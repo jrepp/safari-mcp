@@ -18,6 +18,7 @@
 [![Glama AAA](https://img.shields.io/badge/Glama-AAA_Score-22c55e?logo=ai)](https://glama.ai/mcp/servers/@achiya-automation/safari-mcp)
 [![MCP Registry](https://img.shields.io/badge/MCP_Registry-Verified-2563eb)](https://registry.modelcontextprotocol.io/v0/servers?search=achiya-automation)
 [![Smithery](https://img.shields.io/badge/Smithery-Listed-7c3aed)](https://smithery.ai/server/@achiya-automation/safari-mcp)
+[![MCP Score](https://mcpscoreboard.com/badge/05977769-8762-4e89-aff3-a0c5776843bb.svg)](https://mcpscoreboard.com/server/05977769-8762-4e89-aff3-a0c5776843bb/)
 
 <a href="vscode:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_Server-0078d4?logo=visual-studio-code&logoColor=white" alt="Install in VS Code"></a>
 <a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
@@ -777,7 +778,7 @@ If Safari MCP saves you from Chrome overhead, **a star helps others discover it:
 
 ## Listed On
 
-[![Glama](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp) [![MCP Registry](https://img.shields.io/badge/MCP-Registry-purple)](https://registry.modelcontextprotocol.io/) [![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
+[![Glama](https://glama.ai/mcp/servers/achiya-automation/safari-mcp/badges/score.svg)](https://glama.ai/mcp/servers/achiya-automation/safari-mcp) [![MCP Registry](https://img.shields.io/badge/MCP-Registry-purple)](https://registry.modelcontextprotocol.io/) [![MCP Scoreboard](https://mcpscoreboard.com/badge/05977769-8762-4e89-aff3-a0c5776843bb.svg)](https://mcpscoreboard.com/server/05977769-8762-4e89-aff3-a0c5776843bb/) [![CI](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/achiya-automation/safari-mcp/actions/workflows/ci.yml)
 
 ---
 
