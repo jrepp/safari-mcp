@@ -727,14 +727,21 @@ async function _getSafariWindowGeometry() {
   if (parts.length !== 5 || parts.some(isNaN)) {
     throw new Error("Failed to parse Safari window geometry: " + boundsResult);
   }
+  // Dynamic toolbar height: outerHeight - innerHeight gives total chrome above content
+  // (title bar + URL bar + tab strip + optional bookmarks bar). Hardcoded 74 was wrong
+  // for modern Safari (Sequoia+) where chrome is ~90px. Fall back to 74 if JS unreachable.
+  let toolbarHeight = 74;
+  try {
+    const chromeStr = await runJS(`(window.outerHeight - window.innerHeight) + ''`);
+    const chrome = Number(chromeStr);
+    if (Number.isFinite(chrome) && chrome >= 50 && chrome <= 200) toolbarHeight = chrome;
+  } catch (_e) { /* keep fallback */ }
   return {
     windowX: parts[0],
     windowY: parts[1],
     windowRight: parts[2],
     windowBottom: parts[3],
-    // Safari toolbar height: standard is ~74px (address bar + tab bar).
-    // This is approximate — varies with compact tabs, bookmarks bar, etc.
-    toolbarHeight: 74,
+    toolbarHeight,
     // CGWindow ID for background click targeting (no mouse move, no focus steal)
     windowId: parts[4]
   };

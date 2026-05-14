@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.8] - 2026-05-14
+
+### Fixed
+
+- **Dynamic toolbar height for native click coordinates.** `_getSafariWindowGeometry` previously hardcoded `toolbarHeight: 74` for screen→viewport translation. On modern Safari (Sequoia+) the actual chrome above content is ~90 px, so `safari_native_click` was landing ~16 px above its target — close enough to hit a row but often missing button hit-targets, so the click silently no-op'd. Now computes `outerHeight - innerHeight` from JS at call time and uses that, with a 50–200 px sanity range and fallback to 74 if JS is unreachable. Restores reliable native_click on PartnerStack's network application drawer and any layout where buttons sit close to whitespace.
+
 ## [2.10.7] - 2026-05-14
 
 ### Fixed
