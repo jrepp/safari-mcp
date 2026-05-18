@@ -127,6 +127,20 @@ function _isURLOwned(url) {
   return false;
 }
 
+// Sentinel persisted when a blank tab (about:blank) is opened by this session.
+// A blank tab has no unique URL to own, but ownership must still survive an MCP
+// process restart (_openedTabs is in-memory only) — otherwise reopening blank
+// tabs falsely trips the "no tabs opened yet" guard. The sentinel is never a
+// real tab URL, so it cannot falsely match a user's page in _isURLOwned().
+const BLANK_TAB_SENTINEL = "__mcp-blank-tab__";
+
+function _markBlankTabOpened() {
+  if (!_ownedTabURLs.has(BLANK_TAB_SENTINEL)) {
+    _ownedTabURLs.add(BLANK_TAB_SENTINEL);
+    _saveOwnershipFile(_ownedTabURLs);
+  }
+}
+
 function _addOwnedURL(url) {
   if (url && url !== 'about:blank' && url !== 'favorites://') {
     _ownedTabURLs.add(url);
@@ -697,7 +711,7 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
       throw new Error(msg);
     } else if (currentUrl && !_isURLOwned(currentUrl)) {
       // about:blank tabs are owned if we have any tracked tabs (new_tab creates them at about:blank)
-      const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && _openedTabs.size > 0;
+      const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && (_openedTabs.size > 0 || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
       if (!isBlankOwned) {
         const msg = `⚠️ Tab safety: refusing "${extensionType}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
         console.error(`[Safari MCP] ${msg}`);
@@ -1354,6 +1368,9 @@ server.tool(
       _addOwnedURL(trackUrl);
       if (url && url !== trackUrl) _addOwnedURL(url);  // also own the requested URL (handles www redirects)
     }
+    // Blank tab (no URL requested): persist a restart-surviving ownership marker.
+    const _effectiveNewURL = (result?.url && result.url !== 'about:blank' && result.url !== 'missing value') ? result.url : url;
+    if (!_effectiveNewURL) _markBlankTabOpened();
     return { content: [{ type: "text", text: typeof rawResult === 'string' ? rawResult : JSON.stringify(result) }] };
   }
 );
@@ -1384,7 +1401,7 @@ server.tool(
         const target = parsed.find(t => t.index === index);
         if (target && target.url && !_isURLOwned(target.url)) {
           // about:blank / missing value tabs are owned if tracked in _openedTabs
-          const isBlankOwned = (target.url === 'about:blank' || target.url === 'missing value') && _openedTabs.has(index);
+          const isBlankOwned = (target.url === 'about:blank' || target.url === 'missing value') && (_openedTabs.has(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
           if (!isBlankOwned) {
             const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
             console.error(`[Safari MCP] ${msg}`);

@@ -107,6 +107,15 @@ function cleanupHelper() {
 // cleanupHelper runs via process.on("exit"), which fires when index.js calls process.exit().
 process.on("exit", cleanupHelper);
 process.on("uncaughtException", (err) => { console.error("Uncaught:", err); cleanupHelper(); process.exit(1); });
+// Unhandled promise rejections must NOT terminate the server. A single failed
+// async operation — e.g. a proxy fetch to the primary instance while it is
+// mid-restart, or an aborted fetch timeout — would otherwise bubble to the
+// uncaughtException handler above (Node's default for unhandled rejections) and
+// exit the whole MCP process, disconnecting every concurrent session. Log and
+// continue: the failed operation is localized, the process itself is healthy.
+process.on("unhandledRejection", (reason) => {
+  console.error("[Safari MCP] Unhandled rejection (non-fatal, continuing):", (reason && reason.stack) || reason);
+});
 
 // ========== SAFARI RUNNING CHECK ==========
 // Prevent AppleScript from auto-launching Safari when it's closed

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.1] - 2026-05-18
+
+### Fixed
+
+- **Blank tabs opened via `safari_new_tab` no longer trip "no tabs opened yet" after an MCP process restart.** A tab opened without a URL stays on `about:blank`, which has no unique identity and so was never written to the persisted ownership file (`~/.safari-mcp/owned-tabs.json`). When the host recycled the MCP process, the in-memory `_openedTabs` map was wiped and nothing in the ownership file restored it — every subsequent navigate/click/read was blocked with `Tab safety: no tabs opened yet`, even though the session had legitimately opened a tab. Opening a blank tab now persists a `__mcp-blank-tab__` sentinel (TTL-bounded like every other ownership entry). The sentinel is never a real tab URL, so it cannot falsely match a user's page in `_isURLOwned()`; it only keeps blank-tab ownership alive across a restart.
+- **Unhandled promise rejections no longer crash the MCP process.** A single failed async operation — a proxy fetch to the primary instance mid-restart, or an aborted fetch timeout — bubbled to the `uncaughtException` handler (Node's default path for unhandled rejections) and exited the whole process, disconnecting every concurrent session. A dedicated `unhandledRejection` handler now logs the failure and continues: the failed operation stays localized, the process stays healthy.
+
 ## [2.11.0] - 2026-05-17
 
 ### Fixed
