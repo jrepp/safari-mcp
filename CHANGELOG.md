@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] - 2026-05-17
+
+### Fixed
+
+- **Tab targeting no longer drifts to the user's tab during concurrent browsing.** When the user switched Safari tabs while the agent was working, `resolveActiveTab()` could silently resolve to the wrong tab — the agent's reads, clicks and navigations landed on the user's page. Root cause was a chain of fragile heuristics (cached index → tracked URL → `window.__mcpTabMarker`), each of which breaks under concurrent activity: indices shift when the user inserts a tab, the tracked URL is ambiguous when the user has a same-domain tab open, and `window.__mcpTabMarker` is wiped by every navigation. Tab identity reworked:
+  - The session tab is now marked with `window.name` as well as `window.__mcpTabMarker`. `window.name` survives full same-origin navigations, redirects and reloads, so the marker is no longer lost on every page load.
+  - `resolveActiveTab()` finds the marked tab with a single AppleScript call that loops every tab internally — was N separate daemon round-trips, slow and prone to mis-resolving when a daemon call hiccupped mid-scan. Falls back to a reliable `osascript` subprocess if the daemon call fails.
+  - **Fail-safe:** when the marker and URL can no longer positively identify the session tab, resolution refuses to return a stale index — `runJS` throws a clear re-anchor error instead of silently operating on whatever tab now sits at that index.
+  - `navigate()` captures its tab index once and targets it explicitly for every internal `runJS`, instead of re-resolving mid-navigation. A cross-origin load transiently clears `window.name` and the tracked URL is stale until the new page settles, which previously made `navigate` lose its own tab.
+  - `newTab()` polls `document.readyState` from the Node side before stamping the marker. The previous in-page wait loop was an `async` IIFE that `do JavaScript` never awaits, so it returned immediately and the marker was stamped onto a still-loading page and lost.
+  - Tab-ghost recovery now matches Safari's typographic apostrophe (`Can’t`, U+2019); the plain-ASCII check never matched, so `Can’t get tab N` errors silently skipped recovery.
+
+- **`safari_click` no longer reports success when the click was silently ignored.** Sites that gate handlers on `event.isTrusted` (Clutch, G2, Cloudflare-class WAFs) drop synthetic `dispatchEvent` / `.click()` events without error, so `click()` returned "Clicked: …" while nothing happened. `click()` now captures a synchronous page fingerprint (URL, element count, DOM size, focused element) on both sides of the click and reports whether a React handler fired or the page observably changed. When a synthetic click triggers no handler and no effect — re-checked once after a 320ms async grace window — it escalates automatically to a real OS-level CGEvent click (`isTrusted: true`) instead of falsely claiming success.
+- **`safari_evaluate` now resolves async scripts instead of returning "(undefined)".** AppleScript `do JavaScript` returns the moment the synchronous portion of a script finishes — it never awaits a Promise — so any script using `await`, `.then()` or a leading `async` had its result discarded. Async scripts are now started fire-and-forget into a page global, and that global is polled synchronously from the Node side until the work settles (the same mechanism `navigate()` uses). The expression normalizer is shared between the sync and async paths: a multi-line script whose last line is `})()` no longer crashes with a `return })()` syntax error, and `fetch(` on its own is no longer misclassified as async (an un-awaited fetch is fire-and-forget), so a sync IIFE that merely mentions `fetch` keeps its return value.
+- **`safari_wait_for` actually waits now.** Its in-page wait loop was an `async` IIFE that `do JavaScript` never awaits, so the tool checked the page exactly once and returned immediately — reporting success without ever waiting. The wait loop now runs on the Node side, re-evaluating a single synchronous check against the page each tick until the selector/text appears or the timeout elapses.
+- **`navigate` no longer reports a stale page as a successful navigation.** The URL is set through the Swift helper daemon; a cold or crashed daemon could make that `set URL` silently no-op. `navigate` then polled `document.readyState`, saw the OLD page already `complete`, and returned it as if the navigation had succeeded. `navigate` now records the pre-navigation URL — if the page never leaves it, it retries the `set URL` once through the daemon-independent `osascript` subprocess, then throws a clear error if the page still did not move instead of silently returning the wrong page.
+
+### Added
+
+- **Visibility spoofing keeps backgrounded tabs rendering.** The agent's tab is almost always backgrounded while the user browses, and many SPAs (the Meta/Facebook developer console is the canonical case) blank or stop laying out their main content when `document.visibilityState` is `hidden`. Every stamped tab now has `document.visibilityState` / `document.hidden` pinned to `visible` / `false` and `visibilitychange` events suppressed, so a backgrounded automation tab keeps rendering normally.
+
+### Changed
+
+- Swift-helper daemon requests are serialized on the Node side so FIFO response/callback matching holds regardless of the helper's execution model.
+
 ## [2.10.9] - 2026-05-14
 
 ### Fixed

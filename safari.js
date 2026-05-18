@@ -25,6 +25,21 @@ let _helperProc = null;
 const _helperQueue = []; // callbacks waiting for responses
 let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — only kill after 3
 
+// ── Helper request serialization ──────────────────────────────────────────
+// The Swift helper runs each request on its own background thread, so it can
+// finish requests out of order. The Node side matches responses to callbacks by
+// FIFO queue position — correct ONLY if at most one request is in flight at a
+// time. This mutex enforces exactly that: every helper round-trip runs strictly
+// one at a time. Helper calls are ~5ms so serializing costs nothing measurable,
+// but it eliminates the response/callback desync that made tab resolution
+// silently return the wrong tab when the user was browsing concurrently.
+let _helperLock = Promise.resolve();
+function _withHelperLock(makePromise) {
+  const result = _helperLock.then(makePromise, makePromise);
+  _helperLock = result.then(() => {}, () => {});
+  return result;
+}
+
 // Reject all pending callbacks when helper crashes
 function _drainHelperQueue(reason) {
   while (_helperQueue.length > 0) {
@@ -320,6 +335,52 @@ function getFallbackTarget() {
   return SAFARI_PROFILE ? `current tab of ${getTargetWindowRef()}` : "front document";
 }
 
+// ========== TAB IDENTITY MARKER + VISIBILITY SPOOF ==========
+// Build the JS that stamps our identity onto a tab and keeps it rendering:
+//  - window.name           : survives EVERY navigation (full loads, redirects,
+//                            cross-origin). The browser preserves window.name by
+//                            design — the bulletproof identity that index/URL lack.
+//  - window.__mcpTabMarker : survives SPA / same-document routing (secondary marker).
+//  - visibility spoof      : forces document.visibilityState='visible' so a
+//                            backgrounded tab keeps rendering. SPAs (e.g. the Meta
+//                            developer console) blank their main content when hidden;
+//                            with the user actively switching tabs our automation tab
+//                            is constantly backgrounded, so without this its content
+//                            never paints.
+function _buildStampJS(marker) {
+  const m = String(marker).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  return "(function(){"
+    + "try{window.name='" + m + "';}catch(e){}"
+    + "try{window.__mcpTabMarker='" + m + "';}catch(e){}"
+    + "try{if(!window.__mcpVisSpoof){window.__mcpVisSpoof=1;"
+    +   "Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return 'visible';}});"
+    +   "Object.defineProperty(document,'hidden',{configurable:true,get:function(){return false;}});"
+    +   "Object.defineProperty(document,'webkitVisibilityState',{configurable:true,get:function(){return 'visible';}});"
+    +   "Object.defineProperty(document,'webkitHidden',{configurable:true,get:function(){return false;}});"
+    +   "var s=function(e){e.stopImmediatePropagation();};"
+    +   "document.addEventListener('visibilitychange',s,true);"
+    +   "document.addEventListener('webkitvisibilitychange',s,true);"
+    +   "try{document.hasFocus=function(){return true;};}catch(e){}"
+    + "}}catch(e){}"
+    + "return '1';})()";
+}
+
+// Stamp identity marker + visibility spoof onto a specific tab.
+// Identity-critical: a missed stamp loses the tab marker, so this is NOT best-effort —
+// a daemon hiccup falls back to the reliable osascript subprocess.
+async function _stampTab(idx) {
+  if (!idx || !_activeTabMarker) return;
+  const js = _buildStampJS(_activeTabMarker).replace(/"/g, '\\"');
+  const script = `tell application "Safari" to do JavaScript "${js}" in tab ${idx} of ${getTargetWindowRef()}`;
+  try {
+    await osascriptFast(script, { timeout: 5000 });
+  } catch {
+    // Daemon hiccup — retry via the reliable subprocess. Stamping is identity-critical
+    // (a missed stamp loses the tab marker), so it must not be silently best-effort.
+    await osascript(script, { timeout: 8000 }).catch(() => {});
+  }
+}
+
 // Quick JS execution — exposed for smart-wait checks in index.js
 export async function runJSQuick(js) { return runJS(js); }
 
@@ -339,7 +400,7 @@ export async function restoreFocusIfStolen(savedBundleId) {
 }
 
 function _helperHideSafari(timeout = 2000) {
-  return new Promise((resolve) => {
+  return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
     const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
@@ -352,11 +413,11 @@ function _helperHideSafari(timeout = 2000) {
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"hideSafari":true}\n'); }
     catch { clearTimeout(timer); resolve(); }
-  });
+  }));
 }
 
 function _helperActivateApp(bundleId, timeout = 2000) {
-  return new Promise((resolve) => {
+  return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
     const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
@@ -369,7 +430,7 @@ function _helperActivateApp(bundleId, timeout = 2000) {
     _helperQueue.push(cb);
     try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
     catch { clearTimeout(timer); resolve(); }
-  });
+  }));
 }
 
 export function setFocusGuard(active) { _focusGuardActive = active; }
@@ -382,40 +443,52 @@ export function setActiveTabURL(url) { _activeTabURL = url; _lastResolveTime = D
 async function resolveActiveTab() {
   if (!_activeTabURL && !_activeTabMarker) return _activeTabIndex;
 
-  // Strategy 1: window.__mcpTabMarker (bulletproof — survives navigation, redirects, query changes)
-  // Only attempted if we have a marker AND a cached index hint
+  // Strategy 1: identity marker — window.name (survives ALL navigation: full loads,
+  // redirects, cross-origin) or window.__mcpTabMarker (survives SPA routing).
+  // One AppleScript call loops every tab internally: faster and far more reliable
+  // than N separate daemon round-trips (a daemon hiccup mid-scan used to silently
+  // mis-resolve to the user's tab).
   if (_activeTabMarker) {
     try {
       const safeMarker = _activeTabMarker.replace(/'/g, "\\'");
-      // Single JS call: check cached index first, then walk all tabs to find marker
-      const checkScript = `(function(){return window.__mcpTabMarker==='${safeMarker}'?'1':'0'})()`;
-      if (_activeTabIndex) {
-        const matchAtCached = await osascriptFast(
-          `tell application "Safari" to do JavaScript "${checkScript}" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
-        ).catch(() => '0');
-        if (String(matchAtCached).trim() === '1') return _activeTabIndex;
+      const check = `(function(){try{return (window.name==='${safeMarker}'||window.__mcpTabMarker==='${safeMarker}')?'1':'0'}catch(e){return '0'}})()`;
+      const scanScript = `tell application "Safari"
+        set w to ${getTargetWindowRef()}
+        set n to count of tabs of w
+        ${_activeTabIndex ? `try
+          if n is greater than or equal to ${_activeTabIndex} then
+            if (do JavaScript "${check}" in tab ${_activeTabIndex} of w) is "1" then return ${_activeTabIndex}
+          end if
+        end try` : ''}
+        repeat with i from n to 1 by -1
+          try
+            if (do JavaScript "${check}" in tab i of w) is "1" then return i
+          end try
+        end repeat
+        return 0
+      end tell`;
+      // Fast daemon first; if it hiccups, retry once via reliable subprocess.
+      let res = await osascriptFast(scanScript).catch(() => null);
+      if (res === null) res = await osascript(scanScript).catch(() => null);
+      if (res !== null) {
+        const found = Number(String(res).trim());
+        if (found > 0) { _activeTabIndex = found; return found; }
+        // Reliable scan completed and the marker is on NO tab — it is genuinely
+        // gone (tab closed, or a site overwrote window.name). Drop it; the URL
+        // strategy below is the last chance before we fail safe.
+        _activeTabMarker = null;
       }
-      // Cached index doesn't match — scan all tabs for marker
-      const tabCountStr = await osascriptFast(
-        `tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`
-      ).catch(() => '0');
-      const tabCount = Number(tabCountStr) || 0;
-      for (let i = tabCount; i >= 1; i--) {
-        const m = await osascriptFast(
-          `tell application "Safari" to do JavaScript "${checkScript}" in tab ${i} of ${getTargetWindowRef()}`
-        ).catch(() => '0');
-        if (String(m).trim() === '1') {
-          _activeTabIndex = i;
-          _lastTabCount = tabCount;
-          return i;
-        }
-      }
-      // Marker not found anywhere — page reloaded or tab closed
-      _activeTabMarker = null;
+      // res === null → both attempts errored; can't verify — keep marker, fall through.
     } catch { /* fall through to URL strategy */ }
   }
 
-  if (!_activeTabURL) return _activeTabIndex;
+  if (!_activeTabURL) {
+    // No URL to resolve. If this session owns a tab but the marker is gone, we can
+    // no longer positively identify our tab — refuse to return a stale index that
+    // may now point at the user's tab. runJS will throw a clear re-anchor error.
+    if (_hasOwnedTab && !_activeTabMarker) { _activeTabIndex = null; }
+    return _activeTabIndex;
+  }
 
   try {
     const safeUrl = _activeTabURL.replace(/"/g, '\\"');
@@ -447,6 +520,13 @@ async function resolveActiveTab() {
       const tabCount = Number(resultStr.split(':')[1]) || 1;
       _lastTabCount = tabCount;
       _activeTabURL = null;
+      if (_hasOwnedTab && !_activeTabMarker) {
+        // Identity fully lost: marker gone AND URL matches no tab. Returning the
+        // stale index could silently target the user's tab. Fail safe — drop it.
+        console.error('[Safari MCP] Tab identity lost (marker + URL unresolved) — clearing index to avoid targeting the user\'s tab');
+        _activeTabIndex = null;
+        return null;
+      }
       if (_activeTabIndex && _activeTabIndex > tabCount) {
         console.error(`[Safari MCP] Tab ghost proactive fix: index ${_activeTabIndex} > tabCount ${tabCount}, clamping to ${tabCount}`);
         _activeTabIndex = tabCount;
@@ -538,7 +618,7 @@ async function osascriptFast(script, { timeout = 10000 } = {}) {
 }
 
 function _osascriptFastHelper(script, timeout) {
-  return new Promise((resolve, reject) => {
+  return _withHelperLock(() => new Promise((resolve, reject) => {
     let resolved = false;
     const timer = setTimeout(() => {
       if (resolved) return;
@@ -586,7 +666,7 @@ function _osascriptFastHelper(script, timeout) {
       clearTimeout(timer);
       reject(new Error("safari-helper write failed: " + writeErr.message));
     }
-  });
+  }));
 }
 
 // ========== NATIVE CLICK VIA CGEVENT ==========
@@ -594,7 +674,7 @@ function _osascriptFastHelper(script, timeout) {
 // This produces isTrusted: true events — bypasses WAF protection (G2, etc.)
 
 function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5000) {
-  return new Promise((resolve, reject) => {
+  return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
       reject(new Error("safari-helper not available for native click"));
@@ -627,13 +707,13 @@ function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5
     if (doubleClick) cmd.click.double = true;
     if (windowId) cmd.click.windowId = windowId;
     _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
-  });
+  }));
 }
 
 // Sends a CGEvent hover command to the Swift helper daemon.
 // Moves the cursor to (x, y), dwells to let tooltips render, optionally restores cursor.
 function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = true, timeout = 10000) {
-  return new Promise((resolve, reject) => {
+  return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
       reject(new Error("safari-helper not available for native hover"));
@@ -665,13 +745,13 @@ function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = tr
     const cmd = { hover: { x, y, dwellMs, restoreMouse } };
     if (windowId) cmd.hover.windowId = windowId;
     _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
-  });
+  }));
 }
 
 // Sends a CGEvent keyboard command to the Swift helper daemon.
 // No focus stealing — sends key events directly to the target window via PID.
 function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000) {
-  return new Promise((resolve, reject) => {
+  return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
     if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
       reject(new Error("safari-helper not available for native keyboard"));
@@ -703,14 +783,14 @@ function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000
     const cmd = { keyboard: { keyCode, flags } };
     if (windowId) cmd.keyboard.windowId = windowId;
     _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
-  });
+  }));
 }
 
 // ========== NATIVE FOCUS OPERATIONS VIA DAEMON ==========
 // Uses NSRunningApplication — ~0.1ms for get, ~1ms for activate (vs ~90ms AppleScript)
 
 function _helperGetFrontApp(timeout = 2000) {
-  return new Promise((resolve) => {
+  return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(null); return; }
     let resolved = false;
     const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, timeout);
@@ -723,7 +803,7 @@ function _helperGetFrontApp(timeout = 2000) {
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"getFrontApp":true}\n'); }
     catch { clearTimeout(timer); resolve(null); }
-  });
+  }));
 }
 
 // Get Safari window bounds, toolbar height, and window ID for coordinate calculation
@@ -798,14 +878,16 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
     }
     return await osascript(script, { timeout });
   } catch (err) {
-    // Tab ghost recovery: "Can't get tab X" → re-resolve and retry once
+    // Tab ghost recovery: "Can't get tab X" → re-resolve and retry once.
+    // Match both apostrophes — Safari emits a typographic apostrophe (U+2019),
+    // so a plain "Can't" includes() check silently missed every ghost error.
     const msg = err.message || '';
-    if (idx && (msg.includes("Can't get tab") || msg.includes("-1728"))) {
+    if (idx && (/[Cc]an.t get tab/.test(msg) || msg.includes("-1728"))) {
       console.error(`[Safari MCP] Tab ghost detected (tab ${idx}), re-resolving...`);
       _lastResolveTime = 0; // Force re-resolve
       _lastTabCount = null;  // Invalidate tab count cache
       _activeTabIndex = null;
-      if (_activeTabURL) {
+      if (_activeTabURL || _activeTabMarker) {
         const newIdx = await resolveActiveTab();
         if (newIdx && newIdx !== idx) {
           console.error(`[Safari MCP] Tab ghost resolved: ${idx} → ${newIdx}`);
@@ -904,11 +986,22 @@ export async function navigate(url) {
     // Resolve tab by URL first (in case indices shifted)
     if (_activeTabURL) await resolveActiveTab();
     _assertNotFallingBackToUserTab('navigate');
-    const navTarget = _activeTabIndex
-      ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+    // Capture our tab index ONCE. Every internal runJS below targets it explicitly:
+    // re-resolving mid-navigation is unsafe — a cross-origin load transiently wipes
+    // window.name (a browser privacy feature) and the tracked URL is stale until the
+    // new page settles, so resolveActiveTab() would conclude "identity lost" and drop
+    // the very tab we are navigating.
+    const navIndex = _activeTabIndex;
+    const navTarget = navIndex
+      ? `tab ${navIndex} of ${getTargetWindowRef()}`
       : getFallbackTarget();
     // Step 0: Suppress onbeforeunload dialogs (prevents blocking navigation)
-    await runJS("window.onbeforeunload=null", { timeout: 2000 }).catch(() => {});
+    await runJS("window.onbeforeunload=null", { tabIndex: navIndex, timeout: 2000 }).catch(() => {});
+
+    // Pre-navigation URL, captured before Step 1. Lets the post-load check below
+    // detect a `set URL` that silently no-ops (a cold or crashed Swift daemon):
+    // the readyState poll would otherwise just see the OLD page still loaded.
+    const preNavUrl = await runJS('location.href', { tabIndex: navIndex, timeout: 3000 }).catch(() => '');
 
     // Step 1: Set URL via fast daemon (~5ms) — don't block daemon with polling
     await osascriptFast(
@@ -922,17 +1015,45 @@ export async function navigate(url) {
     for (let poll = 0; poll < 80; poll++) {
       await new Promise(r => setTimeout(r, 200));
       try {
-        const state = await runJS('document.readyState', { timeout: 5000 });
+        const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
         if (state === 'complete' || state === 'interactive') {
           result = await runJS(
             `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
-            { timeout: 5000 }
+            { tabIndex: navIndex, timeout: 5000 }
           );
           if (state === 'complete') break;
           // interactive = DOM ready but resources still loading — wait a bit more
           if (poll > 10) break; // Don't wait forever for 'complete' if interactive after 2s
         }
       } catch { /* page still loading, retry */ }
+    }
+
+    // If the fast `set URL` above silently no-opped (cold/crashed daemon), the poll
+    // just saw the OLD page already loaded. Detect that — the URL never left
+    // preNavUrl — and retry once through the daemon-independent osascript path.
+    let landedUrl = '';
+    try { landedUrl = JSON.parse(result).url || ''; } catch { /* result not JSON */ }
+    if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || landedUrl === preNavUrl)) {
+      console.error('[Safari MCP] navigate: fast set-URL did not take effect — retrying via osascript subprocess');
+      await osascript(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`, { timeout: 12000 });
+      for (let rpoll = 0; rpoll < 80; rpoll++) {
+        await new Promise(res => setTimeout(res, 200));
+        try {
+          const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
+          if (state === 'complete' || state === 'interactive') {
+            result = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, timeout: 5000 });
+            if (state === 'complete') break;
+            if (rpoll > 10) break;
+          }
+        } catch { /* page still loading, retry */ }
+      }
+      // Still stuck on the pre-navigation URL → the navigation genuinely failed.
+      // Throw rather than returning the stale page as a successful navigation.
+      let retryUrl = '';
+      try { retryUrl = JSON.parse(result).url || ''; } catch { /* result not JSON */ }
+      if (retryUrl && retryUrl === preNavUrl) {
+        throw new Error(`navigate failed: page stayed on ${preNavUrl} — Safari "set URL" to ${targetUrl} had no effect (Safari automation/daemon issue, retry exhausted)`);
+      }
     }
 
     // Inject click helpers in background (non-blocking, for subsequent clicks)
@@ -943,20 +1064,17 @@ export async function navigate(url) {
       const parsed = JSON.parse(result);
       if (parsed.blocked && url.startsWith("http://")) {
         const httpUrl = url.replace(/"/g, '\\"');
-        const navTarget = _activeTabIndex
-          ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
-          : `current tab of ${getTargetWindowRef()}`;
         await osascriptFast(
           `tell application "Safari" to set URL of ${navTarget} to "${httpUrl}"`
         );
-        // Poll readyState for HTTP retry (same sync approach)
+        // Poll readyState for HTTP retry — target navIndex explicitly (no re-resolve)
         let retryResult = '{}';
         for (let rp = 0; rp < 40; rp++) {
           await new Promise(r => setTimeout(r, 300));
           try {
-            const rs = await runJS('document.readyState', { timeout: 5000 });
+            const rs = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
             if (rs === 'complete' || rs === 'interactive') {
-              retryResult = await runJS('JSON.stringify({title:document.title,url:location.href})', { timeout: 5000 });
+              retryResult = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, timeout: 5000 });
               if (rs === 'complete') break;
               if (rp > 8) break;
             }
@@ -968,7 +1086,9 @@ export async function navigate(url) {
           const retryParsed = JSON.parse(retry);
           if (retryParsed.url) _activeTabURL = retryParsed.url;
         } catch {}
+        _activeTabIndex = navIndex;
         _lastResolveTime = Date.now();
+        await _stampTab(navIndex);
         return retry;
       }
     } catch (_) {}
@@ -980,18 +1100,14 @@ export async function navigate(url) {
     } catch {
       _activeTabURL = targetUrl;
     }
+    _activeTabIndex = navIndex;
     _lastResolveTime = Date.now();
 
-    // Re-inject the tab marker — navigation creates a new JS context which wipes the
-    // window.__mcpTabMarker we set in newTab. Without re-injection, resolveActiveTab's
-    // marker-based search fails on the very next call and falls back to URL search,
-    // which can mis-target if the tab is still loading or shows an error page.
-    if (_activeTabIndex && _activeTabMarker) {
-      const safeMarker = _activeTabMarker.replace(/'/g, "\\'");
-      await osascriptFast(
-        `tell application "Safari" to do JavaScript "window.__mcpTabMarker='${safeMarker}'" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
-      ).catch(() => {});
-    }
+    // Re-stamp identity marker + visibility spoof onto the settled page. A cross-origin
+    // navigation clears window.name, and any full load wipes __mcpTabMarker and the
+    // visibility spoof — re-stamping keeps resolveActiveTab able to find this tab and
+    // keeps the page rendering even while backgrounded.
+    await _stampTab(navIndex);
 
     return result;
 }
@@ -1025,6 +1141,8 @@ export async function reload(hardReload = false) {
     { timeout: 10000 }
   );
   try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
+  // A reload destroys the JS context — re-stamp marker + visibility spoof.
+  await _stampTab(_activeTabIndex);
   return result;
 }
 
@@ -1042,8 +1160,29 @@ export async function readPage({ selector, maxLength = 50000 } = {}) {
       })()`
     );
   }
+  // innerText needs a built render tree, which Safari may skip for a tab that has
+  // never been foregrounded — it can come back near-empty even though the DOM is
+  // fully present. Detect that and fall back to a layout-independent TreeWalker
+  // text extraction so reads work on a background tab without ever taking focus.
   return runJS(
-    `JSON.stringify({title:document.title,url:location.href,text:document.body.innerText.substring(0,${Number(maxLength)})})`
+    `(function(){
+      var max=${Number(maxLength)};
+      var t=document.body.innerText||'';
+      if(t.replace(/\\s/g,'').length<20){
+        var parts=[];
+        var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);
+        var n;
+        while(n=w.nextNode()){
+          var p=n.parentElement;if(!p)continue;
+          var tag=p.tagName;
+          if(tag==='SCRIPT'||tag==='STYLE'||tag==='NOSCRIPT'||tag==='TEMPLATE')continue;
+          var s=(n.textContent||'').replace(/\\s+/g,' ').trim();
+          if(s)parts.push(s);
+        }
+        t=parts.join('\\n');
+      }
+      return JSON.stringify({title:document.title,url:location.href,text:t.substring(0,max)});
+    })()`
   );
 }
 
@@ -1136,25 +1275,33 @@ export async function click({ selector, text, x, y, ref }) {
   // the native popup is dismissed → the JSC eval times out and the tool returns an
   // error after seconds of hang. Detect early and return a clear directive instead.
   const selectGuard = `if(el&&el.tagName==='SELECT'){var opts=[];for(var oi=0;oi<el.options.length&&opts.length<8;oi++){opts.push(el.options[oi].text||el.options[oi].value);}return '__SELECT_GUARD__:'+(el.id||el.name||'select')+': '+opts.join('|');}`;
+  // Page fingerprint, captured synchronously on either side of the click. dispatchEvent
+  // is synchronous, so anything that differs between before/after is a direct effect of
+  // the click's own handlers — there is no window for ambient ad/lazy-load noise. Catches
+  // DOM add/remove, class/attribute/text mutations, navigation, and focus changes.
+  const FP = `(location.href+'|'+document.querySelectorAll('*').length+'|'+document.documentElement.innerHTML.length+'|'+(document.activeElement?(document.activeElement.tagName+'#'+(document.activeElement.id||'')):''))`;
+  // Mirrors mcpClickWithReact (resolve → React-fiber click → synthetic fallback) but also
+  // reports reactFired and whether the page observably changed — so click() can detect a
+  // synthetic click that was silently ignored (isTrusted-gated handlers) and escalate.
+  const coreJS = (finderExpr, notFound) =>
+    `(function(){var el=${finderExpr};if(!el)return JSON.stringify({err:${JSON.stringify(notFound)}});${selectGuard}` +
+    `var target=mcpResolveTarget(el)||el;var before=${FP};` +
+    `var reactFired=false;try{reactFired=mcpReactClick(target);}catch(e){}` +
+    `var anchor=target&&target.closest?target.closest('a[href]'):null;` +
+    `if(!reactFired||anchor)mcpClick(target);` +
+    `return JSON.stringify({tag:target.tagName,text:((target.innerText||target.textContent)||'').trim().substring(0,50),reactFired:!!reactFired,changed:before!==(${FP}),fp:before});})()`;
+
   let result;
   if (ref) {
-    result = await clickWithRetry(
-      `(function(){var el=mcpFindRef('${ref}');if(!el)return 'Element not found: ref=${ref}';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
-    );
+    result = await clickWithRetry(coreJS(`mcpFindRef('${ref}')`, `Element not found: ref=${ref}`));
   } else if (selector) {
     const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    result = await clickWithRetry(
-      `(function(){var el=mcpQuerySelectorDeep('${sel}');if(!el)return 'Element not found: ${sel}';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+((target.innerText||target.textContent)?(' "'+(target.innerText||target.textContent).trim().substring(0,50)+'"'):'');})()`
-    );
+    result = await clickWithRetry(coreJS(`mcpQuerySelectorDeep('${sel}')`, `Element not found: ${selector}`));
   } else if (text) {
     const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    result = await clickWithRetry(
-      `(function(){var el=mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false);if(!el)return 'Element not found with text: ${safeText}';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' "'+((target.innerText||target.textContent)||'').trim().substring(0,50)+'"';})()`
-    );
+    result = await clickWithRetry(coreJS(`mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false)`, `Element not found with text: ${text}`));
   } else if (x !== undefined && y !== undefined) {
-    result = await clickWithRetry(
-      `(function(){var el=mcpElementFromPoint(${Number(x)},${Number(y)});if(!el)return 'No element at (${Number(x)},${Number(y)})';${selectGuard}var target=mcpClickWithReact(el);return 'Clicked: '+target.tagName+' at (${Number(x)},${Number(y)})';})()`
-    );
+    result = await clickWithRetry(coreJS(`mcpElementFromPoint(${Number(x)},${Number(y)})`, `No element at (${Number(x)},${Number(y)})`));
   } else {
     throw new Error("click requires selector, text, or x/y coordinates");
   }
@@ -1163,7 +1310,32 @@ export async function click({ selector, text, x, y, ref }) {
     const detail = result.substring('__SELECT_GUARD__:'.length);
     throw new Error(`Target is a native <select> (${detail}). Use safari_select_option with a value matching one of the options instead — clicking it would open the OS picker and block.`);
   }
-  return result;
+
+  // Structured result from coreJS. Fall back to the raw string for forward-compat.
+  let info;
+  try { info = JSON.parse(result); } catch { return result; }
+  if (info.err) return info.err;
+  const label = info.tag + (info.text ? ` "${info.text}"` : '');
+
+  // A React handler fired, or the page observably changed → the click landed.
+  if (info.reactFired || info.changed) return 'Clicked: ' + label;
+
+  // No React handler and no synchronous effect. Give an async handler a brief moment,
+  // then re-check before deciding the click was truly ignored.
+  await new Promise(r => setTimeout(r, 320));
+  const afterFp = await runJS(FP).catch(() => null);
+  if (afterFp != null && afterFp !== info.fp) return 'Clicked: ' + label;
+
+  // Synthetic events were ignored — the handler gates on event.isTrusted (Clutch, G2,
+  // Cloudflare-class sites). Escalate to a real OS-level CGEvent click (isTrusted:true).
+  // If a handler genuinely has no observable effect (pure analytics, slow >320ms async),
+  // this re-fires it once via the native click — an accepted, low-cost trade-off.
+  try {
+    await nativeClick({ selector, text, x, y, ref });
+    return 'Clicked (native fallback — synthetic click had no effect): ' + label;
+  } catch (e) {
+    return 'Clicked: ' + label + ' — ⚠️ synthetic click produced no detectable effect and the native fallback is unavailable (' + ((e && e.message) || e) + '). Retry with safari_native_click.';
+  }
 }
 
 export async function doubleClick({ selector, x, y, ref }) {
@@ -2724,22 +2896,27 @@ export async function newTab(url = "") {
   _lastNewTabAt = Date.now();        // (legacy — grace window superseded by _hasOwnedTab)
   _hasOwnedTab = true;               // Permanently true: this session has opened its own tab,
                                      // so write ops must NEVER fall back to the user's current tab.
-  // Set bulletproof tab marker — survives same-tab navigation, redirects, query changes (v2.8.3)
+  // Set bulletproof tab marker — stamped onto the tab by _stampTab() after load.
+  // window.name survives ALL navigation (full loads, redirects, cross-origin);
+  // __mcpTabMarker survives SPA routing.
   _activeTabMarker = `MCP_${SESSION_ID}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  await osascriptFast(
-    `tell application "Safari" to do JavaScript "window.__mcpTabMarker='${_activeTabMarker}'" in tab ${_activeTabIndex} of ${getTargetWindowRef()}`
-  ).catch(() => {});
-  // Wait for page load if URL given
+  // Wait for page load if URL given. Poll readyState from the Node side — Safari's
+  // `do JavaScript` does NOT await async IIFEs, so an in-page wait loop returns
+  // immediately without waiting. Stamping before the page settles loses the marker.
   if (url) {
-    try {
-      await runJS(
-        `(async function(){for(var i=0;i<40;i++){if(location.href!=='about:blank'&&document.readyState==='complete')break;await new Promise(r=>setTimeout(r,250))}return 'ok'})()`,
-        { tabIndex: _activeTabIndex, timeout: 12000 }
-      );
-    } catch {}
+    for (let i = 0; i < 50; i++) {
+      await new Promise(r => setTimeout(r, 200));
+      try {
+        const st = await runJS('document.readyState', { tabIndex: _activeTabIndex, timeout: 5000 });
+        const href = await runJS('location.href', { tabIndex: _activeTabIndex, timeout: 5000 });
+        if ((st === 'complete' || st === 'interactive') && href && href !== 'about:blank') break;
+      } catch { /* tab still loading */ }
+    }
   } else {
     await new Promise(r => setTimeout(r, 200));
   }
+  // Stamp identity marker + visibility spoof onto the loaded document.
+  await _stampTab(_activeTabIndex);
   const info = await runJS(`JSON.stringify({title:document.title,url:location.href,tabIndex:${_activeTabIndex}})`, { tabIndex: _activeTabIndex });
   try {
     const parsed = JSON.parse(info);
@@ -2769,6 +2946,13 @@ export async function closeTab() {
 export async function switchTab(index) {
   const idx = Number(index);
   _activeTabIndex = idx;
+  // Claiming this tab: stamp it with a FRESH identity marker so resolveActiveTab can
+  // re-find it after the user shifts tab indices. A fresh marker (not a reused one)
+  // ensures a previously-claimed tab — which still carries the old marker string —
+  // is never mistaken for this one.
+  _activeTabMarker = `MCP_${SESSION_ID}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  _hasOwnedTab = true;
+  await _stampTab(idx);
   // Do NOT visually switch the tab — it brings the Safari window to foreground
   // and interrupts the user. Visual switching only happens in screenshot() when needed.
   // AppleScript `do JavaScript in tab N` works on background tabs without switching.
@@ -2782,89 +2966,145 @@ export async function switchTab(index) {
     const parsed = JSON.parse(result);
     _activeTabURL = parsed.url || null;
   } catch {}
+  _lastResolveTime = Date.now();
   return result;
 }
 
 // ========== WAIT ==========
 
 export async function waitFor({ selector, text, timeout = 10000 }) {
-  // Single JS call with internal polling loop — 1 call instead of 20+
-  const safeSelector = selector ? selector.replace(/'/g, "\\'") : "";
-  const safeText = text ? text.replace(/'/g, "\\'") : "";
-  const result = await runJS(
-    `(async function(){
-      var deadline = Date.now() + ${Number(timeout)};
-      while (Date.now() < deadline) {
-        ${safeSelector ? `if (document.querySelector('${safeSelector}')) return 'Found: ${safeSelector}';` : ""}
-        ${safeText ? `if (document.body && document.body.innerText.includes('${safeText}')) return 'Found text: ${safeText}';` : ""}
-        await new Promise(function(r){setTimeout(r, 50)});
-      }
-      return 'TIMEOUT';
-    })()`,
-    { timeout: timeout + 2000 }
-  );
-  if (result === "TIMEOUT") {
-    throw new Error(`Timeout waiting for ${selector || text} (${timeout}ms)`);
+  // `do JavaScript` can't await, so an in-page async wait loop returns immediately
+  // (handing back an unsettled promise) instead of waiting. The wait loop runs on
+  // the Node side: each tick re-evaluates one SYNCHRONOUS check against the page.
+  const safeSelector = selector ? selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
+  const safeText = text ? text.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
+  if (!safeSelector && !safeText) {
+    throw new Error("waitFor requires selector or text");
   }
-  return result;
+  const checkJs = `(function(){` +
+    (safeSelector ? `if(document.querySelector('${safeSelector}'))return 'Found: ${safeSelector}';` : "") +
+    (safeText ? `if(document.body&&document.body.innerText.includes('${safeText}'))return 'Found text: ${safeText}';` : "") +
+    `return '';})()`;
+  const deadline = Date.now() + Number(timeout);
+  while (Date.now() < deadline) {
+    const hit = await runJS(checkJs, { timeout: 5000 }).catch(() => "");
+    if (hit) return hit;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  throw new Error(`Timeout waiting for ${selector || text} (${timeout}ms)`);
 }
 
 // ========== EVALUATE ==========
 
-export async function evaluate({ script }) {
-  let js = script.trim();
-
-  const isAsync = /\bawait\b/.test(js) || /\.then\s*\(/.test(js) || /^async\b/.test(js) || /\bfetch\s*\(/.test(js);
-
-  if (isAsync) {
-    // Single combined call: execute async + return result in ONE runJS (no polling!)
-    const result = await runJS(
-      `(async function(){
-        try{
-          var v = await(async function(){${js}})();
-          return JSON.stringify({v: v !== undefined && v !== null ? (typeof v === 'object' ? JSON.stringify(v) : String(v)) : null});
-        }catch(e){
-          return JSON.stringify({e: e.message});
-        }
-      })()`,
-      { timeout: 35000 }
-    );
-    try {
-      const parsed = JSON.parse(result);
-      if (parsed.e) return `Error: ${parsed.e}`;
-      return parsed.v !== undefined && parsed.v !== null ? String(parsed.v) : '(undefined)';
-    } catch { return result || '(undefined)'; }
-  }
-
+// Build the expression to evaluate from a user script. Pure (no Safari calls) so
+// it can be unit-tested directly — see scripts/test-evaluate-wrapping.js.
+export function _buildEvalExpr(js) {
+  // Async iff the *result* is a promise to wait on. `fetch(` alone is NOT async —
+  // an un-awaited fetch is fire-and-forget; only await / .then() / a leading
+  // `async` make the result thenable.
+  const isAsync = /\bawait\b/.test(js) || /\.then\s*\(/.test(js) || /^async\b/.test(js);
+  // Statement keywords: a script starting with one is never a bare expression,
+  // and `return (<keyword> ...)` would be a syntax error.
+  const NON_EXPR = /^(var|let|const|return|if|for|while|switch|try|do|throw)\b/;
   const isIIFE = /^\((?:async\s+)?function/.test(js) || /^\((?:async\s+)?\(/.test(js);
-  const isSimpleExpression = !js.includes(';') && !js.includes('\n') && !js.startsWith('var ') && !js.startsWith('let ') && !js.startsWith('const ');
+  const isSimpleExpression = !js.includes(';') && !js.includes('\n') && !NON_EXPR.test(js);
 
-  if (!isIIFE && !isSimpleExpression) {
+  let expr;
+  if (isIIFE) {
+    expr = js;
+  } else if (isSimpleExpression) {
+    // A bare expression — usable as-is for sync; async needs an awaiting wrapper.
+    expr = isAsync ? `(async function(){return (${js})})()` : js;
+  } else {
+    // Multi-statement: prepend `return` to the last value-producing line when it
+    // can safely take one; otherwise fall back to indirect-eval completion value.
     const lines = js.split('\n');
     let addedReturn = false;
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();
       if (!line || line.startsWith('//')) continue;
-      if (line.startsWith('return ') || line.startsWith('return;')) { addedReturn = true; break; }
-      if (line.endsWith('}') || line.startsWith('var ') || line.startsWith('let ') || line.startsWith('const ')) break;
+      if (line.startsWith('return ') || line.startsWith('return;') || line === 'return') {
+        addedReturn = true; break;
+      }
+      // A block-closer (`}`, `})`, `})()`), a block body (ends with `}`) or a
+      // statement keyword can't take a prepended `return`.
+      if (line.startsWith('}') || line.endsWith('}') || NON_EXPR.test(line)) break;
       lines[i] = 'return ' + lines[i];
       addedReturn = true;
       break;
     }
     if (addedReturn) {
-      js = '(function(){' + lines.join('\n') + '})()';
+      expr = `(${isAsync ? 'async function' : 'function'}(){${lines.join('\n')}})()`;
+    } else if (isAsync) {
+      // No safe return slot — run the body in an async IIFE (value may be undefined).
+      expr = `(async function(){${js}})()`;
     } else {
-      // Last line ends with } (if/else/for/while) or starts with var/let/const — can't prepend return.
-      // Use indirect eval to capture completion value. Falls back to plain IIFE on CSP-strict pages.
-      // eslint-disable-next-line no-eval
+      // Indirect eval yields the completion value of an arbitrary statement list;
+      // the catch re-runs the body plainly when a strict CSP blocks eval.
       const escaped = js.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-      js = "(function(){ try { return (0,eval)('" + escaped + "') } catch(_e) { " + js.replace(/\n/g, ' ') + " } })()";
+      expr = "(function(){ try { return (0,eval)('" + escaped + "') } catch(_e) { " + js.replace(/\n/g, ' ') + " } })()";
     }
   }
+  return { isAsync, expr };
+}
 
-  // Wrap in IIFE with try/catch. Safari's `do JavaScript` only returns values from single expressions —
-  // multi-statement scripts (var x; try{} x) return nothing. So the entire wrapper must be one IIFE.
-  const wrappedJs = `(function(){ try { return (${js}); } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
+// Async scripts can't be awaited through AppleScript `do JavaScript` — it returns
+// the moment the synchronous portion finishes, handing back an unsettled Promise.
+// So the work is started fire-and-forget into a page global, then that global is
+// polled synchronously from the Node side (the same pattern navigate() uses).
+async function _evaluateAsync(expr) {
+  // Token is identifier-safe (base36 → [0-9a-z], `_` prefix) so `window.<token>`
+  // dot access needs no quoting/escaping through the AppleScript bridge.
+  const token = '__mcpEval_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const slot = 'window.' + token;
+  // A SYNC outer function installs the globals, starts the async work (NOT awaited
+  // here — `do JavaScript` would not await it anyway) and returns immediately.
+  const kickoff =
+    `(function(){${slot}={done:false};(async function(){try{` +
+    `var __v=await (${expr});` +
+    `${slot}.val=(__v===undefined||__v===null)?null:(typeof __v==='object'?JSON.stringify(__v):String(__v));` +
+    `}catch(__e){${slot}.err=(__e&&__e.message)||String(__e);}` +
+    `finally{${slot}.done=true;}})();return 'ok';})()`;
+  const started = await runJS(kickoff, { timeout: 10000 });
+  if (started !== 'ok') {
+    return typeof started === 'string' && started ? started : '(no return value)';
+  }
+  // Poll the result global until the async work settles (35s budget).
+  const pollJs =
+    `(function(){var s=${slot};if(!s)return '__MCP_GONE__';` +
+    `if(!s.done)return '';return JSON.stringify({v:s.val,e:s.err});})()`;
+  const deadline = Date.now() + 35000;
+  let raw = '';
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 120));
+    raw = await runJS(pollJs, { timeout: 5000 }).catch(() => '');
+    if (raw === '__MCP_GONE__') {
+      return '(no return value — page navigated away during async evaluation)';
+    }
+    if (raw) break;
+  }
+  // Best-effort cleanup of the page global.
+  runJS(`(function(){try{delete ${slot};}catch(__e){${slot}=undefined;}return '';})()`).catch(() => {});
+  if (!raw) {
+    throw new Error('safari_evaluate: async script did not settle within 35s');
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed.e) return 'Error: ' + parsed.e;
+    return parsed.v !== undefined && parsed.v !== null ? String(parsed.v) : '(no return value)';
+  } catch {
+    return raw;
+  }
+}
+
+export async function evaluate({ script }) {
+  const js = (script || '').trim();
+  if (!js) return '(no return value)';
+  const { isAsync, expr } = _buildEvalExpr(js);
+  if (isAsync) return _evaluateAsync(expr);
+  // Sync: a single `do JavaScript` over one expression. `do JavaScript` only
+  // returns the value of a single expression, so the whole script is one IIFE.
+  const wrappedJs = `(function(){ try { return (${expr}); } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
   if (process.env.MCP_DEBUG) console.error('[evaluate] wrapped:', wrappedJs.substring(0, 300));
   const result = await runJS(wrappedJs);
   if (result === null || result === undefined || result === '') {
