@@ -7,7 +7,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
-import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
+import { readFile, writeFile, unlink, appendFile, realpath, lstat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const LOCAL_FILE_MAX_BYTES = parseInt(process.env.SAFARI_MCP_MAX_FILE_BYTES || String(100 * 1024 * 1024), 10);
 // Local session ID — kept in sync with index.js SESSION_ID for tab marker generation
 // Both files need their own const because they're separate ES modules; the marker only needs to be unique per process
 const SESSION_ID = randomUUID().slice(0, 8);
@@ -3292,24 +3293,50 @@ export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, t
 
 // ========== FILE PATH SAFETY ==========
 // Prevent reading sensitive system files via upload/paste tools
-function _validateFilePath(filePath) {
+async function _validateFilePath(filePath) {
   const resolved = resolvePath(filePath);
-  if (resolved.includes('..')) throw new Error("Path traversal not allowed: " + filePath);
+  const linkInfo = await lstat(resolved);
+  if (linkInfo.isSymbolicLink()) throw new Error("Symlink file paths are not allowed: " + filePath);
+  if (!linkInfo.isFile()) throw new Error("File path must point to a regular file: " + filePath);
+  if (linkInfo.size > LOCAL_FILE_MAX_BYTES) {
+    throw new Error(`File too large: ${filePath} (${linkInfo.size} bytes, max ${LOCAL_FILE_MAX_BYTES})`);
+  }
+  const real = await realpath(resolved);
   const blocked = ['.ssh', '.gnupg', '.aws', '.config/gcloud', 'credentials', '.env', '.npmrc', '.netrc', 'id_rsa', 'id_ed25519', '.keychain'];
-  const lower = resolved.toLowerCase();
+  const lower = real.toLowerCase();
   for (const b of blocked) {
     if (lower.includes(b)) throw new Error("Blocked: reading sensitive path " + filePath);
   }
   // Must be under /Users/ or /tmp/ or /var/folders/ (macOS temp)
-  if (!resolved.startsWith('/Users/') && !resolved.startsWith('/tmp/') && !resolved.startsWith('/var/folders/') && !resolved.startsWith('/private/tmp/')) {
+  if (!real.startsWith('/Users/') && !real.startsWith('/tmp/') && !real.startsWith('/var/folders/') && !real.startsWith('/private/tmp/')) {
     throw new Error("File path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
   }
+  return real;
+}
+
+async function _validateOutputPath(filePath, extension) {
+  const resolved = resolvePath(filePath);
+  if (extension && !resolved.toLowerCase().endsWith(extension)) {
+    throw new Error(`Output path must end with ${extension}: ${filePath}`);
+  }
+  try {
+    const info = await lstat(resolved);
+    if (info.isSymbolicLink()) throw new Error("Symlink output paths are not allowed: " + filePath);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  const parent = dirname(resolved);
+  const realParent = await realpath(parent);
+  if (!realParent.startsWith('/Users/') && !realParent.startsWith('/tmp/') && !realParent.startsWith('/var/folders/') && !realParent.startsWith('/private/tmp/')) {
+    throw new Error("Output path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
+  }
+  return resolved;
 }
 
 // ========== UPLOAD FILE ==========
 
 export async function uploadFile({ selector, filePath }) {
-  _validateFilePath(filePath);
+  const validatedPath = await _validateFilePath(filePath);
   // Read file in Node.js, send as base64 to Safari JS, create File + DataTransfer
   // NO file dialog, NO System Events, NO focus stealing
 
@@ -3337,9 +3364,9 @@ export async function uploadFile({ selector, filePath }) {
 
   const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const { basename, extname } = await import("node:path");
-  let fileName = basename(filePath);
-  let ext = extname(filePath).toLowerCase().replace(".", "");
-  let resolvedPath = filePath;
+  let fileName = basename(validatedPath);
+  let ext = extname(validatedPath).toLowerCase().replace(".", "");
+  let resolvedPath = validatedPath;
 
   // Auto-convert images that the target input rejects.
   // Quora is the canonical case — declares accept="image/png,image/jpeg" and silently
@@ -3454,17 +3481,17 @@ export async function uploadFile({ selector, filePath }) {
 // ========== PASTE IMAGE FROM FILE ==========
 
 export async function pasteImageFromFile({ filePath }) {
-  _validateFilePath(filePath);
+  const validatedPath = await _validateFilePath(filePath);
   // Paste image via JS ClipboardEvent — NO clipboard touch, NO System Events, NO focus steal
   const { extname } = await import("node:path");
-  const ext = extname(filePath).toLowerCase().replace(".", "");
+  const ext = extname(validatedPath).toLowerCase().replace(".", "");
   const mimeMap = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
   const mime = mimeMap[ext] || "image/png";
 
   // Read image as base64
-  const fileData = await readFile(filePath);
+  const fileData = await readFile(validatedPath);
   const base64 = fileData.toString("base64");
-  const fileName = filePath.split("/").pop().replace(/'/g, "\\'");
+  const fileName = validatedPath.split("/").pop().replace(/'/g, "\\'");
 
   // Use runJSLarge — images are often >260KB as base64
   const result = await runJSLarge(
@@ -3590,6 +3617,7 @@ export async function clearConsoleCapture() {
 
 export async function savePDF({ path: pdfPath }) {
   await refreshTargetWindow();
+  const safePdfPath = await _validateOutputPath(pdfPath, ".pdf");
   // NO focus stealing — uses screencapture + Python Quartz to generate PDF
 
   // Step 1: Get full page dimensions
@@ -3629,16 +3657,14 @@ export async function savePDF({ path: pdfPath }) {
   ).catch(() => {});
 
   // Step 5: Convert screenshot to PDF using Python3 + macOS Quartz (no external deps)
-  const safePdfPath = pdfPath.replace(/'/g, "'\\''");
-  const safePngPath = tmpPng.replace(/'/g, "'\\''");
   try {
     await execFileAsync("python3", ["-c", `
 import sys
 from Quartz import CGImageSourceCreateWithURL, CGImageSourceCreateImageAtIndex, CGImageGetWidth, CGImageGetHeight, CGPDFContextCreateWithURL, CGRectMake, CGPDFContextBeginPage, CGPDFContextEndPage, CGContextDrawImage
 from CoreFoundation import CFURLCreateFromFileSystemRepresentation
 
-png_path = b'${safePngPath}'
-pdf_path = b'${safePdfPath}'
+png_path = sys.argv[1].encode("utf-8")
+pdf_path = sys.argv[2].encode("utf-8")
 
 src_url = CFURLCreateFromFileSystemRepresentation(None, png_path, len(png_path), False)
 img_src = CGImageSourceCreateWithURL(src_url, None)
@@ -3657,14 +3683,14 @@ CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img)
 CGPDFContextEndPage(ctx)
 del ctx
 print(f"OK {w}x{h}")
-`.trim()], { timeout: 15000 });
+`.trim(), tmpPng, safePdfPath], { timeout: 15000 });
   } catch (err) {
     throw new Error(`PDF conversion failed: ${err.message}`);
   } finally {
     unlink(tmpPng).catch(() => {});
   }
 
-  return `PDF saved to: ${pdfPath} (image-based, no focus stealing)`;
+  return `PDF saved to: ${safePdfPath} (image-based, no focus stealing)`;
 }
 
 // ========== SNAPSHOT — ref-based interaction (like Chrome DevTools MCP) ==========
