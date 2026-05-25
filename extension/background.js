@@ -11,6 +11,12 @@ let _enabled = true;         // Toggle from popup — when false, stops polling 
 let _reconnectTimer = null;  // Single reconnect timer — prevents exponential growth
 let _reconnectDelay = 3000;  // Current backoff delay (resets on successful connect)
 const _RECONNECT_MAX = 60000; // Max backoff: 60 seconds
+let _bridgeSecret = null;    // Per-session MCP bridge secret, obtained after user pairing
+let _pairingInfo = null;     // Non-sensitive server metadata shown in the popup
+
+function authHeaders(extra = {}) {
+  return _bridgeSecret ? { ...extra, "X-Safari-MCP-Secret": _bridgeSecret } : extra;
+}
 
 // ========== GLOBAL ERROR HANDLER ==========
 // Prevent unhandled errors from crashing the service worker
@@ -26,6 +32,9 @@ self.addEventListener("unhandledrejection", (e) => {
 let _startupReady = browser.storage.local.get("mcpEnabled").then(data => {
   _enabled = data.mcpEnabled !== false;
   if (!_enabled) updateBadge("OFF");
+});
+let _secretReady = browser.storage.local.get("mcpBridgeSecret").then(data => {
+  _bridgeSecret = typeof data.mcpBridgeSecret === "string" ? data.mcpBridgeSecret : null;
 });
 
 // Listen for messages from popup
@@ -47,8 +56,12 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.action === "getStatus") {
-    sendResponse({ connected: isConnected, enabled: _enabled });
+    sendResponse({ connected: isConnected, enabled: _enabled, needsPairing: !_bridgeSecret && !!_pairingInfo, pairingInfo: _pairingInfo });
     return false; // Synchronous response
+  }
+  if (msg.action === "pair") {
+    pairWithServer(msg.pairingCode).then(sendResponse);
+    return true;
   }
   return false;
 });
@@ -57,7 +70,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 function updateBadge(text) {
   // Also write status to storage so popup can read it
-  const status = text === "ON" ? "connected" : text === "OFF" ? "paused" : text === "" ? "checking" : "disconnected";
+  const status = text === "ON" ? "connected" : text === "OFF" ? "paused" : text === "PAIR" ? "pairing" : text === "" ? "checking" : "disconnected";
   browser.storage.local.set({ mcpStatus: status }).catch(() => {});
   try {
     browser.action.setBadgeText({ text });
@@ -69,6 +82,7 @@ function updateBadge(text) {
 
 async function connect() {
   if (!_enabled) return;
+  await _secretReady.catch(() => {});
   // Cancel any existing poll
   if (pollAbort) {
     try { pollAbort.abort(); } catch {}
@@ -78,8 +92,15 @@ async function connect() {
   try {
     const res = await fetch(`${HTTP_URL}/connect`, {
       method: "POST",
+      headers: authHeaders(),
       signal: AbortSignal.timeout(5000),
     });
+    if (res.status === 401) {
+      await browser.storage.local.remove("mcpBridgeSecret").catch(() => {});
+      _bridgeSecret = null;
+      await loadPairingInfo();
+      return;
+    }
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
       if (data.profile) {
@@ -96,6 +117,7 @@ async function connect() {
         // Notify server that we passed profile verification
         await fetch(`${HTTP_URL}/extension-verified`, {
           method: "POST",
+          headers: authHeaders(),
           signal: AbortSignal.timeout(3000),
         }).catch(() => {});
         await _discoverProfileWindow();
@@ -113,6 +135,41 @@ async function connect() {
   isConnected = false;
   updateBadge("");
   scheduleReconnect();
+}
+
+async function loadPairingInfo() {
+  isConnected = false;
+  updateBadge("PAIR");
+  try {
+    const res = await fetch(`${HTTP_URL}/pairing-info`, { signal: AbortSignal.timeout(3000) });
+    _pairingInfo = res.ok ? await res.json().catch(() => ({})) : { requiresApproval: true };
+  } catch {
+    _pairingInfo = { requiresApproval: true };
+  }
+  browser.storage.local.set({ mcpStatus: "pairing", mcpPairingInfo: _pairingInfo }).catch(() => {});
+}
+
+async function pairWithServer(pairingCode) {
+  if (!_enabled) return { ok: false, error: "Bridge is paused" };
+  try {
+    const res = await fetch(`${HTTP_URL}/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pairingCode: String(pairingCode || "").trim() }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.secret) {
+      return { ok: false, error: data.error || `Pairing failed (${res.status})` };
+    }
+    _bridgeSecret = data.secret;
+    _pairingInfo = null;
+    await browser.storage.local.set({ mcpBridgeSecret: _bridgeSecret, mcpPairingInfo: null, mcpStatus: "checking" });
+    connect();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
 }
 
 function scheduleReconnect() {
@@ -141,8 +198,16 @@ async function pollForCommands() {
       // 90s safety timeout prevents stuck connections from blocking forever
       const timeout = setTimeout(() => pollAbort.abort(), 90000);
       const res = await fetch(`${HTTP_URL}/poll`, {
+        headers: authHeaders(),
         signal: pollAbort.signal,
       });
+      if (res.status === 401) {
+        clearTimeout(timeout);
+        await browser.storage.local.remove("mcpBridgeSecret").catch(() => {});
+        _bridgeSecret = null;
+        await loadPairingInfo();
+        return;
+      }
       clearTimeout(timeout);
       if (res.status === 200) {
         const msg = await res.json();
@@ -181,7 +246,7 @@ async function executeAndReply(msg) {
   try {
     await fetch(`${HTTP_URL}/result`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(response),
       signal: AbortSignal.timeout(5000),
     });
@@ -1850,7 +1915,7 @@ async function _verifyProfileMatch(expectedProfile) {
     try {
       verifyRes = await fetch(`${HTTP_URL}/verify-profile`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ nonce, expectedProfile }),
         signal: AbortSignal.timeout(5000),
       });

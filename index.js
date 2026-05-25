@@ -11,7 +11,7 @@ import { z } from "zod";
 import * as safari from "./safari.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -19,6 +19,8 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
+const BRIDGE_TOKEN_BYTES = 32;
+const PAIRING_CODE_TTL_MS = 2 * 60 * 1000;
 
 // ========== MULTI-INSTANCE: concurrent instances coexist (never kill siblings) ==========
 // This block previously SIGTERM'd every other safari-mcp instance running >10s to
@@ -40,7 +42,74 @@ const SESSION_ID = randomUUID().slice(0, 8);
 // remain "owned" across process restarts for up to OWNERSHIP_TTL_MS.
 const OWNERSHIP_DIR = join(homedir(), ".safari-mcp");
 const OWNERSHIP_FILE = join(OWNERSHIP_DIR, "owned-tabs.json");
+const SESSION_FILE = join(OWNERSHIP_DIR, "session.json");
 const OWNERSHIP_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+const BRIDGE_SECRET = process.env.SAFARI_MCP_BRIDGE_SECRET || randomBytes(BRIDGE_TOKEN_BYTES).toString("base64url");
+let _pairingCode = _newPairingCode();
+let _pairingCodeExpiresAt = Date.now() + PAIRING_CODE_TTL_MS;
+let _pairingFailures = 0;
+
+function _newPairingCode() {
+  return String(randomBytes(4).readUInt32BE(0) % 1000000).padStart(6, "0");
+}
+
+function _rotatePairingCode() {
+  _pairingCode = _newPairingCode();
+  _pairingCodeExpiresAt = Date.now() + PAIRING_CODE_TTL_MS;
+  _pairingFailures = 0;
+}
+
+function _logPairingCode() {
+  console.error(`[Safari MCP] Pairing code: ${_pairingCode} (expires in ${Math.round(PAIRING_CODE_TTL_MS / 1000)}s)`);
+}
+
+function _saveSessionFile() {
+  try {
+    if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
+    writeFileSync(SESSION_FILE, JSON.stringify({
+      port: HTTP_PORT,
+      wsPort: WS_PORT,
+      secret: BRIDGE_SECRET,
+      pid: process.pid,
+      createdAt: Date.now(),
+      profile: process.env.SAFARI_PROFILE || null,
+    }), { mode: 0o600 });
+  } catch (err) {
+    console.error(`[Safari MCP] Failed to write bridge session file: ${err.message}`);
+  }
+}
+
+function _loadSessionSecret() {
+  try {
+    if (!existsSync(SESSION_FILE)) return null;
+    const data = JSON.parse(readFileSync(SESSION_FILE, "utf8"));
+    return typeof data.secret === "string" ? data.secret : null;
+  } catch {
+    return null;
+  }
+}
+
+function _extractBridgeSecret(req) {
+  const auth = req.headers.authorization || "";
+  if (auth.startsWith("Bearer ")) return auth.slice("Bearer ".length).trim();
+  const header = req.headers["x-safari-mcp-secret"];
+  if (typeof header === "string") return header.trim();
+  return "";
+}
+
+function _isAuthorized(req) {
+  return _extractBridgeSecret(req) === BRIDGE_SECRET;
+}
+
+function _rejectUnauthorized(res) {
+  res.writeHead(401, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Unauthorized: bridge secret required" }));
+}
+
+function _safeExtensionOrigin(origin) {
+  return !origin || origin.startsWith("safari-web-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("chrome-extension://");
+}
 
 function _loadOwnershipFile() {
   try {
@@ -281,7 +350,14 @@ const _commandQueue = [];
 let wss;
 try {
   wss = new WebSocketServer({ host: "127.0.0.1", port: WS_PORT });
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, req) => {
+    const origin = req.headers.origin || "";
+    const url = new URL(req.url || "/", `http://127.0.0.1:${WS_PORT}`);
+    const token = url.searchParams.get("token") || "";
+    if (!_safeExtensionOrigin(origin) || token !== BRIDGE_SECRET) {
+      ws.close(1008, "Unauthorized");
+      return;
+    }
     _extensionWs = ws;
     _extensionConnected = true;
     console.error(`[Safari MCP] Extension connected via WebSocket`);
@@ -315,7 +391,7 @@ try {
     // Safari extensions use moz-extension:// or safari-web-extension:// origins.
     // "*" was a security risk: any webpage could POST to localhost:9224 and execute MCP commands.
     const origin = req.headers.origin || "";
-    const isSafeOrigin = !origin || origin.startsWith("safari-web-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("chrome-extension://");
+    const isSafeOrigin = _safeExtensionOrigin(origin);
     if (isSafeOrigin) {
       res.setHeader("Access-Control-Allow-Origin", origin || "*");
     } else {
@@ -333,8 +409,61 @@ try {
       return;
     }
 
+    // GET /pairing-info — unauthenticated discovery only, never marks extension connected
+    if (req.method === "GET" && req.url === "/pairing-info") {
+      if (Date.now() > _pairingCodeExpiresAt) _rotatePairingCode();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        name: "Safari MCP",
+        port: HTTP_PORT,
+        wsPort: WS_PORT,
+        pid: process.pid,
+        createdAt: Date.now(),
+        profile: process.env.SAFARI_PROFILE || null,
+        requiresApproval: true,
+        pairingCodeExpiresAt: _pairingCodeExpiresAt,
+      }));
+      return;
+    }
+
+    // POST /pair — user-approved one-time pairing. The extension must supply the
+    // code printed in the MCP server logs; then it receives the current bridge secret.
+    if (req.method === "POST" && req.url === "/pair") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
+      req.on("end", () => {
+        try {
+          const { pairingCode } = JSON.parse(body || "{}");
+          if (Date.now() > _pairingCodeExpiresAt || String(pairingCode || "") !== _pairingCode) {
+            _pairingFailures++;
+            if (_pairingFailures >= 10) {
+              _rotatePairingCode();
+              _logPairingCode();
+            }
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid or expired pairing code" }));
+            return;
+          }
+          _rotatePairingCode();
+          _logPairingCode();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            secret: BRIDGE_SECRET,
+            profile: process.env.SAFARI_PROFILE || null,
+            wsPort: WS_PORT,
+            port: HTTP_PORT,
+          }));
+        } catch (err) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      });
+      return;
+    }
+
     // GET /poll — extension asks for next command (long-poll, up to 5s)
     if (req.method === "GET" && req.url === "/poll") {
+      if (!_isAuthorized(req)) { _rejectUnauthorized(res); return; }
       _extensionLastPollTime = Date.now(); // Keep connection alive — critical for stale detection
       if (!_extensionConnected) {
         _extensionConnected = true;
@@ -372,6 +501,7 @@ try {
 
     // POST /result — extension sends command result
     if (req.method === "POST" && req.url === "/result") {
+      if (!_isAuthorized(req)) { _rejectUnauthorized(res); return; }
       let body = "";
       req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", () => {
@@ -387,6 +517,7 @@ try {
 
     // POST /connect — extension announces it's alive
     if (req.method === "POST" && req.url === "/connect") {
+      if (!_isAuthorized(req)) { _rejectUnauthorized(res); return; }
       // When SAFARI_PROFILE is set, don't mark as connected until profile is verified.
       // A personal-profile extension connecting first would incorrectly set the flag.
       if (!process.env.SAFARI_PROFILE && !_extensionConnected) {
@@ -401,6 +532,7 @@ try {
 
     // POST /extension-verified — extension confirmed it's in the correct profile
     if (req.method === "POST" && req.url === "/extension-verified") {
+      if (!_isAuthorized(req)) { _rejectUnauthorized(res); return; }
       if (!_extensionConnected) {
         _extensionConnected = true;
         console.error("[Safari MCP] Extension connected and profile-verified via HTTP polling");
@@ -413,6 +545,7 @@ try {
 
     // POST /verify-profile — extension asks server to check which profile has a nonce tab
     if (req.method === "POST" && req.url === "/verify-profile") {
+      if (!_isAuthorized(req)) { _rejectUnauthorized(res); return; }
       let body = "";
       req.on("data", (chunk) => { body += chunk; if (body.length > MAX_BODY_SIZE) { res.writeHead(413); res.end("Payload too large"); req.destroy(); } });
       req.on("end", async () => {
@@ -466,6 +599,7 @@ try {
 
     // GET /proxy-check — secondary instances check if extension is connected
     if (req.method === "GET" && req.url === "/proxy-check") {
+      if (!_isAuthorized(req)) { _rejectUnauthorized(res); return; }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ extensionConnected: _extensionConnected }));
       return;
@@ -473,6 +607,7 @@ try {
 
     // POST /proxy-command — secondary instances send commands through primary
     if (req.method === "POST" && req.url === "/proxy-command") {
+      if (!_isAuthorized(req)) { _rejectUnauthorized(res); return; }
       // חוסם כש-SAFARI_PROFILE מוגדר — אחרת ה-extension עלול לפעול בפרופיל הלא נכון
       if (process.env.SAFARI_PROFILE) {
         res.writeHead(503, { "Content-Type": "application/json" });
@@ -504,6 +639,8 @@ try {
 
   httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
     _isExtensionHost = true;
+    _saveSessionFile();
+    _logPairingCode();
     console.error(`[Safari MCP] HTTP server listening on port ${HTTP_PORT} (extension host)`);
   });
   httpServer.on("error", (err) => {
@@ -532,8 +669,11 @@ setTimeout(() => {
 async function _checkPrimaryExtension() {
   if (_isExtensionHost) return; // Already hosting — stop polling
   try {
+    const primarySecret = _loadSessionSecret();
+    if (!primarySecret) throw new Error("primary bridge secret unavailable");
     const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-check`, {
       method: "GET",
+      headers: { "X-Safari-MCP-Secret": primarySecret },
       signal: AbortSignal.timeout(2000),
     });
     if (res.ok) {
@@ -553,9 +693,11 @@ async function _checkPrimaryExtension() {
 
 // Send command to primary instance's extension via proxy
 async function _proxyToExtension(type, payload, timeoutMs = 30000) {
+  const primarySecret = _loadSessionSecret();
+  if (!primarySecret) throw new Error("Proxy error: primary bridge secret unavailable");
   const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-command`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Safari-MCP-Secret": primarySecret },
     body: JSON.stringify({ type, payload }),
     signal: AbortSignal.timeout(timeoutMs),
   });

@@ -10,9 +10,16 @@
     .connected { background: #4CAF50; }
     .disconnected { background: #f44336; }
     .paused { background: #FF9800; }
+    .pairing { background: #1976D2; }
     .checking { background: #FF9800; animation: pulse 1.2s ease-in-out infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
     .info { color: #666; font-size: 11px; margin-bottom: 12px; }
+    .pairing-box { display: none; margin: 12px 0; padding: 10px 0; border-top: 1px solid #e0e0e0; }
+    .pairing-box.visible { display: block; }
+    .pairing-row { display: flex; gap: 6px; margin-top: 8px; }
+    .pairing-row input { flex: 1; min-width: 0; padding: 6px 8px; font: inherit; border: 1px solid #bbb; border-radius: 6px; }
+    .pairing-row button { padding: 6px 10px; font: inherit; border: 0; border-radius: 6px; background: #1976D2; color: white; cursor: pointer; }
+    .pairing-error { color: #b00020; font-size: 11px; margin-top: 6px; min-height: 14px; }
     .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid #e0e0e0; }
     .toggle-label { font-size: 13px; font-weight: 500; }
     .toggle { position: relative; width: 42px; height: 24px; cursor: pointer; }
@@ -30,6 +37,14 @@
     <span id="statusText">Checking...</span>
   </div>
   <div class="info" id="info"></div>
+  <div class="pairing-box" id="pairingBox">
+    <div class="info">Enter the pairing code shown by the running MCP server.</div>
+    <div class="pairing-row">
+      <input id="pairingCode" inputmode="numeric" autocomplete="off" placeholder="Pairing code">
+      <button id="pairButton">Allow</button>
+    </div>
+    <div class="pairing-error" id="pairingError"></div>
+  </div>
   <div class="toggle-row">
     <span class="toggle-label">Active</span>
     <label class="toggle">
