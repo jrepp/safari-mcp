@@ -1078,9 +1078,19 @@ async function searchTabs({ query, urlContains, titleContains, index, activate =
       return errorResult(`Found ${matches.length} matching tabs; pass index to activate one specific tab:\n${JSON.stringify(matches, null, 2)}`);
     }
     const tab = matches[0];
+    _addOwnedURL(tab.url);
+    const result = await safari.switchTab(tab.index);
+    let activated = tab;
+    try {
+      const parsed = typeof result === "string" ? JSON.parse(result) : result;
+      if (parsed?.url) {
+        _addOwnedURL(parsed.url);
+        activated = { ...tab, title: parsed.title || tab.title, url: parsed.url };
+      }
+    } catch {}
     safari.setActiveTabIndex(tab.index);
-    safari.setActiveTabURL(tab.url);
-    return textResult({ activated: tab }, { pretty: true });
+    safari.setActiveTabURL(activated.url);
+    return textResult({ activated }, { pretty: true });
   }
 
   return textResult(matches, { pretty: true });

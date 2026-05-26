@@ -1012,6 +1012,7 @@ export async function navigate(url) {
     // detect a `set URL` that silently no-ops (a cold or crashed Swift daemon):
     // the readyState poll would otherwise just see the OLD page still loaded.
     const preNavUrl = await runJS('location.href', { tabIndex: navIndex, timeout: 3000 }).catch(() => '');
+    const preNavTimeOrigin = await runJS('String(performance.timeOrigin||0)', { tabIndex: navIndex, timeout: 3000 }).catch(() => '');
 
     // Step 1: Set URL via fast daemon (~5ms) — don't block daemon with polling
     await osascriptFast(
@@ -1028,7 +1029,7 @@ export async function navigate(url) {
         const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
         if (state === 'complete' || state === 'interactive') {
           result = await runJS(
-            `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
+            `JSON.stringify({title:document.title,url:location.href,timeOrigin:String(performance.timeOrigin||0),blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
             { tabIndex: navIndex, timeout: 5000 }
           );
           if (state === 'complete') break;
@@ -1042,8 +1043,14 @@ export async function navigate(url) {
     // just saw the OLD page already loaded. Detect that — the URL never left
     // preNavUrl — and retry once through the daemon-independent osascript path.
     let landedUrl = '';
-    try { landedUrl = JSON.parse(result).url || ''; } catch { /* result not JSON */ }
-    if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || landedUrl === preNavUrl)) {
+    let landedTimeOrigin = '';
+    try {
+      const landed = JSON.parse(result);
+      landedUrl = landed.url || '';
+      landedTimeOrigin = landed.timeOrigin || '';
+    } catch { /* result not JSON */ }
+    const sameDocumentAfterSetUrl = preNavTimeOrigin && landedTimeOrigin && landedTimeOrigin === preNavTimeOrigin;
+    if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || (landedUrl === preNavUrl && sameDocumentAfterSetUrl))) {
       console.error('[Safari MCP] navigate: fast set-URL did not take effect — retrying via osascript subprocess');
       await osascript(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`, { timeout: 12000 });
       for (let rpoll = 0; rpoll < 80; rpoll++) {
@@ -1051,7 +1058,7 @@ export async function navigate(url) {
         try {
           const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
           if (state === 'complete' || state === 'interactive') {
-            result = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, timeout: 5000 });
+            result = await runJS('JSON.stringify({title:document.title,url:location.href,timeOrigin:String(performance.timeOrigin||0)})', { tabIndex: navIndex, timeout: 5000 });
             if (state === 'complete') break;
             if (rpoll > 10) break;
           }
@@ -1060,8 +1067,13 @@ export async function navigate(url) {
       // Still stuck on the pre-navigation URL → the navigation genuinely failed.
       // Throw rather than returning the stale page as a successful navigation.
       let retryUrl = '';
-      try { retryUrl = JSON.parse(result).url || ''; } catch { /* result not JSON */ }
-      if (retryUrl && retryUrl === preNavUrl) {
+      let retryTimeOrigin = '';
+      try {
+        const retryParsed = JSON.parse(result);
+        retryUrl = retryParsed.url || '';
+        retryTimeOrigin = retryParsed.timeOrigin || '';
+      } catch { /* result not JSON */ }
+      if (retryUrl && retryUrl === preNavUrl && preNavTimeOrigin && retryTimeOrigin === preNavTimeOrigin) {
         throw new Error(`navigate failed: page stayed on ${preNavUrl} — Safari "set URL" to ${targetUrl} had no effect (Safari automation/daemon issue, retry exhausted)`);
       }
     }
@@ -3220,12 +3232,53 @@ export async function handleDialog({ action = "accept", text }) {
 
 // ========== WINDOW ==========
 
+async function _getViewportInfo() {
+  const raw = await runJS(
+    "JSON.stringify({innerWidth:window.innerWidth,innerHeight:window.innerHeight,outerWidth:window.outerWidth,outerHeight:window.outerHeight,visualWidth:window.visualViewport?window.visualViewport.width:null,visualHeight:window.visualViewport?window.visualViewport.height:null,devicePixelRatio:window.devicePixelRatio||1})",
+    { timeout: 5000 }
+  );
+  return JSON.parse(raw);
+}
+
+async function _waitForViewportChange(previous, timeout = 2500) {
+  const deadline = Date.now() + timeout;
+  let current = null;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 100));
+    try {
+      current = await _getViewportInfo();
+      if (!previous || current.innerWidth !== previous.innerWidth || current.innerHeight !== previous.innerHeight) {
+        return current;
+      }
+    } catch { /* retry */ }
+  }
+  return current || previous;
+}
+
+function _viewportChanged(before, after) {
+  return !!before && !!after && (
+    after.innerWidth !== before.innerWidth ||
+    after.innerHeight !== before.innerHeight ||
+    after.outerWidth !== before.outerWidth ||
+    after.outerHeight !== before.outerHeight ||
+    after.visualWidth !== before.visualWidth ||
+    after.visualHeight !== before.visualHeight
+  );
+}
+
 export async function resizeWindow({ width, height }) {
   await refreshTargetWindow();
+  const before = await _getViewportInfo().catch(() => null);
   await osascript(
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(width)}, ${Number(height)}}`
   );
-  return `Resized to ${width}x${height}`;
+  const viewport = await _waitForViewportChange(before);
+  return JSON.stringify({
+    requested: { width: Number(width), height: Number(height) },
+    viewport,
+    changed: _viewportChanged(before, viewport),
+    layoutChanged: !!before && !!viewport && (viewport.innerWidth !== before.innerWidth || viewport.innerHeight !== before.innerHeight),
+  });
 }
 
 // ========== COOKIES & STORAGE ==========
@@ -3536,6 +3589,9 @@ export async function pasteImageFromFile({ filePath }) {
 export async function emulate({ device, width, height, userAgent, scale = 1 }) {
   await refreshTargetWindow();
   const devices = {
+    "iphone-15": { width: 393, height: 852, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
+    "iphone-15-pro": { width: 393, height: 852, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
+    "iphone-15-pro-max": { width: 430, height: 932, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
     "iphone-14": { width: 390, height: 844, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
     "iphone-14-pro-max": { width: 430, height: 932, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
     "ipad": { width: 820, height: 1180, ua: "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
@@ -3544,15 +3600,18 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
     "galaxy-s24": { width: 412, height: 915, ua: "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" },
   };
 
-  const d = device ? devices[device.toLowerCase()] : null;
+  const deviceKey = device ? device.toLowerCase().trim().replace(/\s+/g, "-") : "";
+  const d = deviceKey ? devices[deviceKey] : null;
   const w = d ? d.width : (width || 375);
   const h = d ? d.height : (height || 812);
   const ua = d ? d.ua : (userAgent || "");
+  const before = await _getViewportInfo().catch(() => null);
 
   // Resize Safari window to match device
   await osascript(
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${w}, ${h + 100}}`
   );
+  const viewportAfterResize = await _waitForViewportChange(before);
 
   // Override viewport meta and user agent if specified
   if (ua) {
@@ -3571,11 +3630,15 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
   await runJS(
     `(async function(){location.reload();await new Promise(function(r){setTimeout(r,300)});for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return 'done';})()`
   );
+  const viewport = await _getViewportInfo().catch(() => viewportAfterResize);
 
   return JSON.stringify({
     device: device || "custom",
     width: w,
     height: h,
+    viewport,
+    resized: _viewportChanged(before, viewportAfterResize),
+    layoutChanged: !!before && !!viewportAfterResize && (viewportAfterResize.innerWidth !== before.innerWidth || viewportAfterResize.innerHeight !== before.innerHeight),
     userAgent: ua ? ua.substring(0, 60) + "..." : "(default)",
   });
 }
