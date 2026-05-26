@@ -279,8 +279,11 @@ if (SAFARI_PROFILE) {
       return;
     }
     try {
+      // Read-only window-name query — opt out of focus-guard so a rare
+      // user-app-switch race never triggers the hide-fallback against them.
       const name = await osascriptFast(
-        `tell application "Safari" to return name of ${_targetWindowRef}`
+        `tell application "Safari" to return name of ${_targetWindowRef}`,
+        { noFocusGuard: true }
       ).catch(() => '');
       if (name && !name.startsWith(`${SAFARI_PROFILE} \u2014`)) {
         // Window ID no longer belongs to profile — invalidate cache immediately
@@ -394,17 +397,35 @@ async function _stampTab(idx) {
 export async function runJSQuick(js) { return runJS(js); }
 
 // ========== FOCUS PRESERVATION ==========
-// Safari AppleScript can steal focus (bring Safari window to front).
-// We hide Safari instead of activating the previous app — prevents ANY Safari window from flashing.
+// Safari AppleScript can steal focus (bring Safari window to front), especially
+// on macOS Tahoe where window-mutation commands trigger an implicit activate.
+// Strategy: 1) read frontmost from daemon (~0.1ms), 2) try to re-activate previous
+// app, 3) settle 5ms (Tahoe needs time to honor the activate), 4) verify, and
+// 5) fall back to hiding Safari if activate didn't take.
 export async function saveFrontmostApp() {
   const app = await _helperGetFrontApp();
   return app?.bundleId || null;
 }
 export async function restoreFocusIfStolen(savedBundleId) {
   if (!savedBundleId || savedBundleId === "com.apple.Safari") return;
-  const current = await _helperGetFrontApp();
+  let current = await _helperGetFrontApp();
+  if (current?.bundleId !== "com.apple.Safari") return;
+
+  // Primary: bring previous app back. Await so the caller doesn't return
+  // control to user-space while Safari is still frontmost.
+  await _helperActivateApp(savedBundleId).catch(() => {});
+
+  // Tahoe settle window — NSRunningApplication.activate() is async at the OS
+  // level; without this brief wait the verify check below races and reports a
+  // false success.
+  await new Promise(r => setTimeout(r, 5));
+
+  current = await _helperGetFrontApp();
   if (current?.bundleId === "com.apple.Safari") {
-    await _helperActivateApp(savedBundleId);
+    // Activate did not take effect (Safari's window-server policy can block it
+    // under Tahoe). Hide Safari as a last-resort fallback — the OS auto-picks
+    // the next app, which is reliably the one we saved.
+    await _helperHideSafari().catch(() => {});
   }
 }
 
@@ -590,40 +611,52 @@ async function osascript(script, { timeout = 10000 } = {}) {
     }
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
   } finally {
-    // Re-activate previous app if Safari stole focus (~1ms)
+    // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      const current = await _helperGetFrontApp();
-      if (current?.bundleId === 'com.apple.Safari') {
-        _helperActivateApp(frontApp.bundleId).catch(() => {});
-      }
+      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
     }
   }
 }
 
 // osascriptFast: uses persistent Swift daemon (~5ms) — 18x faster than subprocess (~90ms)
-async function osascriptFast(script, { timeout = 10000 } = {}) {
+async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } = {}) {
   if (!(await isSafariRunning())) throw safariNotRunningError();
   if (!_helperProc) startHelper();
-  if (_helperProc) {
-    try {
-      return await _osascriptFastHelper(script, timeout);
-    } catch (err) {
-      // Retry once if the window ID became stale
-      if (isStaleWindowError(err) && SAFARI_PROFILE) {
-        const oldRef = _targetWindowRef;
-        await refreshTargetWindow(true);
-        if (_targetWindowRef !== oldRef) {
-          const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
-          // Guard: helper may have died during the stale-window retry
-          if (!_helperProc) startHelper();
-          if (_helperProc) return await _osascriptFastHelper(retryScript, timeout);
-          return await osascript(retryScript, { timeout });
+
+  // Focus guard — Tahoe AppleScript can implicitly activate Safari (especially
+  // on window-mutating commands: set URL / set bounds / set current tab).
+  // Skip if an outer caller (extensionOrFallback / runJSLarge / osascript)
+  // already handles focus, or if the caller knows the script is read-only and
+  // not worth the round-trip overhead (e.g. background polling every 3s).
+  const shouldGuardFocus = !_focusGuardActive && !noFocusGuard;
+  const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
+
+  try {
+    if (_helperProc) {
+      try {
+        return await _osascriptFastHelper(script, timeout);
+      } catch (err) {
+        // Retry once if the window ID became stale
+        if (isStaleWindowError(err) && SAFARI_PROFILE) {
+          const oldRef = _targetWindowRef;
+          await refreshTargetWindow(true);
+          if (_targetWindowRef !== oldRef) {
+            const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
+            // Guard: helper may have died during the stale-window retry
+            if (!_helperProc) startHelper();
+            if (_helperProc) return await _osascriptFastHelper(retryScript, timeout);
+            return await osascript(retryScript, { timeout });
+          }
         }
+        throw err;
       }
-      throw err;
+    }
+    return await osascript(script, { timeout });
+  } finally {
+    if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== "com.apple.Safari") {
+      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
     }
   }
-  return osascript(script, { timeout });
 }
 
 function _osascriptFastHelper(script, timeout) {
@@ -972,12 +1005,9 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
     return stdout.trim();
   } finally {
     unlink(tmpFile).catch(() => {});
-    // Re-activate previous app if Safari stole focus (~1ms)
+    // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuard && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      const current = await _helperGetFrontApp();
-      if (current?.bundleId === 'com.apple.Safari') {
-        _helperActivateApp(frontApp.bundleId).catch(() => {});
-      }
+      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
     }
   }
 }
@@ -2685,12 +2715,10 @@ export async function screenshot({ fullPage = false } = {}) {
             );
           }
         }
-        // Re-activate previous app if screencapture stole focus (common on macOS Tahoe)
+        // Re-activate previous app if screencapture stole focus (common on macOS Tahoe).
+        // Centralized restore handles settle delay + hide fallback if activate is blocked.
         if (previousBundleId && previousBundleId !== "com.apple.Safari") {
-          const cur = await _helperGetFrontApp();
-          if (cur?.bundleId === "com.apple.Safari") {
-            await _helperActivateApp(previousBundleId).catch(() => {});
-          }
+          await restoreFocusIfStolen(previousBundleId).catch(() => {});
         }
         // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
         // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit

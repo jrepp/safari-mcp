@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.7] - 2026-05-26
+
+### Fixed
+
+- **Focus theft eliminated on macOS Tahoe.** Three independent gaps in the focus-preservation pipeline let Safari steal the user's foreground app during routine tool calls (`safari_navigate`, `safari_read_page`, `safari_snapshot`, `safari_screenshot`, and any tool that ultimately ran an AppleScript). On Tahoe, Safari implicitly activates itself when an AppleScript mutates one of its windows (`set URL`, `set bounds`, `set current tab`) and `screencapture -l<id>` flashes the window forward mid-capture, so the pre-existing save/restore had race windows that became visible to the user every few calls.
+  - **`osascriptFast` is now focus-guarded.** It is the hot path (~5ms via the persistent Swift daemon, 18× faster than the subprocess fallback) and is called from `safari_navigate`, `safari_snapshot`, the tab-resolution layer, the profile-window detector, and dozens of internal helpers. It previously had no guard at all — only the slower `osascript` subprocess wrapper saved and restored the frontmost app. Added a mirror guard gated on `!_focusGuardActive` so nested calls inside `extensionOrFallback` / `runJSLarge` still skip duplicate save+restore work.
+  - **Awaited restores.** Three sites (`osascript` subprocess, `runJSLarge`, `screenshot`'s screencapture path) previously called `_helperActivateApp(prev).catch(() => {})` without awaiting. `NSRunningApplication.activate()` is async at the OS level, so the function returned to user-space while Safari was still frontmost — keystrokes during the ~5–50ms race landed in Safari. All three now `await restoreFocusIfStolen(prev)`.
+  - **Verify-and-hide fallback inside `restoreFocusIfStolen`.** macOS Tahoe's window-server policy can silently block `NSRunningApplication.activate()`, leaving the previously activated app stuck behind Safari. The function now: activates the saved bundle → settles 5ms (Tahoe needs time to honor the activate) → re-reads frontmost → falls back to `_helperHideSafari()` only if Safari is still on top. Hiding Safari is reliable because the OS auto-picks the next app — which is the one we saved.
+- **Background profile-window polling no longer participates in focus-guard.** Every 3 seconds the server polls `tell application "Safari" to return name of window N` to detect profile-window changes. Once `osascriptFast` became focus-guarded this poll became a tiny ~5ms window during which a manual user switch to Safari could be misread as "Safari stole focus" and trigger the hide fallback against them. The polling now passes `noFocusGuard: true` because the script is read-only and provably can't activate Safari.
+
 ## [2.11.6] - 2026-05-26
 
 ### Security
