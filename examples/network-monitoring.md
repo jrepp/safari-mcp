@@ -8,7 +8,7 @@ See what resources the page has loaded (images, scripts, API calls) using the Pe
 
 ```json
 // Navigate to a page
-{ "tool": "safari_new_tab", "arguments": { "url": "https://api.github.com" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://api.github.com" } }
 
 // Get a quick overview of loaded resources
 { "tool": "safari_network", "arguments": { "limit": 20 } }
@@ -28,16 +28,16 @@ For full request/response inspection including headers, status codes, and POST b
 
 ```json
 // Step 1: Start capturing (intercepts fetch + XHR from this point forward)
-{ "tool": "safari_start_network_capture", "arguments": {} }
+{ "tool": "safari_network", "arguments": { "action": "capture_start" } }
 
 // Step 2: Navigate or interact to trigger API calls
 { "tool": "safari_navigate", "arguments": { "url": "https://example.com/dashboard" } }
 
 // Step 3: Wait for the page to load and make its API calls
-{ "tool": "safari_wait", "arguments": { "ms": 3000 } }
+{ "tool": "safari_wait", "arguments": { "action": "time", "ms": 3000 } }
 
 // Step 4: Get captured requests with full details
-{ "tool": "safari_network_details", "arguments": {} }
+{ "tool": "safari_network", "arguments": { "action": "details" } }
 ```
 
 **Expected output:** Array of captured requests with method, URL, status, headers, and timing:
@@ -67,7 +67,7 @@ Focus on specific API endpoints.
 
 ```json
 // Only show requests to the /api/ path
-{ "tool": "safari_network_details", "arguments": { "filter": "/api/", "limit": 10 } }
+{ "tool": "safari_network", "arguments": { "action": "details", "filter": "/api/", "limit": 10 } }
 ```
 
 ## 4. Clear and re-capture
@@ -76,16 +76,16 @@ Reset the capture buffer to isolate a specific interaction.
 
 ```json
 // Clear previous captures
-{ "tool": "safari_clear_network", "arguments": {} }
+{ "tool": "safari_network", "arguments": { "action": "clear" } }
 
 // Perform the action you want to monitor
 { "tool": "safari_click", "arguments": { "text": "Save Changes" } }
 
 // Wait for API calls to complete
-{ "tool": "safari_wait", "arguments": { "ms": 2000 } }
+{ "tool": "safari_wait", "arguments": { "action": "time", "ms": 2000 } }
 
 // See only the requests triggered by that click
-{ "tool": "safari_network_details", "arguments": {} }
+{ "tool": "safari_network", "arguments": { "action": "details" } }
 ```
 
 ## 5. Mock API responses
@@ -95,8 +95,9 @@ Intercept network requests and return custom responses. Useful for testing error
 ```json
 // Mock a specific API endpoint to return an error
 {
-  "tool": "safari_mock_route",
+  "tool": "safari_network",
   "arguments": {
+    "action": "mock",
     "urlPattern": "/api/v1/user/profile",
     "response": {
       "status": 500,
@@ -107,7 +108,7 @@ Intercept network requests and return custom responses. Useful for testing error
 }
 
 // Now navigate or reload -- the app will receive the mocked 500 error
-{ "tool": "safari_reload", "arguments": {} }
+{ "tool": "safari_history", "arguments": { "action": "reload" } }
 ```
 
 **Expected output:** `"Mock registered for pattern: /api/v1/user/profile"`. All subsequent fetch/XHR requests matching the pattern will receive the mocked response instead of hitting the real server.
@@ -116,8 +117,9 @@ Intercept network requests and return custom responses. Useful for testing error
 
 ```json
 {
-  "tool": "safari_mock_route",
+  "tool": "safari_network",
   "arguments": {
+    "action": "mock",
     "urlPattern": "/api/v1/products",
     "response": {
       "status": 200,
@@ -131,7 +133,7 @@ Intercept network requests and return custom responses. Useful for testing error
 ## 7. Remove all mocks
 
 ```json
-{ "tool": "safari_clear_mocks", "arguments": {} }
+{ "tool": "safari_network", "arguments": { "action": "clear_mocks" } }
 ```
 
 ## 8. Monitor console output alongside network
@@ -140,16 +142,16 @@ Combine network monitoring with console capture to see errors and warnings.
 
 ```json
 // Start both captures
-{ "tool": "safari_start_network_capture", "arguments": {} }
-{ "tool": "safari_start_console", "arguments": {} }
+{ "tool": "safari_network", "arguments": { "action": "capture_start" } }
+{ "tool": "safari_console", "arguments": { "action": "start" } }
 
 // Interact with the page
 { "tool": "safari_click", "arguments": { "text": "Load Data" } }
-{ "tool": "safari_wait", "arguments": { "ms": 3000 } }
+{ "tool": "safari_wait", "arguments": { "action": "time", "ms": 3000 } }
 
 // Check for API errors and console errors together
-{ "tool": "safari_network_details", "arguments": { "filter": "/api/" } }
-{ "tool": "safari_console_filter", "arguments": { "level": "error" } }
+{ "tool": "safari_network", "arguments": { "action": "details", "filter": "/api/" } }
+{ "tool": "safari_console", "arguments": { "action": "get", "level": "error" } }
 ```
 
 **Expected output:** Two complementary views -- network requests showing HTTP status codes, and console errors showing any JavaScript exceptions or error messages triggered by those requests.
@@ -160,13 +162,13 @@ Test how a page behaves on slow connections.
 
 ```json
 // Throttle to 3G speeds
-{ "tool": "safari_throttle_network", "arguments": { "profile": "slow-3g" } }
+{ "tool": "safari_network", "arguments": { "action": "throttle", "profile": "slow-3g" } }
 
 // Navigate and observe load behavior
 { "tool": "safari_navigate", "arguments": { "url": "https://example.com" } }
 
 // Check performance metrics
-{ "tool": "safari_performance_metrics", "arguments": {} }
+{ "tool": "safari_extract", "arguments": { "kind": "performance" } }
 ```
 
 **Expected output:** Performance metrics showing navigation timing, Web Vitals (FCP, LCP, CLS), and resource breakdown under throttled conditions.

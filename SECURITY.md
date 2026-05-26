@@ -58,7 +58,7 @@ Safari's "Allow JavaScript from Apple Events" setting (under Develop menu) must 
 
 ### Tab Ownership Guard
 
-safari-mcp implements a tab ownership model to protect the user's browsing session. MCP clients are expected to only interact with tabs they opened via `safari_new_tab`, never with pre-existing user tabs. This prevents accidental navigation, form submission, or data loss in tabs the user is actively working in.
+safari-mcp implements a tab ownership model to protect the user's browsing session. MCP clients are expected to only interact with tabs they opened via `safari_tabs` with `action: "new"`, never with pre-existing user tabs. This prevents accidental navigation, form submission, or data loss in tabs the user is actively working in.
 
 ### Extension Permissions
 

@@ -4,15 +4,18 @@ Work with multiple tabs safely, without touching the user's existing tabs. Safar
 
 ## The golden rule
 
-**Never interact with a tab you didn't open.** Always open your own tabs with `safari_new_tab`.
+**Never interact with a tab you didn't open.** Always open your own tabs with `safari_tabs` using `action: "new"`.
 
 ## 1. Inventory existing tabs first
 
-Before any work, check what tabs are already open so you know which ones belong to the user.
+Before opening a new tab, search for an existing relevant tab. This avoids duplicate local app tabs and gives the agent the right target when the user already has the page open.
 
 ```json
-// Step 1: See all existing tabs (these are the USER'S tabs -- never touch them)
-{ "tool": "safari_list_tabs", "arguments": {} }
+// Find an existing app tab and anchor MCP to it if there is exactly one match
+{ "tool": "safari_tabs", "arguments": { "action": "search", "urlContains": "localhost:3000", "activate": true } }
+
+// Or see all existing tabs
+{ "tool": "safari_tabs", "arguments": { "action": "list" } }
 ```
 
 **Expected output:**
@@ -30,10 +33,10 @@ Tabs 1-3 are the user's. Never navigate, click, or fill in these tabs.
 
 ```json
 // Open tabs for your work -- remember the indices
-{ "tool": "safari_new_tab", "arguments": { "url": "https://example.com/page-a" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://example.com/page-a" } }
 // Returns: { "tabIndex": 4, ... }
 
-{ "tool": "safari_new_tab", "arguments": { "url": "https://example.com/page-b" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://example.com/page-b" } }
 // Returns: { "tabIndex": 5, ... }
 ```
 
@@ -43,13 +46,13 @@ Tabs 4 and 5 are yours. Only interact with these.
 
 ```json
 // Switch to your first tab
-{ "tool": "safari_switch_tab", "arguments": { "index": 4 } }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 4 } }
 
 // Do some work -- extract data
-{ "tool": "safari_extract_tables", "arguments": {} }
+{ "tool": "safari_extract", "arguments": { "kind": "tables" } }
 
 // Switch to your second tab
-{ "tool": "safari_switch_tab", "arguments": { "index": 5 } }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 5 } }
 
 // Do different work
 { "tool": "safari_read_page", "arguments": {} }
@@ -61,32 +64,32 @@ Compare pricing pages from two competitors side by side.
 
 ```json
 // Step 1: Inventory user's tabs
-{ "tool": "safari_list_tabs", "arguments": {} }
+{ "tool": "safari_tabs", "arguments": { "action": "list" } }
 // Note: user has tabs 1-3
 
 // Step 2: Open competitor A
-{ "tool": "safari_new_tab", "arguments": { "url": "https://competitor-a.com/pricing" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://competitor-a.com/pricing" } }
 // Tab 4 is ours
 
 // Step 3: Open competitor B
-{ "tool": "safari_new_tab", "arguments": { "url": "https://competitor-b.com/pricing" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://competitor-b.com/pricing" } }
 // Tab 5 is ours
 
 // Step 4: Extract pricing from competitor A
-{ "tool": "safari_switch_tab", "arguments": { "index": 4 } }
-{ "tool": "safari_wait_for", "arguments": { "selector": ".pricing-table", "timeout": 5000 } }
-{ "tool": "safari_extract_tables", "arguments": { "selector": ".pricing-table" } }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 4 } }
+{ "tool": "safari_wait", "arguments": { "selector": ".pricing-table", "timeout": 5000 } }
+{ "tool": "safari_extract", "arguments": { "kind": "tables", "selector": ".pricing-table" } }
 
 // Step 5: Extract pricing from competitor B
-{ "tool": "safari_switch_tab", "arguments": { "index": 5 } }
-{ "tool": "safari_wait_for", "arguments": { "selector": ".pricing-table", "timeout": 5000 } }
-{ "tool": "safari_extract_tables", "arguments": { "selector": ".pricing-table" } }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 5 } }
+{ "tool": "safari_wait", "arguments": { "selector": ".pricing-table", "timeout": 5000 } }
+{ "tool": "safari_extract", "arguments": { "kind": "tables", "selector": ".pricing-table" } }
 
 // Step 6: Clean up when done
-{ "tool": "safari_switch_tab", "arguments": { "index": 5 } }
-{ "tool": "safari_close_tab", "arguments": {} }
-{ "tool": "safari_switch_tab", "arguments": { "index": 4 } }
-{ "tool": "safari_close_tab", "arguments": {} }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 5 } }
+{ "tool": "safari_tabs", "arguments": { "action": "close" } }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 4 } }
+{ "tool": "safari_tabs", "arguments": { "action": "close" } }
 ```
 
 ## 5. Multi-step form workflow across tabs
@@ -95,7 +98,7 @@ Fill a form that requires information from another page.
 
 ```json
 // Step 1: Open the source page to get reference data
-{ "tool": "safari_new_tab", "arguments": { "url": "https://internal.company.com/employee/12345" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://internal.company.com/employee/12345" } }
 // Tab 4 is ours
 
 // Step 2: Read the employee data
@@ -103,11 +106,12 @@ Fill a form that requires information from another page.
 // Agent stores the employee name, email, department, etc.
 
 // Step 3: Open the target form in a second tab
-{ "tool": "safari_new_tab", "arguments": { "url": "https://hr-system.company.com/new-request" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://hr-system.company.com/new-request" } }
 // Tab 5 is ours
 
 // Step 4: Fill the form using data from the other tab
-{ "tool": "safari_fill_form", "arguments": {
+{ "tool": "safari_form", "arguments": {
+  "action": "fill_all",
   "fields": [
     { "selector": "#employee-name", "value": "Jane Smith" },
     { "selector": "#employee-email", "value": "jane@company.com" },
@@ -116,8 +120,8 @@ Fill a form that requires information from another page.
 } }
 
 // Step 5: Clean up the source tab (keep the form tab for review)
-{ "tool": "safari_switch_tab", "arguments": { "index": 4 } }
-{ "tool": "safari_close_tab", "arguments": {} }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 4 } }
+{ "tool": "safari_tabs", "arguments": { "action": "close" } }
 ```
 
 ## 6. Handle tab index changes
@@ -127,11 +131,11 @@ When you close a tab, higher-numbered tabs shift down. Always re-check if needed
 ```json
 // You have tabs 4 and 5
 // Close tab 4 -- tab 5 becomes tab 4
-{ "tool": "safari_switch_tab", "arguments": { "index": 4 } }
-{ "tool": "safari_close_tab", "arguments": {} }
+{ "tool": "safari_tabs", "arguments": { "action": "switch", "index": 4 } }
+{ "tool": "safari_tabs", "arguments": { "action": "close" } }
 
 // If unsure about indices after closing, re-list
-{ "tool": "safari_list_tabs", "arguments": {} }
+{ "tool": "safari_tabs", "arguments": { "action": "list" } }
 ```
 
 ## Automatic cleanup

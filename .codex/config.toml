@@ -1,0 +1,6 @@
+[mcp_servers.safari]
+command = "node"
+args = ["index.js"]
+
+[mcp_servers.safari.env]
+SAFARI_MCP_QUIET = "1"

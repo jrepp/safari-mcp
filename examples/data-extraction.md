@@ -8,10 +8,10 @@ Pull data from HTML tables -- useful for scraping pricing pages, comparison tabl
 
 ```json
 // Step 1: Navigate to a page with tables
-{ "tool": "safari_new_tab", "arguments": { "url": "https://en.wikipedia.org/wiki/List_of_countries_by_GDP_(nominal)" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://en.wikipedia.org/wiki/List_of_countries_by_GDP_(nominal)" } }
 
 // Step 2: Extract all tables
-{ "tool": "safari_extract_tables", "arguments": {} }
+{ "tool": "safari_extract", "arguments": { "kind": "tables" } }
 ```
 
 **Expected output:** JSON array of tables, each with headers and rows:
@@ -33,7 +33,7 @@ Pull data from HTML tables -- useful for scraping pricing pages, comparison tabl
 To extract a specific table:
 
 ```json
-{ "tool": "safari_extract_tables", "arguments": { "selector": "table.wikitable", "limit": 1 } }
+{ "tool": "safari_extract", "arguments": { "kind": "tables", "selector": "table.wikitable", "limit": 1 } }
 ```
 
 ## 2. Extract all links with metadata
@@ -41,7 +41,7 @@ To extract a specific table:
 Get every link on a page with its href, text, rel attributes, and external/nofollow detection.
 
 ```json
-{ "tool": "safari_extract_links", "arguments": {} }
+{ "tool": "safari_extract", "arguments": { "kind": "links" } }
 ```
 
 **Expected output:** JSON array of links:
@@ -55,7 +55,7 @@ Get every link on a page with its href, text, rel attributes, and external/nofol
 Filter links by URL or text substring:
 
 ```json
-{ "tool": "safari_extract_links", "arguments": { "filter": "github.com", "limit": 20 } }
+{ "tool": "safari_extract", "arguments": { "kind": "links", "filter": "github.com", "limit": 20 } }
 ```
 
 ## 3. Extract meta tags, OG data, and structured data
@@ -63,14 +63,14 @@ Filter links by URL or text substring:
 Get everything search engines and social platforms see: title, description, Open Graph, Twitter Cards, JSON-LD, canonical URL, and alternate languages.
 
 ```json
-{ "tool": "safari_extract_meta", "arguments": {} }
+{ "tool": "safari_extract", "arguments": { "kind": "meta" } }
 ```
 
 **Expected output:**
 ```json
 {
   "title": "Safari MCP - Browser Automation for AI Agents",
-  "description": "80 tools for native Safari automation...",
+  "description": "19 compact tools for native Safari automation...",
   "canonical": "https://example.com/safari-mcp",
   "og": {
     "og:title": "Safari MCP",
@@ -92,7 +92,7 @@ Get everything search engines and social platforms see: title, description, Open
 Audit images on a page -- find missing alt text, oversized images, or lazy-loading issues.
 
 ```json
-{ "tool": "safari_extract_images", "arguments": {} }
+{ "tool": "safari_extract", "arguments": { "kind": "images" } }
 ```
 
 **Expected output:** Array of images with src, alt, dimensions, loading attribute, and whether the image is visible in the viewport.
@@ -106,7 +106,7 @@ For data that doesn't fit neatly into tables or links, use `safari_evaluate` to 
 {
   "tool": "safari_evaluate",
   "arguments": {
-    "expression": "JSON.stringify([...document.querySelectorAll('.product-card')].map(card => ({ name: card.querySelector('h3')?.textContent?.trim(), price: card.querySelector('.price')?.textContent?.trim(), inStock: !card.querySelector('.out-of-stock') })))"
+    "script": "JSON.stringify([...document.querySelectorAll('.product-card')].map(card => ({ name: card.querySelector('h3')?.textContent?.trim(), price: card.querySelector('.price')?.textContent?.trim(), inStock: !card.querySelector('.out-of-stock') })))"
   }
 }
 ```
@@ -140,13 +140,13 @@ The real power: extract data from pages that require login. Since Safari MCP use
 
 ```json
 // Google Search Console -- already logged in via Safari
-{ "tool": "safari_new_tab", "arguments": { "url": "https://search.google.com/search-console/performance/search-analytics?resource_id=https://example.com/" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://search.google.com/search-console/performance/search-analytics?resource_id=https://example.com/" } }
 
 // Wait for the performance table to load
-{ "tool": "safari_wait_for", "arguments": { "selector": "table", "timeout": 10000 } }
+{ "tool": "safari_wait", "arguments": { "selector": "table", "timeout": 10000 } }
 
 // Extract the search queries table
-{ "tool": "safari_extract_tables", "arguments": { "selector": "table", "limit": 1 } }
+{ "tool": "safari_extract", "arguments": { "kind": "tables", "selector": "table", "limit": 1 } }
 ```
 
 **Expected output:** Your actual Search Console data as structured JSON -- no API keys or OAuth setup needed.

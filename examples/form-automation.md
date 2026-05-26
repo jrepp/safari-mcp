@@ -8,10 +8,10 @@ Before filling, discover what forms exist and get the right selectors.
 
 ```json
 // Step 1: Navigate to a page with forms
-{ "tool": "safari_new_tab", "arguments": { "url": "https://example.com/contact" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://example.com/contact" } }
 
 // Step 2: Auto-detect all forms, fields, and submit buttons
-{ "tool": "safari_detect_forms", "arguments": {} }
+{ "tool": "safari_form", "arguments": { "action": "detect" } }
 ```
 
 **Expected output:** JSON listing each form with its fields, input types, selectors, and submit button:
@@ -44,8 +44,9 @@ Before filling, discover what forms exist and get the right selectors.
 
 ```json
 {
-  "tool": "safari_fill_form",
+  "tool": "safari_form",
   "arguments": {
+    "action": "fill_all",
     "fields": [
       { "selector": "#name", "value": "Jane Smith" },
       { "selector": "#email", "value": "jane@example.com" },
@@ -61,7 +62,7 @@ Before filling, discover what forms exist and get the right selectors.
 
 ```json
 // Native <select> dropdown
-{ "tool": "safari_select_option", "arguments": { "selector": "#subject", "value": "Support" } }
+{ "tool": "safari_form", "arguments": { "action": "select", "selector": "#subject", "value": "Support" } }
 ```
 
 **Expected output:** `"Selected: Support"`. For custom dropdowns (React Select, Material UI), use click-based interaction instead:
@@ -78,8 +79,9 @@ Fill all fields and submit the form in a single operation.
 
 ```json
 {
-  "tool": "safari_fill_and_submit",
+  "tool": "safari_form",
   "arguments": {
+    "action": "submit",
     "fields": [
       { "selector": "#name", "value": "Jane Smith" },
       { "selector": "#email", "value": "jane@example.com" },
@@ -123,10 +125,10 @@ For fields that need keystroke-level input (autocomplete, search-as-you-type):
 { "tool": "safari_click", "arguments": { "selector": "input[type='search']" } }
 
 // Type character by character with events
-{ "tool": "safari_type_text", "arguments": { "text": "safari mcp", "selector": "input[type='search']" } }
+{ "tool": "safari_keyboard", "arguments": { "action": "type", "text": "safari mcp", "selector": "input[type='search']" } }
 
 // Press Enter to search
-{ "tool": "safari_press_key", "arguments": { "key": "Enter" } }
+{ "tool": "safari_keyboard", "arguments": { "action": "press", "key": "Enter" } }
 ```
 
 **Expected output:** Each character is typed with keydown/keypress/keyup events, triggering autocomplete suggestions. All keyboard input is JavaScript-based, so it works regardless of the system keyboard layout.

@@ -142,7 +142,7 @@ const _openedTabs = new Map();
 // ========== TAB OWNERSHIP: prevent operating on user's tabs ==========
 // Tracks URLs of tabs opened by this MCP session.
 // Any tool that modifies a tab (navigate, click, fill, etc.) is blocked
-// unless the current tab was opened via safari_new_tab.
+// unless the current tab was opened via safari_tabs action=new.
 // Hydrated from ~/.safari-mcp/owned-tabs.json so ownership survives MCP restarts.
 const _ownedTabURLs = new Set(_loadOwnershipFile().map(e => e.url));
 
@@ -835,18 +835,18 @@ function _assertOwnedTabForWrite(operationName) {
   const currentUrl = safari.getActiveTabURL();
   if (_ownedTabURLs.size === 0 && _openedTabs.size === 0) {
     // No tabs opened yet — block everything except read-only ops
-    const msg = `⚠️ Tab safety: no tabs opened yet. Call safari_new_tab first before "${operationName}".`;
+    const msg = `Tab safety: no tabs opened yet. Call safari_tabs with action "new" first before "${operationName}".`;
     console.error(`[Safari MCP] ${msg}`);
     throw new Error(msg);
   } else if (!currentUrl && safari.getActiveTabIndex() === null) {
-    const msg = `⚠️ Tab safety: refusing "${operationName}" — no active owned tab is anchored in this MCP session. Use safari_new_tab or safari_switch_tab first.`;
+    const msg = `Tab safety: refusing "${operationName}" — no active owned tab is anchored in this MCP session. Use safari_tabs with action "new" or "switch" first.`;
     console.error(`[Safari MCP] ${msg}`);
     throw new Error(msg);
   } else if (currentUrl && !_isURLOwned(currentUrl)) {
     // about:blank tabs are owned if we have any tracked tabs (new_tab creates them at about:blank)
     const isBlankOwned = (currentUrl === 'about:blank' || currentUrl === 'missing value') && (_openedTabs.size > 0 || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
     if (!isBlankOwned) {
-      const msg = `⚠️ Tab safety: refusing "${operationName}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_new_tab or safari_switch_tab to target your own tab.`;
+      const msg = `Tab safety: refusing "${operationName}" — current tab (${currentUrl}) was not opened by this MCP session. Use safari_tabs with action "new" or "switch" to target your own tab.`;
       console.error(`[Safari MCP] ${msg}`);
       throw new Error(msg);
     }
@@ -940,1463 +940,599 @@ function unwrapPageText(text) {
   return value.slice(firstNewline + 1, endIndex).trim();
 }
 
-// ========== NAVIGATION ==========
+// ========== COMPACT TOOL SURFACE ==========
+
+function textResult(result, { untrusted = false, pretty = false } = {}) {
+  const text = typeof result === "string" ? result : JSON.stringify(result, null, pretty ? 2 : 0);
+  const safeText = text === undefined ? "" : text;
+  return { content: [{ type: "text", text: untrusted ? pageText(safeText) : safeText }] };
+}
+
+function errorResult(message) {
+  return { content: [{ type: "text", text: message }], isError: true };
+}
+
+function unknownAction(tool, action) {
+  return errorResult(`Unknown ${tool} action: ${action}`);
+}
+
+async function openTrackedTab(url) {
+  if (_openedTabs.size >= MAX_TABS) {
+    let oldestIdx = null, oldestTime = Infinity;
+    for (const [idx, info] of _openedTabs) {
+      if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
+    }
+    if (oldestIdx !== null) {
+      console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached — closing oldest tab #${oldestIdx}`);
+      try {
+        safari.setActiveTabIndex(oldestIdx);
+        await safari.closeTab();
+      } catch {}
+      _untrackTab(oldestIdx);
+    }
+  }
+
+  const rawResult = await extensionOrFallback("new_tab", { url }, () => safari.newTab(url));
+  let result = rawResult;
+  if (typeof rawResult === "string") {
+    try { result = JSON.parse(rawResult); } catch {}
+  }
+  if (result?.tabIndex) {
+    safari.setActiveTabIndex(result.tabIndex);
+    _trackTab(result.tabIndex, url);
+  }
+  if (result?.url || url) {
+    const trackUrl = (!result?.url || result.url === "about:blank") && url ? url : result.url;
+    safari.setActiveTabURL(trackUrl);
+    _addOwnedURL(trackUrl);
+    if (url && url !== trackUrl) _addOwnedURL(url);
+  }
+  const effectiveURL = (result?.url && result.url !== "about:blank" && result.url !== "missing value") ? result.url : url;
+  if (!effectiveURL) _markBlankTabOpened();
+  return rawResult;
+}
+
+async function switchTrackedTab(index) {
+  if (_ownedTabURLs.size > 0) {
+    try {
+      const tabs = await safari.listTabs();
+      const parsed = typeof tabs === "string" ? JSON.parse(tabs) : tabs;
+      const target = parsed.find(t => t.index === index);
+      if (target && target.url && !_isURLOwned(target.url)) {
+        const isBlankOwned = (target.url === "about:blank" || target.url === "missing value") && (_openedTabs.has(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
+        if (!isBlankOwned) {
+          const msg = `Tab safety: refusing switch to index ${index} (${target.url}) — not opened by this MCP session. Use safari_tabs action=new first.`;
+          console.error(`[Safari MCP] ${msg}`);
+          return errorResult(msg);
+        }
+      }
+    } catch {}
+  }
+  const result = await extensionOrFallback("switch_tab", { index }, () => safari.switchTab(index));
+  safari.setActiveTabIndex(index);
+  if (result && typeof result === "object" && result.url) safari.setActiveTabURL(result.url);
+  return textResult(result);
+}
+
+async function waitForNewTab({ timeout, urlContains }) {
+  const timeoutMs = timeout || 10000;
+  const beforeRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+  const beforeTabs = typeof beforeRaw === "string" ? JSON.parse(beforeRaw) : beforeRaw;
+  const beforeIds = new Set(beforeTabs.map(t => `${t.index}:${t.url}`));
+  const beforeCount = beforeTabs.length;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 500));
+    const nowRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+    const nowTabs = typeof nowRaw === "string" ? JSON.parse(nowRaw) : nowRaw;
+    if (nowTabs.length <= beforeCount) continue;
+    for (const tab of nowTabs) {
+      if (beforeIds.has(`${tab.index}:${tab.url}`)) continue;
+      if (tab.url === "about:blank") {
+        let resolved = null;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          await new Promise(r => setTimeout(r, 300));
+          const refreshed = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+          const refreshedTabs = typeof refreshed === "string" ? JSON.parse(refreshed) : refreshed;
+          resolved = refreshedTabs.find(t => t.index === tab.index);
+          if (resolved && resolved.url !== "about:blank") break;
+          resolved = null;
+        }
+        if (!resolved || resolved.url === "about:blank") continue;
+        if (urlContains && !resolved.url.includes(urlContains)) continue;
+        await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));
+        safari.setActiveTabIndex(resolved.index);
+        safari.setActiveTabURL(resolved.url);
+        return textResult(`Found new tab: ${resolved.title} (${resolved.url})`);
+      }
+      if (urlContains && !tab.url.includes(urlContains)) continue;
+      await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
+      safari.setActiveTabIndex(tab.index);
+      safari.setActiveTabURL(tab.url);
+      return textResult(`Found new tab: ${tab.title} (${tab.url})`);
+    }
+  }
+  return textResult("TIMEOUT: no new tab appeared");
+}
+
+async function searchTabs({ query, urlContains, titleContains, index, activate = false }) {
+  const raw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+  const tabs = typeof raw === "string" ? JSON.parse(raw) : raw;
+  const q = query ? String(query).toLowerCase() : null;
+  const urlNeedle = urlContains ? String(urlContains).toLowerCase() : null;
+  const titleNeedle = titleContains ? String(titleContains).toLowerCase() : null;
+  const matches = tabs.filter(tab => {
+    if (index !== undefined && tab.index !== index) return false;
+    const title = String(tab.title || "").toLowerCase();
+    const url = String(tab.url || "").toLowerCase();
+    if (q && !title.includes(q) && !url.includes(q)) return false;
+    if (urlNeedle && !url.includes(urlNeedle)) return false;
+    if (titleNeedle && !title.includes(titleNeedle)) return false;
+    return true;
+  });
+
+  if (activate) {
+    if (matches.length === 0) return errorResult("No matching tab found");
+    if (matches.length > 1 && index === undefined) {
+      return errorResult(`Found ${matches.length} matching tabs; pass index to activate one specific tab:\n${JSON.stringify(matches, null, 2)}`);
+    }
+    const tab = matches[0];
+    safari.setActiveTabIndex(tab.index);
+    safari.setActiveTabURL(tab.url);
+    return textResult({ activated: tab }, { pretty: true });
+  }
+
+  return textResult(matches, { pretty: true });
+}
 
 server.tool(
   "safari_navigate",
-  "Navigate to a URL in Safari. Waits for page to fully load.",
+  "Navigate the active MCP-owned Safari tab to a URL and wait for load.",
   { url: z.string().describe("URL to navigate to") },
   async ({ url }) => {
     const oldUrl = safari.getActiveTabURL();
-    const result = await extensionOrFallback(
-      "navigate", { url },
-      () => safari.navigate(url)
-    );
-    // Update ownership: old URL → new URL (tab is still ours, just different URL)
+    const result = await extensionOrFallback("navigate", { url }, () => safari.navigate(url));
     if (oldUrl) _updateOwnedURL(oldUrl, url);
-    return { content: [{ type: "text", text: pageText(result) }] };
+    return textResult(result, { untrusted: true });
   }
 );
-
-server.tool(
-  "safari_go_back",
-  "Go back in browser history",
-  {},
-  async () => {
-    const result = await extensionOrFallback("go_back", {}, () => safari.goBack());
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_go_forward",
-  "Go forward in browser history",
-  {},
-  async () => {
-    const result = await extensionOrFallback("go_forward", {}, () => safari.goForward());
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_reload",
-  "Reload the current page",
-  { hard: z.boolean().optional().describe("Hard reload (bypass cache)") },
-  async ({ hard }) => {
-    const result = await extensionOrFallback("reload", { hard }, () => safari.reload(hard));
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
-  }
-);
-
-// ========== PAGE INFO ==========
 
 server.tool(
   "safari_read_page",
-  "Read page text content (title, URL, body text). Use for reading article text or page content. For interacting with elements, prefer safari_snapshot (gives ref IDs). Use selector to read specific element. Use maxLength to limit output.",
+  "Read current page content. Use format=source for HTML source.",
   {
-    selector: z.string().optional().describe("CSS selector to read specific element"),
-    maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
+    selector: z.string().optional().describe("CSS selector to read a subtree"),
+    maxLength: z.coerce.number().optional().describe("Max characters to return"),
+    format: z.enum(["text", "source"]).optional().describe("text or source"),
   },
-  async ({ selector, maxLength }) => {
-    const result = await extensionOrFallback(
-      "read_page", { selector, maxLength },
-      () => safari.readPage({ selector, maxLength })
-    );
-    return { content: [{ type: "text", text: pageText(result) }] };
+  async ({ selector, maxLength, format }) => {
+    const result = format === "source"
+      ? await extensionOrFallback("get_source", { maxLength }, () => safari.getPageSource({ maxLength }))
+      : await extensionOrFallback("read_page", { selector, maxLength }, () => safari.readPage({ selector, maxLength }));
+    return textResult(result, { untrusted: true });
   }
 );
-
-server.tool(
-  "safari_get_source",
-  "Get HTML source of current page",
-  { maxLength: z.coerce.number().optional().describe("Max chars (default: 200000)") },
-  async ({ maxLength }) => {
-    const result = await extensionOrFallback(
-      "get_source", { maxLength },
-      () => safari.getPageSource({ maxLength })
-    );
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== SNAPSHOT (ref-based interaction like Chrome DevTools MCP) ==========
 
 server.tool(
   "safari_snapshot",
-  "PREFERRED way to see page state. Returns accessibility tree with ref IDs for every interactive element. Use refs with click/fill/type instead of CSS selectors. Workflow: snapshot → see refs → click({ref:'0_5'}). PREFER THIS over safari_screenshot (cheaper, structured text vs heavy image) and over safari_read_page (includes interactive refs). Use safari_screenshot only when you need to see visual layout/styling.",
-  { selector: z.string().optional().describe("CSS selector for subtree (default: full page)") },
+  "Preferred page state tool. Returns structured accessibility-like tree with refs for click/fill/type.",
+  { selector: z.string().optional().describe("CSS selector for subtree") },
   async (args) => {
     const gen = safari.getNextSnapshotGen();
-    const result = await extensionOrFallback(
-      "snapshot", { selector: args.selector, gen },
-      () => safari.takeSnapshot({ ...args, _gen: gen })
-    );
-    return { content: [{ type: "text", text: pageText(result) }] };
+    const result = await extensionOrFallback("snapshot", { selector: args.selector, gen }, () => safari.takeSnapshot({ ...args, _gen: gen }));
+    return textResult(result, { untrusted: true });
   }
 );
-
-server.tool(
-  "safari_navigate_and_read",
-  "Navigate to a URL and return the page content in one step — saves 1 full round-trip vs navigate+read_page. Use instead of safari_navigate + safari_read_page.",
-  {
-    url: z.string().describe("URL to navigate to"),
-    maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
-    timeout: z.coerce.number().optional().describe("Load timeout in ms (default: 30000)"),
-  },
-  async ({ url, maxLength, timeout }) => {
-    const oldUrl = safari.getActiveTabURL();
-    const result = await extensionOrFallback(
-      "navigate_and_read", { url, maxLength, timeout },
-      async () => {
-        await safari.navigate(url);
-        return safari.readPage({ maxLength });
-      }
-    );
-    // Update ownership: old URL → new URL
-    if (oldUrl) _updateOwnedURL(oldUrl, url);
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== CLICK ==========
 
 server.tool(
   "safari_click",
-  "Click element. Use ref (from snapshot), selector, text, or x/y. Works on React/Airtable/virtual DOM apps via full PointerEvent+MouseEvent sequence + React Fiber fallback. Pure JS — never touches user's mouse. When using ref, always take a FRESH safari_snapshot first — refs expire after each new snapshot.",
+  "Click an element by ref, selector, text, or coordinates. Supports native, double, right-click, wait, and read-after variants.",
   {
-    ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
+    ref: z.string().optional().describe("Ref from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
-    text: z.string().optional().describe("Visible text to find and click"),
-    x: z.coerce.number().optional().describe("X coordinate"),
-    y: z.coerce.number().optional().describe("Y coordinate"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y },
-      () => safari.click(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_click_and_read",
-  "Click an element then return the updated page — saves 1 full round-trip vs separate click+read_page. Handles both React Router navigation and full page loads.",
-  {
-    text: z.string().optional().describe("Visible text of the element to click"),
-    selector: z.string().optional().describe("CSS selector"),
-    x: z.coerce.number().optional().describe("X coordinate"),
-    y: z.coerce.number().optional().describe("Y coordinate"),
-    wait: z.coerce.number().optional().describe("Ms to wait after click (default: auto-detect navigation)"),
-    maxLength: z.coerce.number().optional().describe("Max chars to return (default: 50000)"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "click_and_read",
-      { selector: args.selector, text: args.text, x: args.x, y: args.y, wait: args.wait, maxLength: args.maxLength },
-      async () => {
-        await safari.click(args);
-        if (args.wait) {
-          await new Promise(r => setTimeout(r, args.wait));
-        } else {
-          // Smart wait: brief pause then check if page is loading
-          await new Promise(r => setTimeout(r, 50));
-          const state = await safari.runJSQuick("document.readyState");
-          if (state === "loading") {
-            // Page is navigating — wait for it to complete
-            await safari.runJSQuick("(async function(){for(var i=0;i<50;i++){if(document.readyState==='complete')return 'done';await new Promise(r=>setTimeout(r,200));}return 'timeout';})()");
-          } else {
-            await new Promise(r => setTimeout(r, 100)); // SPA settle time
-          }
-        }
-        return safari.readPage({ maxLength: args.maxLength });
-      }
-    );
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_double_click",
-  "Double-click an element by CSS selector or x/y coordinates (e.g. to select a word in text)",
-  {
-    selector: z.string().optional().describe("CSS selector"),
-    x: z.coerce.number().optional().describe("X coordinate"),
-    y: z.coerce.number().optional().describe("Y coordinate"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "double_click", { selector: args.selector, x: args.x, y: args.y },
-      () => safari.doubleClick(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_right_click",
-  "Right-click (context menu) an element by CSS selector or x/y coordinates",
-  {
-    selector: z.string().optional().describe("CSS selector"),
-    x: z.coerce.number().optional().describe("X coordinate"),
-    y: z.coerce.number().optional().describe("Y coordinate"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "right_click", { selector: args.selector, x: args.x, y: args.y },
-      () => safari.rightClick(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-// ========== NATIVE CLICK (OS-level, isTrusted: true) ==========
-
-server.tool(
-  "safari_native_click",
-  "OS-level mouse click via macOS CGEvent — produces isTrusted: true events that pass WAF/bot detection (G2, Cloudflare, etc.). Use when regular safari_click fails with 405/403 errors or form submissions are blocked. Trade-off: physically moves the mouse cursor and requires Safari window to be visible. Use ref (from snapshot), selector, text, or x/y. When using ref, always take a FRESH safari_snapshot first.",
-  {
-    ref: z.string().optional().describe("Ref ID from safari_snapshot (e.g. '0_5')"),
-    selector: z.string().optional().describe("CSS selector"),
-    text: z.string().optional().describe("Visible text to find and click"),
+    text: z.string().optional().describe("Visible text to click"),
     x: z.coerce.number().optional().describe("Viewport X coordinate"),
     y: z.coerce.number().optional().describe("Viewport Y coordinate"),
-    doubleClick: z.boolean().optional().default(false).describe("Double-click instead of single click"),
+    button: z.enum(["left", "right"]).optional().describe("Mouse button"),
+    count: z.coerce.number().optional().describe("Click count; use 2 for double-click"),
+    native: z.boolean().optional().describe("Use OS-level trusted click"),
+    waitFor: z.string().optional().describe("CSS selector to wait for after click"),
+    wait: z.coerce.number().optional().describe("Milliseconds to wait after click"),
+    read: z.boolean().optional().describe("Return page text after click"),
+    maxLength: z.coerce.number().optional().describe("Max chars when read=true"),
   },
   async (args) => {
-    // Native click always uses AppleScript path (no extension) — it needs OS-level access
-    const result = await directWrite("native_click", () => safari.nativeClick(args));
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    let result;
+    if (args.native) {
+      result = await directWrite("native_click", () => safari.nativeClick({ ...args, doubleClick: args.count === 2 }));
+    } else if (args.button === "right") {
+      result = await extensionOrFallback("right_click", { selector: args.selector, x: args.x, y: args.y }, () => safari.rightClick(args));
+    } else if (args.count === 2) {
+      result = await extensionOrFallback("double_click", { selector: args.selector, x: args.x, y: args.y }, () => safari.doubleClick(args));
+    } else if (args.waitFor) {
+      result = await directWrite("click_and_wait", () => safari.clickAndWait(args));
+    } else {
+      result = await extensionOrFallback("click", { ref: args.ref, selector: args.selector, text: args.text, x: args.x, y: args.y }, () => safari.click(args));
+    }
+    if (args.wait) await new Promise(r => setTimeout(r, args.wait));
+    if (args.read) {
+      const page = await safari.readPage({ maxLength: args.maxLength });
+      return textResult(page, { untrusted: true });
+    }
+    return textResult(result);
   }
 );
-
-server.tool(
-  "safari_native_hover",
-  "OS-level mouse hover via macOS CGEvent — moves the real cursor to an element to trigger native :hover / mouseenter handlers. Use for obfuscated UIs where JS-dispatched mouseenter isn't enough, like Discord server sidebars (tooltips only appear on real hover) or portal-rendered tooltips. After hover, call safari_wait_for or safari_evaluate to read the tooltip. Dwells for dwellMs to let tooltips render, then restores the original cursor position by default. Requires Safari window to be visible.",
-  {
-    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
-    selector: z.string().optional().describe("CSS selector"),
-    text: z.string().optional().describe("Visible text to find and hover"),
-    x: z.coerce.number().optional().describe("Viewport X coordinate"),
-    y: z.coerce.number().optional().describe("Viewport Y coordinate"),
-    dwellMs: z.coerce.number().optional().default(500).describe("Milliseconds to dwell over the element so tooltips render (clamped 0-5000)"),
-    restoreMouse: z.boolean().optional().default(true).describe("Restore cursor to original position after dwell"),
-  },
-  async (args) => {
-    const result = await directWrite("native_hover", () => safari.nativeHover(args));
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_native_keyboard",
-  "OS-level keyboard event via macOS CGEvent — sends a real keypress (with optional modifiers) to the Safari window WITHOUT activating Safari or stealing focus. Use when safari_press_key's JS path doesn't reach React trust-gated handlers (Discord ProseMirror Enter, Slack send, virtualized editors). Keys: enter, return, tab, escape, space, delete, backspace, up/down/left/right, home, end, pageup, pagedown, f1-f6, a-z, 0-9 and common punctuation. Modifiers: cmd, shift, alt, ctrl. Produces isTrusted:true events. Never activates Safari — runs entirely in the background.",
-  {
-    key: z.string().describe("Key name: enter, escape, tab, space, arrow keys, letters, digits, etc."),
-    modifiers: z.array(z.string()).optional().default([]).describe("Modifier keys: cmd, shift, alt, ctrl"),
-  },
-  async (args) => {
-    const result = await directWrite("native_keyboard", () => safari.nativeKeyboard(args));
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_native_type",
-  "Insert text into ANY editor via OS-level clipboard paste (CGEvent Cmd+V targeted to Safari window). Unlike safari_fill which manipulates DOM directly (breaking React/ProseMirror state), this goes through the real paste pipeline — ProseMirror/Slate/Draft.js process the paste event natively and update their internal model. After native_type, pressing Enter (via safari_native_keyboard) will actually submit the form because the framework state matches the DOM. Saves and restores the user's clipboard. No focus stealing. Use for Discord, Slack, and any editor where safari_fill works visually but the content isn't 'really there' when you try to submit.",
-  {
-    value: z.string().describe("Text to insert via clipboard paste"),
-    selector: z.string().optional().describe("CSS selector of the editor element to focus first"),
-    ref: z.string().optional().describe("Ref ID from safari_snapshot to focus first"),
-  },
-  async (args) => {
-    const result = await directWrite("native_type", () => safari.nativeType(args));
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-// ========== FORM INPUT ==========
 
 server.tool(
   "safari_fill",
-  "Fill/replace value in an input, textarea, select, OR contenteditable (rich text). Handles React controlled inputs, ProseMirror, Draft.js, and Google Closure editors automatically. Use for SETTING a value (replaces existing). For code editors (Monaco/CodeMirror/Ace), use safari_replace_editor instead. For character-by-character typing in search boxes, use safari_type_text. IMPORTANT: When using ref, always take a FRESH safari_snapshot first — refs expire after each new snapshot (prefix changes: 5_xx → 6_xx).",
+  "Fill or replace text in an input, textarea, select, contenteditable, or rich editor.",
   {
-    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
+    ref: z.string().optional().describe("Ref from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
     value: z.string().describe("Value to fill"),
+    native: z.boolean().optional().describe("Paste through OS-level keyboard pipeline"),
+    verify: z.boolean().optional().describe("Verify framework/editor state after filling"),
   },
   async (args) => {
-    const selector = args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector;
-    const result = await extensionOrFallback(
-      "fill", { selector, value: args.value },
-      () => safari.fill(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_clear_field",
-  "Clear an input field",
-  { selector: z.string().describe("CSS selector of the input") },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "clear_field", { selector: args.selector },
-      () => safari.clearField(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_verify_state",
-  "Verify the framework-level state of an editor/input matches the expected value. Returns JSON {match, mode, actual, expected, hint?}. Modern editors (ProseMirror, Lexical, Closure, React-controlled inputs) maintain state separately from the DOM — `.value` or `.textContent` may show new text while the internal store still holds old data, so a Submit click sends stale data. Call this AFTER safari_fill and BEFORE clicking Submit on critical forms (Featured.com, LinkedIn share, Medium, Reddit).",
-  {
-    selector: z.string().describe("CSS selector of the editor/input to verify"),
-    expected: z.string().describe("Expected value or text fragment that should appear in framework state"),
-  },
-  async (args) => {
-    const result = await safari.verifyState(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_select_option",
-  "Select an option in a native <select> dropdown. Sets .value and dispatches change event. Pass `ref` (from safari_snapshot) for a select inside an iframe or shadow DOM — a plain `selector` only reaches the top document. For custom dropdowns (React/LinkedIn), use safari_click on the dropdown trigger, then safari_click on the option instead.",
-  {
-    selector: z.string().optional().describe("CSS selector of the select (top document only)"),
-    ref: z.string().optional().describe("Ref ID from safari_snapshot — required for selects inside iframes/shadow DOM"),
-    value: z.string().describe("Option value or visible label to select"),
-  },
-  async (args) => {
-    // ref path: resolve via mcpFindRef (reaches iframes/shadow DOM) on the AppleScript
-    // engine — the extension's select_option handler is selector-only.
-    if (args.ref) {
-      const refResult = await directWrite("select_option", () => safari.selectOption({ ref: args.ref, value: args.value }));
-      return { content: [{ type: "text", text: typeof refResult === 'string' ? refResult : JSON.stringify(refResult) }] };
+    const result = args.native
+      ? await directWrite("native_type", () => safari.nativeType(args))
+      : await extensionOrFallback("fill", { selector: args.ref ? `[data-mcp-ref=\"${args.ref}\"]` : args.selector, value: args.value }, () => safari.fill(args));
+    if (args.verify && args.selector) {
+      const verification = await safari.verifyState({ selector: args.selector, expected: args.value });
+      return textResult({ result, verification }, { untrusted: true });
     }
-    let result = await extensionOrFallback(
-      "select_option", { selector: args.selector, value: args.value },
-      () => safari.selectOption(args)
-    );
-    // If extension returned "Selected: " with empty/default value, fuzzy match may have failed.
-    // Retry via AppleScript path which has the latest fuzzy match code.
-    if (typeof result === 'string' && result.match(/^Selected:\s*$/) ) {
-      console.error('[Safari MCP] select_option returned empty value — retrying via AppleScript');
-      result = await directWrite("select_option", () => safari.selectOption(args));
-    }
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+    return textResult(result);
   }
 );
-
-server.tool(
-  "safari_react_select_set",
-  "Set a value in a react-select v5 dropdown by walking React fiber to find the Select component and invoking onChange directly — bypasses the menu UI entirely. Use when safari_click on the chevron or option keeps failing (Cloudflare custom token forms after a few rows, portal-rendered selects that intercept synthetic events). Returns JSON {ok, selected} on success, or {ok:false, error, available:[…]} listing up to 30 option labels on miss. Match is by label, value, or case-insensitive label. Either ref or selector required. NOTE: For Permissions-levels combos that are disabled until a Permission is selected, set the Permissions value first — the level combo becomes enabled and its props.options populate.",
-  {
-    selector: z.string().optional().describe("CSS selector — typically input[name=...] or the .react-select__control container"),
-    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
-    value: z.string().describe("Option label (or value) to select — case-insensitive fallback"),
-  },
-  async (args) => {
-    const result = await directWrite("react_select_set", () => safari.reactSelectSet(args));
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_react_select_list_options",
-  "List available options of a react-select v5 dropdown without opening the menu. Returns JSON {ok, total, options:[{label,value}…]}. Useful when safari_react_select_set returns 'option not found' and you need to see exact labels (e.g. 'Email Routing Rules' vs 'Email Routing'). Either ref or selector required.",
-  {
-    selector: z.string().optional().describe("CSS selector"),
-    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
-  },
-  async (args) => {
-    const result = await safari.reactSelectListOptions(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_fill_form",
-  "Fill multiple form fields at once",
-  {
-    fields: z.array(z.object({
-      selector: z.string().describe("CSS selector"),
-      value: z.string().describe("Value to fill"),
-    })).describe("Array of {selector, value} pairs"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "fill_form", { fields: args.fields },
-      () => safari.fillForm(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-// ========== KEYBOARD ==========
-
-server.tool(
-  "safari_press_key",
-  "Press a keyboard key (enter, tab, escape, arrows, etc). Supports modifiers (cmd, shift, alt, ctrl).",
-  {
-    key: z.string().describe("Key name: enter, tab, escape, space, delete, up, down, left, right, or a single character"),
-    modifiers: z.array(z.string()).optional().describe("Modifier keys: cmd, shift, alt, ctrl"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "press_key", { key: args.key, modifiers: args.modifiers },
-      () => safari.pressKey(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_type_text",
-  "Type text character-by-character with realistic key events. Best for: search boxes (triggers autocomplete), chat inputs, and fields that react to each keystroke. For rich text editors (Medium, HackerNoon, LinkedIn), use safari_fill instead — it uses framework-native APIs. For code editors (Monaco/CodeMirror), use safari_replace_editor. When using ref, always take a FRESH safari_snapshot first — refs expire after each new snapshot.",
-  {
-    text: z.string().describe("Text to type"),
-    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
-    selector: z.string().optional().describe("CSS selector to focus"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "type_text", { text: args.text, selector: args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector },
-      () => safari.typeText(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-// ========== CODE EDITOR ==========
-
-server.tool(
-  "safari_replace_editor",
-  "Replace ALL content in a code editor (Monaco, CodeMirror, Ace, ProseMirror). Use ONLY for code editors — Airtable automations, GitHub gists, CodePen, n8n code nodes, etc. NOT for rich text editors like Medium/LinkedIn (use safari_fill for those). Detects ProseMirror/Draft.js/CodeMirror/Monaco/Ace and uses their native API.",
-  {
-    text: z.string().describe("The complete code/text to put in the editor"),
-  },
-  async ({ text }) => {
-    const result = await extensionOrFallback(
-      "replace_editor", { text },
-      () => safari.replaceEditorContent({ text })
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-// ========== SCREENSHOT ==========
 
 server.tool(
   "safari_screenshot",
-  "Take a visual screenshot (base64 JPEG). EXPENSIVE — use safari_snapshot instead for most tasks. Only use screenshot when you need to verify visual layout, styling, images, or colors that snapshot can't show.",
+  "Take a visual screenshot. Pass selector for an element screenshot.",
   {
-    fullPage: z.boolean().optional().describe("Capture full page (not just viewport)"),
+    fullPage: z.boolean().optional().describe("Capture full page"),
+    selector: z.string().optional().describe("Element selector for element-only screenshot"),
   },
-  async ({ fullPage }) => {
-    let base64;
-    try {
-      base64 = await extensionOrFallback(
-        "screenshot", { fullPage },
-        () => safari.screenshot({ fullPage })
-      );
-    } catch (err) {
-      // If AppleScript screenshot failed (permission lost), retry via extension only
-      // But only if we're not in profile mode (extension may be from wrong profile)
-      if (_extensionConnected && !_preferAppleScript && err.message && (err.message.includes("permission") || err.message.includes("screencapture") || err.message.includes("empty"))) {
-        console.error("[Safari MCP] Screenshot AppleScript failed, retrying via extension only");
-        base64 = await sendToExtension("screenshot", { fullPage }, 15000);
-      } else {
-        throw err;
-      }
-    }
-    return {
-      content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
-    };
+  async ({ fullPage, selector }) => {
+    const base64 = selector
+      ? await extensionOrFallback("screenshot_element", { selector }, () => safari.screenshotElement({ selector }))
+      : await extensionOrFallback("screenshot", { fullPage }, () => safari.screenshot({ fullPage }));
+    return { content: [{ type: "image", data: base64, mimeType: selector ? "image/png" : "image/jpeg" }] };
   }
 );
-
-server.tool(
-  "safari_screenshot_element",
-  "Take a screenshot of a specific element (by CSS selector). Returns base64 PNG image.",
-  { selector: z.string().describe("CSS selector of the element to capture") },
-  async ({ selector }) => {
-    const base64 = await extensionOrFallback(
-      "screenshot_element", { selector },
-      () => safari.screenshotElement({ selector })
-    );
-    return {
-      content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
-    };
-  }
-);
-
-// ========== SCROLL ==========
-
-server.tool(
-  "safari_scroll",
-  "Scroll the page up or down by a specified amount",
-  {
-    direction: z.enum(["up", "down"]).optional().describe("Scroll direction (default: down)"),
-    amount: z.coerce.number().optional().describe("Pixels to scroll (default: 500)"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "scroll", { direction: args.direction, amount: args.amount },
-      () => safari.scroll(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_scroll_to",
-  "Scroll to a specific position on the page",
-  {
-    x: z.coerce.number().optional().describe("X position (default: 0)"),
-    y: z.coerce.number().optional().describe("Y position (default: 0)"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "scroll_to", { x: args.x, y: args.y },
-      () => safari.scrollTo(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-// ========== TAB MANAGEMENT ==========
-
-server.tool(
-  "safari_list_tabs",
-  "List all open tabs in Safari with their titles and URLs",
-  {},
-  async () => {
-    const result = await extensionOrFallback(
-      "list_tabs", {},
-      () => safari.listTabs()
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }] };
-  }
-);
-
-server.tool(
-  "safari_reload_extension",
-  "Hot-reload the Safari MCP Bridge extension — forces it to reload its own code from disk without requiring manual Safari Preferences → Extensions → toggle. Use after editing extension/background.js or extension/content.js in the safari-mcp repo. The extension briefly disconnects during reload and auto-reconnects within ~2 seconds. NOTE: this tool itself requires the extension version already installed to support the `reload_extension` command (added in v2.9.1+). If your extension is older, trigger a manual reload once to pick up this feature.",
-  {},
-  async () => {
-    const result = await extensionOrFallback(
-      "reload_extension", {},
-      async () => "Extension fallback not available — this command requires the Safari MCP Bridge extension."
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_new_tab",
-  "Open a new tab, optionally with a URL",
-  { url: z.string().optional().describe("URL to open (empty for blank tab)") },
-  async ({ url }) => {
-    // Enforce tab limit — close oldest MCP tab if at max
-    if (_openedTabs.size >= MAX_TABS) {
-      let oldestIdx = null, oldestTime = Infinity;
-      for (const [idx, info] of _openedTabs) {
-        if (info.openedAt < oldestTime) { oldestTime = info.openedAt; oldestIdx = idx; }
-      }
-      if (oldestIdx !== null) {
-        console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached — closing oldest tab #${oldestIdx}`);
-        try {
-          safari.setActiveTabIndex(oldestIdx);
-          await safari.closeTab();
-        } catch {}
-        _untrackTab(oldestIdx);
-      }
-    }
-
-    const rawResult = await extensionOrFallback(
-      "new_tab", { url },
-      () => safari.newTab(url)
-    );
-    // AppleScript fallback returns a JSON string; extension returns an object — normalize
-    let result = rawResult;
-    if (typeof rawResult === 'string') {
-      try { result = JSON.parse(rawResult); } catch {}
-    }
-    // Sync safari.js tracking when extension handled new_tab
-    if (result?.tabIndex) {
-      safari.setActiveTabIndex(result.tabIndex);
-      _trackTab(result.tabIndex, url);
-    }
-    if (result?.url || url) {
-      // Prefer requested URL over about:blank for tracking (page hasn't loaded yet)
-      const trackUrl = (!result?.url || result.url === 'about:blank') && url ? url : result.url;
-      safari.setActiveTabURL(trackUrl);
-      // Also register actual URL (may differ from requested due to redirects)
-      _addOwnedURL(trackUrl);
-      if (url && url !== trackUrl) _addOwnedURL(url);  // also own the requested URL (handles www redirects)
-    }
-    // Blank tab (no URL requested): persist a restart-surviving ownership marker.
-    const _effectiveNewURL = (result?.url && result.url !== 'about:blank' && result.url !== 'missing value') ? result.url : url;
-    if (!_effectiveNewURL) _markBlankTabOpened();
-    return { content: [{ type: "text", text: typeof rawResult === 'string' ? rawResult : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_close_tab",
-  "Close the current tab",
-  {},
-  async () => {
-    const activeIdx = safari.getActiveTabIndex();
-    const result = await extensionOrFallback("close_tab", {}, () => safari.closeTab());
-    if (activeIdx !== null) _untrackTab(activeIdx);
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_switch_tab",
-  "Switch to a specific tab by index (use safari_list_tabs to see indices). All subsequent commands (click, fill, evaluate, screenshot, scroll) will target this tab. If commands seem to run on the wrong tab, call switch_tab again to re-anchor.",
-  { index: z.coerce.number().describe("Tab index (starting from 1)") },
-  async ({ index }) => {
-    // Tab ownership check: verify target tab is one we opened
-    if (_ownedTabURLs.size > 0) {
-      // Get target tab's URL via list_tabs before switching
-      try {
-        const tabs = await safari.listTabs();
-        const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
-        const target = parsed.find(t => t.index === index);
-        if (target && target.url && !_isURLOwned(target.url)) {
-          // about:blank / missing value tabs are owned if tracked in _openedTabs
-          const isBlankOwned = (target.url === 'about:blank' || target.url === 'missing value') && (_openedTabs.has(index) || _ownedTabURLs.has(BLANK_TAB_SENTINEL));
-          if (!isBlankOwned) {
-            const msg = `⚠️ Tab safety: refusing switch_tab to index ${index} (${target.url}) — not opened by this MCP session. Use safari_new_tab to open your own tab.`;
-            console.error(`[Safari MCP] ${msg}`);
-            return { content: [{ type: "text", text: msg }], isError: true };
-          }
-        }
-      } catch {}
-    }
-    const result = await extensionOrFallback(
-      "switch_tab", { index },
-      () => safari.switchTab(index)
-    );
-    // Sync safari.js state so AppleScript fallback targets the correct tab
-    safari.setActiveTabIndex(index);
-    if (result && typeof result === 'object' && result.url) {
-      safari.setActiveTabURL(result.url);
-    }
-    return { content: [{ type: "text", text: JSON.stringify(result) }] };
-  }
-);
-
-// ========== WAIT ==========
-
-server.tool(
-  "safari_wait_for",
-  "Wait for an element or text to appear on the page",
-  {
-    selector: z.string().optional().describe("CSS selector to wait for"),
-    text: z.string().optional().describe("Text to wait for"),
-    timeout: z.coerce.number().optional().describe("Timeout in ms (default: 10000)"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "wait_for", { selector: args.selector, text: args.text, timeout: args.timeout },
-      () => safari.waitFor(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-server.tool(
-  "safari_wait_for_new_tab",
-  "Wait for a new tab to appear (e.g. after OAuth login click opens popup). Automatically switches to the new tab.",
-  {
-    timeout: z.coerce.number().optional().describe("Timeout in ms (default: 10000)"),
-    urlContains: z.string().optional().describe("Only match new tabs whose URL contains this string"),
-  },
-  async ({ timeout, urlContains }) => {
-    const timeoutMs = timeout || 10000;
-    // Get current tab list
-    const beforeRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-    const beforeTabs = typeof beforeRaw === 'string' ? JSON.parse(beforeRaw) : beforeRaw;
-    const beforeIds = new Set(beforeTabs.map(t => `${t.index}:${t.url}`));
-    const beforeCount = beforeTabs.length;
-
-    // Poll for new tab — detect by count increase + new entries (handles about:blank tabs)
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 500));
-      const nowRaw = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-      const nowTabs = typeof nowRaw === 'string' ? JSON.parse(nowRaw) : nowRaw;
-      if (nowTabs.length > beforeCount) {
-        // Find the new tab(s) — could be about:blank initially (OAuth popups)
-        for (const tab of nowTabs) {
-          if (!beforeIds.has(`${tab.index}:${tab.url}`)) {
-            // Wait for about:blank to resolve to actual URL — dynamic polling instead of fixed delay
-            if (tab.url === 'about:blank') {
-              let resolved = null;
-              for (let attempt = 0; attempt < 10; attempt++) {
-                await new Promise(r => setTimeout(r, 300)); // 300ms intervals, max 3s total
-                const refreshed = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
-                const refreshedTabs = typeof refreshed === 'string' ? JSON.parse(refreshed) : refreshed;
-                resolved = refreshedTabs.find(t => t.index === tab.index);
-                if (resolved && resolved.url !== 'about:blank') break;
-                resolved = null;
-              }
-              if (resolved && resolved.url !== 'about:blank') {
-                if (urlContains && !resolved.url.includes(urlContains)) continue;
-                await extensionOrFallback("switch_tab", { index: resolved.index }, () => safari.switchTab(resolved.index));
-                safari.setActiveTabIndex(resolved.index);
-                safari.setActiveTabURL(resolved.url);
-                return { content: [{ type: "text", text: `Found new tab: ${resolved.title} (${resolved.url})` }] };
-              }
-              continue;
-            }
-            if (urlContains && !tab.url.includes(urlContains)) continue;
-            await extensionOrFallback("switch_tab", { index: tab.index }, () => safari.switchTab(tab.index));
-            safari.setActiveTabIndex(tab.index);
-            safari.setActiveTabURL(tab.url);
-            return { content: [{ type: "text", text: `Found new tab: ${tab.title} (${tab.url})` }] };
-          }
-        }
-      }
-    }
-    return { content: [{ type: "text", text: "TIMEOUT: no new tab appeared" }] };
-  }
-);
-
-// ========== EVALUATE JAVASCRIPT ==========
-
-server.tool(
-  "safari_evaluate",
-  "Execute JavaScript in the current page. Automatically falls back to AppleScript when CSP blocks execution (e.g. Google Search Console, LinkedIn). For reading data, prefer safari_read_page or safari_snapshot. For interactions, prefer safari_click/fill with refs.",
-  { script: z.string().describe("JavaScript code to execute") },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "evaluate", { script: args.script },
-      () => safari.evaluate(args)
-    );
-    return { content: [{ type: "text", text: pageText((typeof result === 'string' ? result : JSON.stringify(result)) || "(no return value)") }] };
-  }
-);
-
-// ========== ELEMENT INFO ==========
-
-server.tool(
-  "safari_get_element",
-  "Get detailed info about an element (tag, text, rect, attributes, visibility)",
-  { selector: z.string().describe("CSS selector") },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "get_element", { selector: args.selector },
-      () => safari.getElementInfo(args)
-    );
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_query_all",
-  "Find all elements matching a CSS selector (returns tag, text, href, value)",
-  {
-    selector: z.string().describe("CSS selector"),
-    limit: z.coerce.number().optional().describe("Max results (default: 20)"),
-  },
-  async (args) => {
-    const result = await extensionOrFallback(
-      "query_all", { selector: args.selector, limit: args.limit },
-      () => safari.querySelectorAll(args)
-    );
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== HOVER ==========
-
-server.tool(
-  "safari_hover",
-  "Hover over element. Use ref, selector, or x/y",
-  {
-    ref: z.string().optional().describe("Ref ID from safari_snapshot"),
-    selector: z.string().optional().describe("CSS selector"),
-    x: z.coerce.number().optional().describe("X coordinate"),
-    y: z.coerce.number().optional().describe("Y coordinate"),
-  },
-  async (args) => {
-    const sel = args.ref ? `[data-mcp-ref="${args.ref}"]` : args.selector;
-    const result = await extensionOrFallback(
-      "hover", { selector: sel },
-      () => safari.hover(args)
-    );
-    return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-  }
-);
-
-// ========== DIALOG HANDLING ==========
-
-server.tool(
-  "safari_handle_dialog",
-  "Set up handler for the next alert/confirm/prompt dialog",
-  {
-    action: z.enum(["accept", "dismiss"]).optional().describe("Accept or dismiss (default: accept)"),
-    text: z.string().optional().describe("Text to enter for prompt dialogs"),
-  },
-  async (args) => {
-    const result = await directWrite("handle_dialog", () => safari.handleDialog(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== WINDOW ==========
-
-server.tool(
-  "safari_resize",
-  "Resize the Safari window",
-  {
-    width: z.coerce.number().describe("Window width"),
-    height: z.coerce.number().describe("Window height"),
-  },
-  async (args) => {
-    const result = await directWrite("resize", () => safari.resizeWindow(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== DRAG ==========
-
-server.tool(
-  "safari_drag",
-  "Drag an element to another element or position. Use CSS selectors or x/y coordinates.",
-  {
-    sourceSelector: z.string().optional().describe("CSS selector of element to drag"),
-    targetSelector: z.string().optional().describe("CSS selector of drop target"),
-    sourceX: z.coerce.number().optional().describe("Source X coordinate"),
-    sourceY: z.coerce.number().optional().describe("Source Y coordinate"),
-    targetX: z.coerce.number().optional().describe("Target X coordinate"),
-    targetY: z.coerce.number().optional().describe("Target Y coordinate"),
-  },
-  async (args) => {
-    const result = await directWrite("drag", () => safari.drag(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== UPLOAD FILE ==========
-
-server.tool(
-  "safari_upload_file",
-  "Upload a file to a <input type='file'> element via JavaScript DataTransfer — NO file dialog, NO UI interaction. IMPORTANT: Do NOT click the file input before calling this tool — just provide the selector and file path. If a file dialog is already open, this tool will close it first. NOTE: 'verified 0 files' may appear even on success if the site uses a custom upload handler — check visually with safari_snapshot.",
-  {
-    selector: z.string().describe("CSS selector of the file input"),
-    filePath: z.string().describe("Absolute path to the file to upload"),
-  },
-  async (args) => {
-    const result = await directWrite("upload_file", () => safari.uploadFile(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== PASTE IMAGE ==========
-
-server.tool(
-  "safari_paste_image",
-  "Paste an image from a local file into the focused element via JS DataTransfer (no clipboard, no focus steal). Works on Medium, dev.to, HackerNoon, TOI, etc.",
-  {
-    filePath: z.string().describe("Absolute path to the image file (PNG, JPG, WebP)"),
-  },
-  async ({ filePath }) => {
-    const result = await directWrite("paste_image", () => safari.pasteImageFromFile({ filePath }));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== EMULATE (DEVICE SIMULATION) ==========
-
-server.tool(
-  "safari_emulate",
-  "Emulate a mobile device by resizing window and setting user agent. Devices: iphone-14, iphone-14-pro-max, ipad, ipad-pro, pixel-7, galaxy-s24. Or use custom width/height.",
-  {
-    device: z.string().optional().describe("Device name: iphone-14, ipad, pixel-7, galaxy-s24, etc."),
-    width: z.coerce.number().optional().describe("Custom viewport width"),
-    height: z.coerce.number().optional().describe("Custom viewport height"),
-    userAgent: z.string().optional().describe("Custom user agent string"),
-    scale: z.coerce.number().optional().describe("Initial scale (default: 1)"),
-  },
-  async (args) => {
-    const result = await directWrite("emulate", () => safari.emulate(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_reset_emulation",
-  "Reset device emulation back to desktop mode",
-  {},
-  async () => {
-    const result = await directWrite("reset_emulation", () => safari.resetEmulation());
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== COOKIES & STORAGE ==========
-
-server.tool(
-  "safari_get_cookies",
-  "Get cookies for the current page",
-  {},
-  async () => {
-    const result = await safari.getCookies();
-    return { content: [{ type: "text", text: pageText(result || "(no cookies)") }] };
-  }
-);
-
-server.tool(
-  "safari_local_storage",
-  "Get localStorage data for the current page",
-  { key: z.string().optional().describe("Specific key to get (omit for all)") },
-  async ({ key }) => {
-    const result = await safari.getLocalStorage({ key });
-    return { content: [{ type: "text", text: pageText(result || "(empty)") }] };
-  }
-);
-
-// ========== NETWORK ==========
-
-server.tool(
-  "safari_network",
-  "Quick network overview via Performance API (no setup needed). Shows URLs and timing for resources loaded by the page. For detailed request/response info (headers, status codes, POST bodies), use safari_start_network_capture + safari_network_details instead.",
-  { limit: z.coerce.number().optional().describe("Max requests to return (default: 50)") },
-  async ({ limit }) => {
-    const result = await safari.getNetworkRequests({ limit });
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== RUN SCRIPT (multi-step) ==========
-
-server.tool(
-  "safari_run_script",
-  "Batch multiple Safari actions in ONE call. Steps: [{action, args}]. Actions match other safari_* tool names without prefix (e.g. 'navigate', 'click', 'fill', 'evaluate', 'readPage').",
-  {
-    steps: z.array(z.object({
-      action: z.string().describe("Action name (e.g. 'navigate', 'click', 'fill')"),
-      args: z.record(z.string(), z.unknown()).optional().describe("Arguments for the action"),
-    })).describe("Array of steps to execute sequentially"),
-  },
-  async ({ steps }) => {
-    const result = await directWrite("run_script", () => safari.runScript({ steps }));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== CONSOLE ==========
-
-server.tool(
-  "safari_start_console",
-  "Start capturing console messages (log, warn, error, info). Call once per page.",
-  {},
-  async () => {
-    const result = await directWrite("start_console", () => safari.startConsoleCapture());
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_get_console",
-  "Get captured console messages (must call safari_start_console first)",
-  {},
-  async () => {
-    const result = await safari.getConsoleMessages();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_clear_console",
-  "Clear all captured console messages",
-  {},
-  async () => {
-    const result = await directWrite("clear_console", () => safari.clearConsoleCapture());
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== PDF SAVE ==========
-
-server.tool(
-  "safari_save_pdf",
-  "Save the current page as a PDF file. Uses screencapture + PDF rendering (no Safari UI interaction needed).",
-  { path: z.string().describe("Absolute file path to save the PDF (e.g. /Users/am/Downloads/page.pdf)") },
-  async (args) => {
-    const result = await directWrite("save_pdf", () => safari.savePDF(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== ACCESSIBILITY SNAPSHOT ==========
-
-server.tool(
-  "safari_accessibility_snapshot",
-  "Get the accessibility tree of the page (roles, ARIA labels, focusable elements, form states). Essential for a11y auditing.",
-  {
-    selector: z.string().optional().describe("CSS selector for subtree (default: full page)"),
-    maxDepth: z.coerce.number().optional().describe("Max tree depth (default: 5)"),
-  },
-  async (args) => {
-    const result = await safari.getAccessibilityTree(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== COOKIE CRUD ==========
-
-server.tool(
-  "safari_set_cookie",
-  "Set a cookie on the current page",
-  {
-    name: z.string().describe("Cookie name"),
-    value: z.string().describe("Cookie value"),
-    domain: z.string().optional().describe("Cookie domain"),
-    path: z.string().optional().describe("Cookie path (default: /)"),
-    expires: z.string().optional().describe("Expiry date (e.g. 'Thu, 01 Jan 2030 00:00:00 GMT')"),
-    secure: z.boolean().optional().describe("Secure flag"),
-    sameSite: z.enum(["Strict", "Lax", "None"]).optional().describe("SameSite attribute"),
-  },
-  async (args) => {
-    const result = await directWrite("set_cookie", () => safari.setCookie(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_delete_cookies",
-  "Delete a specific cookie or all cookies for the current page",
-  {
-    name: z.string().optional().describe("Cookie name to delete"),
-    all: z.boolean().optional().describe("Delete all cookies"),
-  },
-  async (args) => {
-    const result = await directWrite("delete_cookies", () => safari.deleteCookies(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== SESSION STORAGE ==========
-
-server.tool(
-  "safari_session_storage",
-  "Get sessionStorage data for the current page",
-  { key: z.string().optional().describe("Specific key (omit for all)") },
-  async ({ key }) => {
-    const result = await safari.getSessionStorage({ key });
-    return { content: [{ type: "text", text: pageText(result || "(empty)") }] };
-  }
-);
-
-server.tool(
-  "safari_set_session_storage",
-  "Set a value in sessionStorage",
-  {
-    key: z.string().describe("Storage key"),
-    value: z.string().describe("Value to store"),
-  },
-  async (args) => {
-    const result = await directWrite("set_session_storage", () => safari.setSessionStorage(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_set_local_storage",
-  "Set a value in localStorage",
-  {
-    key: z.string().describe("Storage key"),
-    value: z.string().describe("Value to store"),
-  },
-  async (args) => {
-    const result = await directWrite("set_local_storage", () => safari.setLocalStorage(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== STORAGE DELETE / CLEAR ==========
-
-server.tool(
-  "safari_delete_local_storage",
-  "Delete a localStorage key, or clear all localStorage (omit key to clear all)",
-  { key: z.string().optional().describe("Key to delete (omit to clear ALL)") },
-  async ({ key }) => {
-    const result = await directWrite("delete_local_storage", () => safari.deleteLocalStorage({ key }));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_delete_session_storage",
-  "Delete a sessionStorage key, or clear all sessionStorage (omit key to clear all)",
-  { key: z.string().optional().describe("Key to delete (omit to clear ALL)") },
-  async ({ key }) => {
-    const result = await directWrite("delete_session_storage", () => safari.deleteSessionStorage({ key }));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== STORAGE STATE EXPORT/IMPORT ==========
-
-server.tool(
-  "safari_export_storage",
-  "Export all storage state (cookies + localStorage + sessionStorage) as JSON — useful for saving and restoring login sessions",
-  {},
-  async () => {
-    const result = await safari.exportStorageState();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_import_storage",
-  "Import storage state from JSON (as exported by safari_export_storage) — restores cookies, localStorage, sessionStorage",
-  { state: z.string().describe("JSON string from safari_export_storage") },
-  async ({ state }) => {
-    const result = await directWrite("import_storage", () => safari.importStorageState({ state: unwrapPageText(state) }));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== CLIPBOARD ==========
-
-server.tool(
-  "safari_clipboard_read",
-  "Read the current clipboard content (text)",
-  {},
-  async () => {
-    const result = await directWrite("clipboard_read", () => safari.clipboardRead());
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_clipboard_write",
-  "Write text to the system clipboard",
-  { text: z.string().describe("Text to copy to clipboard") },
-  async (args) => {
-    const result = await directWrite("clipboard_write", () => safari.clipboardWrite(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== NETWORK MOCKING ==========
-
-server.tool(
-  "safari_mock_route",
-  "Intercept network requests matching a URL pattern and return a mock response. Works with both fetch and XHR. Useful for testing API error states, offline behavior, or replacing API responses.",
-  {
-    urlPattern: z.string().describe("URL substring or regex pattern to match (e.g. '/api/users' or 'example\\.com')"),
-    response: z.object({
-      status: z.coerce.number().optional().describe("HTTP status code (default: 200)"),
-      body: z.string().optional().describe("Response body string (JSON, HTML, text)"),
-      contentType: z.string().optional().describe("Content-Type header (default: application/json)"),
-    }).describe("Mock response to return"),
-  },
-  async ({ urlPattern, response }) => {
-    const result = await directWrite("mock_route", () => safari.mockNetworkRoute({ urlPattern, response }));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_clear_mocks",
-  "Remove all network route mocks (restore real network behavior)",
-  {},
-  async () => {
-    const result = await directWrite("clear_mocks", () => safari.clearNetworkMocks());
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== WAIT FOR TIME ==========
 
 server.tool(
   "safari_wait",
-  "Wait for a fixed time in milliseconds. Use only when you need a brief pause between actions. PREFER safari_wait_for (waits for element/text to appear) — it's smarter and doesn't waste time.",
-  { ms: z.coerce.number().describe("Milliseconds to wait") },
-  async ({ ms }) => {
-    const result = await safari.waitForTime({ ms });
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-// ========== NETWORK CAPTURE (Detailed) ==========
-
-server.tool(
-  "safari_start_network_capture",
-  "Start capturing detailed network requests (fetch + XHR) with headers, status, timing. Call once per page. Intercepts fetch/XHR — captures requests AFTER this call only. For quick overview of already-loaded resources, use safari_network instead.",
-  {},
-  async () => {
-    const result = await directWrite("start_network_capture", () => safari.startNetworkCapture());
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_network_details",
-  "Get captured network requests with full details (must call safari_start_network_capture first)",
+  "Wait for page state or a fixed time.",
   {
-    limit: z.coerce.number().optional().describe("Max requests (default: 50)"),
-    filter: z.string().optional().describe("Filter by URL substring"),
+    action: z.enum(["for", "time"]).optional().describe("for waits for selector/text; time waits milliseconds"),
+    selector: z.string().optional().describe("CSS selector to wait for"),
+    text: z.string().optional().describe("Text to wait for"),
+    timeout: z.coerce.number().optional().describe("Timeout in ms"),
+    ms: z.coerce.number().optional().describe("Milliseconds for action=time"),
   },
   async (args) => {
-    const result = await safari.getNetworkDetails(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
+    if (args.action === "time" || args.ms) return textResult(await safari.waitForTime({ ms: args.ms || args.timeout || 1000 }));
+    const result = await extensionOrFallback("wait_for", { selector: args.selector, text: args.text, timeout: args.timeout }, () => safari.waitFor(args));
+    return textResult(result);
   }
 );
 
 server.tool(
-  "safari_clear_network",
-  "Clear all captured network requests",
-  {},
-  async () => {
-    const result = await directWrite("clear_network", () => safari.clearNetworkCapture());
-    return { content: [{ type: "text", text: result }] };
+  "safari_evaluate",
+  "Execute JavaScript in the current page. Prefer typed tools for common read/interact operations.",
+  { script: z.string().describe("JavaScript code to execute") },
+  async (args) => {
+    const result = await extensionOrFallback("evaluate", { script: args.script }, () => safari.evaluate(args));
+    return textResult((typeof result === "string" ? result : JSON.stringify(result)) || "(no return value)", { untrusted: true });
   }
 );
 
-// ========== PERFORMANCE METRICS ==========
-
 server.tool(
-  "safari_performance_metrics",
-  "Get detailed performance metrics: navigation timing, Web Vitals (FCP, LCP, CLS), resource breakdown, memory usage",
-  {},
-  async () => {
-    const result = await safari.getPerformanceMetrics();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== NETWORK THROTTLING ==========
-
-server.tool(
-  "safari_throttle_network",
-  "Simulate slow network conditions. Profiles: slow-3g, fast-3g, 4g, offline. Or custom latency/speed. Call with no args to reset.",
+  "safari_tabs",
+  "Find and manage Safari tabs. Prefer action=search or action=list to reuse an existing relevant tab before opening a new one.",
   {
-    profile: z.string().optional().describe("Preset: slow-3g, fast-3g, 4g, offline"),
-    latency: z.coerce.number().optional().describe("Custom latency in ms"),
-    downloadKbps: z.coerce.number().optional().describe("Custom download speed in Kbps"),
+    action: z.enum(["list", "search", "new", "switch", "close", "wait_for_new"]).describe("Tab action"),
+    query: z.string().optional().describe("Search title and URL for action=search"),
+    titleContains: z.string().optional().describe("Title substring for action=search"),
+    activate: z.boolean().optional().describe("For action=search, anchor MCP to the single matching tab without opening a new tab"),
+    url: z.string().optional().describe("URL for action=new"),
+    urlContains: z.string().optional().describe("URL substring for action=search or action=wait_for_new"),
+    index: z.coerce.number().optional().describe("Tab index for action=switch"),
+    timeout: z.coerce.number().optional().describe("Timeout for action=wait_for_new"),
   },
   async (args) => {
-    const result = await directWrite("throttle_network", () => safari.throttleNetwork(args));
-    return { content: [{ type: "text", text: result }] };
+    if (args.action === "list") {
+      const result = await extensionOrFallback("list_tabs", {}, () => safari.listTabs());
+      return textResult(result, { pretty: true });
+    }
+    if (args.action === "search") return searchTabs(args);
+    if (args.action === "new") return textResult(await openTrackedTab(args.url));
+    if (args.action === "switch") return switchTrackedTab(args.index);
+    if (args.action === "close") {
+      const activeIdx = safari.getActiveTabIndex();
+      const result = await extensionOrFallback("close_tab", {}, () => safari.closeTab());
+      if (activeIdx !== null) _untrackTab(activeIdx);
+      return textResult(result);
+    }
+    if (args.action === "wait_for_new") return waitForNewTab(args);
+    return unknownAction("tabs", args.action);
   }
 );
 
-// ========== CONSOLE FILTER ==========
-
 server.tool(
-  "safari_console_filter",
-  "Get console messages filtered by level (must call safari_start_console first)",
-  { level: z.enum(["log", "warn", "error", "info"]).describe("Console level to filter") },
-  async (args) => {
-    const result = await safari.getConsoleByLevel(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== DATA EXTRACTION ==========
-
-server.tool(
-  "safari_extract_tables",
-  "Extract HTML tables as structured JSON (headers + rows). Perfect for scraping data tables.",
+  "safari_history",
+  "Browser history/navigation controls.",
   {
-    selector: z.string().optional().describe("CSS selector (default: 'table')"),
-    limit: z.coerce.number().optional().describe("Max tables (default: 10)"),
+    action: z.enum(["back", "forward", "reload"]).describe("History action"),
+    hard: z.boolean().optional().describe("Hard reload for action=reload"),
+  },
+  async ({ action, hard }) => {
+    if (action === "back") return textResult(await extensionOrFallback("go_back", {}, () => safari.goBack()));
+    if (action === "forward") return textResult(await extensionOrFallback("go_forward", {}, () => safari.goForward()));
+    if (action === "reload") return textResult(await extensionOrFallback("reload", { hard }, () => safari.reload(hard)));
+    return unknownAction("history", action);
+  }
+);
+
+server.tool(
+  "safari_pointer",
+  "Pointer interactions other than simple clicks: hover, native hover, and drag.",
+  {
+    action: z.enum(["hover", "drag"]).describe("Pointer action"),
+    ref: z.string().optional().describe("Ref from safari_snapshot"),
+    selector: z.string().optional().describe("CSS selector"),
+    text: z.string().optional().describe("Visible text"),
+    x: z.coerce.number().optional().describe("Viewport X"),
+    y: z.coerce.number().optional().describe("Viewport Y"),
+    native: z.boolean().optional().describe("Use OS-level event where supported"),
+    dwellMs: z.coerce.number().optional().describe("Native hover dwell time"),
+    restoreMouse: z.boolean().optional().describe("Restore cursor after native hover"),
+    sourceSelector: z.string().optional().describe("Drag source selector"),
+    targetSelector: z.string().optional().describe("Drag target selector"),
+    sourceX: z.coerce.number().optional().describe("Drag source X"),
+    sourceY: z.coerce.number().optional().describe("Drag source Y"),
+    targetX: z.coerce.number().optional().describe("Drag target X"),
+    targetY: z.coerce.number().optional().describe("Drag target Y"),
   },
   async (args) => {
-    const result = await safari.extractTables(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
+    if (args.action === "hover") {
+      if (args.native) return textResult(await directWrite("native_hover", () => safari.nativeHover(args)));
+      const sel = args.ref ? `[data-mcp-ref=\"${args.ref}\"]` : args.selector;
+      return textResult(await extensionOrFallback("hover", { selector: sel }, () => safari.hover(args)));
+    }
+    if (args.action === "drag") return textResult(await directWrite("drag", () => safari.drag(args)));
+    return unknownAction("pointer", args.action);
   }
 );
 
 server.tool(
-  "safari_extract_meta",
-  "Extract all meta tags: title, description, canonical, OG tags, Twitter cards, JSON-LD, alternate languages, RSS feeds",
-  {},
-  async () => {
-    const result = await safari.extractMeta();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_extract_images",
-  "Extract all images with src, alt, dimensions, loading strategy, viewport visibility",
-  { limit: z.coerce.number().optional().describe("Max images (default: 50)") },
-  async (args) => {
-    const result = await safari.extractImages(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_extract_links",
-  "Extract all links with href, text, rel, target, external/nofollow detection",
+  "safari_keyboard",
+  "Keyboard and editor actions.",
   {
-    limit: z.coerce.number().optional().describe("Max links (default: 100)"),
-    filter: z.string().optional().describe("Filter by URL or text substring"),
+    action: z.enum(["press", "type", "replace_editor"]).describe("Keyboard action"),
+    key: z.string().optional().describe("Key for action=press"),
+    modifiers: z.array(z.string()).optional().describe("Modifier keys"),
+    text: z.string().optional().describe("Text for type/replace_editor"),
+    selector: z.string().optional().describe("Optional target selector"),
+    ref: z.string().optional().describe("Optional target ref"),
+    native: z.boolean().optional().describe("Use OS-level keyboard/paste path"),
   },
   async (args) => {
-    const result = await safari.extractLinks(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
+    if (args.action === "press") {
+      if (args.native) return textResult(await directWrite("native_keyboard", () => safari.nativeKeyboard(args)));
+      return textResult(await extensionOrFallback("press_key", { key: args.key, modifiers: args.modifiers }, () => safari.pressKey(args)));
+    }
+    if (args.action === "type") {
+      if (args.native) return textResult(await directWrite("native_type", () => safari.nativeType({ value: args.text, selector: args.selector, ref: args.ref })));
+      return textResult(await extensionOrFallback("type_text", { text: args.text, selector: args.ref ? `[data-mcp-ref=\"${args.ref}\"]` : args.selector }, () => safari.typeText(args)));
+    }
+    if (args.action === "replace_editor") return textResult(await extensionOrFallback("replace_editor", { text: args.text }, () => safari.replaceEditorContent({ text: args.text })));
+    return unknownAction("keyboard", args.action);
   }
 );
 
-// ========== GEOLOCATION OVERRIDE ==========
-
 server.tool(
-  "safari_override_geolocation",
-  "Override the browser's geolocation API to return custom coordinates",
+  "safari_form",
+  "Form, select, framework state, and form discovery actions.",
   {
-    latitude: z.coerce.number().describe("Latitude (-90 to 90)"),
-    longitude: z.coerce.number().describe("Longitude (-180 to 180)"),
-    accuracy: z.coerce.number().optional().describe("Accuracy in meters (default: 100)"),
+    action: z.enum(["clear", "select", "fill_all", "submit", "verify", "detect", "react_select_set", "react_select_options"]).describe("Form action"),
+    selector: z.string().optional().describe("CSS selector"),
+    ref: z.string().optional().describe("Ref from safari_snapshot"),
+    value: z.string().optional().describe("Value for select/react_select_set"),
+    expected: z.string().optional().describe("Expected state for verify"),
+    fields: z.array(z.object({ selector: z.string(), value: z.string() })).optional().describe("Fields for fill_all/submit"),
+    submitSelector: z.string().optional().describe("Submit selector for action=submit"),
   },
   async (args) => {
-    const result = await directWrite("override_geolocation", () => safari.overrideGeolocation(args));
-    return { content: [{ type: "text", text: result }] };
+    if (args.action === "clear") return textResult(await extensionOrFallback("clear_field", { selector: args.selector }, () => safari.clearField(args)));
+    if (args.action === "select") return textResult(await directWrite("select_option", () => safari.selectOption(args)));
+    if (args.action === "fill_all") return textResult(await extensionOrFallback("fill_form", { fields: args.fields }, () => safari.fillForm(args)));
+    if (args.action === "submit") return textResult(await directWrite("fill_and_submit", () => safari.fillAndSubmit(args)));
+    if (args.action === "verify") return textResult(await safari.verifyState({ selector: args.selector, expected: args.expected }), { untrusted: true });
+    if (args.action === "detect") return textResult(await safari.detectForms(), { untrusted: true });
+    if (args.action === "react_select_set") return textResult(await directWrite("react_select_set", () => safari.reactSelectSet(args)));
+    if (args.action === "react_select_options") return textResult(await safari.reactSelectListOptions(args), { untrusted: true });
+    return unknownAction("form", args.action);
   }
 );
 
-// ========== COMPUTED STYLES ==========
-
 server.tool(
-  "safari_get_computed_style",
-  "Get computed CSS styles for an element. Optionally filter specific properties.",
+  "safari_extract",
+  "Extract structured data or inspect elements/page metadata.",
   {
-    selector: z.string().describe("CSS selector"),
-    properties: z.array(z.string()).optional().describe("Specific CSS properties to get (e.g. ['color', 'font-size'])"),
+    kind: z.enum(["element", "query", "style", "accessibility", "tables", "meta", "images", "links", "analyze", "performance", "css_coverage"]).describe("Extraction kind"),
+    selector: z.string().optional().describe("CSS selector"),
+    limit: z.coerce.number().optional().describe("Result limit"),
+    filter: z.string().optional().describe("Filter string"),
+    properties: z.array(z.string()).optional().describe("CSS properties for kind=style"),
+    maxDepth: z.coerce.number().optional().describe("Max depth for kind=accessibility"),
   },
   async (args) => {
-    const result = await safari.getComputedStyles(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
+    const { kind } = args;
+    if (kind === "element") return textResult(await extensionOrFallback("get_element", { selector: args.selector }, () => safari.getElementInfo(args)), { untrusted: true });
+    if (kind === "query") return textResult(await extensionOrFallback("query_all", { selector: args.selector, limit: args.limit }, () => safari.querySelectorAll(args)), { untrusted: true });
+    if (kind === "style") return textResult(await safari.getComputedStyles(args), { untrusted: true });
+    if (kind === "accessibility") return textResult(await safari.getAccessibilityTree(args), { untrusted: true });
+    if (kind === "tables") return textResult(await safari.extractTables(args), { untrusted: true });
+    if (kind === "meta") return textResult(await safari.extractMeta(), { untrusted: true });
+    if (kind === "images") return textResult(await safari.extractImages(args), { untrusted: true });
+    if (kind === "links") return textResult(await safari.extractLinks(args), { untrusted: true });
+    if (kind === "analyze") return textResult(await safari.analyzePage(), { untrusted: true });
+    if (kind === "performance") return textResult(await safari.getPerformanceMetrics(), { untrusted: true });
+    if (kind === "css_coverage") return textResult(await safari.getCSSCoverage(), { untrusted: true });
+    return unknownAction("extract", kind);
   }
 );
 
-// ========== INDEXEDDB ==========
-
 server.tool(
-  "safari_list_indexed_dbs",
-  "List all IndexedDB databases on the current page",
-  {},
-  async () => {
-    const result = await safari.listIndexedDBs();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-server.tool(
-  "safari_get_indexed_db",
-  "Read records from an IndexedDB database store",
+  "safari_storage",
+  "Cookies, localStorage, sessionStorage, IndexedDB, and full storage-state operations.",
   {
-    dbName: z.string().describe("Database name"),
-    storeName: z.string().describe("Object store name"),
-    limit: z.coerce.number().optional().describe("Max records (default: 20)"),
+    store: z.enum(["cookies", "local", "session", "indexeddb", "all"]).describe("Storage area"),
+    action: z.enum(["get", "set", "delete", "export", "import", "list"]).describe("Storage action"),
+    key: z.string().optional().describe("Storage key"),
+    value: z.string().optional().describe("Storage value"),
+    name: z.string().optional().describe("Cookie name"),
+    domain: z.string().optional().describe("Cookie domain"),
+    path: z.string().optional().describe("Cookie path"),
+    expires: z.string().optional().describe("Cookie expiration"),
+    secure: z.boolean().optional().describe("Cookie secure flag"),
+    sameSite: z.enum(["Strict", "Lax", "None"]).optional().describe("Cookie SameSite"),
+    all: z.boolean().optional().describe("Delete all cookies"),
+    state: z.string().optional().describe("Storage export JSON for action=import"),
+    dbName: z.string().optional().describe("IndexedDB database name"),
+    storeName: z.string().optional().describe("IndexedDB object store name"),
+    limit: z.coerce.number().optional().describe("IndexedDB record limit"),
   },
   async (args) => {
-    const result = await safari.getIndexedDB(args);
-    return { content: [{ type: "text", text: pageText(result) }] };
+    if (args.store === "cookies") {
+      if (args.action === "get") return textResult((await safari.getCookies()) || "(no cookies)", { untrusted: true });
+      if (args.action === "set") return textResult(await directWrite("set_cookie", () => safari.setCookie(args)));
+      if (args.action === "delete") return textResult(await directWrite("delete_cookies", () => safari.deleteCookies(args)));
+    }
+    if (args.store === "local") {
+      if (args.action === "get") return textResult((await safari.getLocalStorage({ key: args.key })) || "(empty)", { untrusted: true });
+      if (args.action === "set") return textResult(await directWrite("set_local_storage", () => safari.setLocalStorage(args)));
+      if (args.action === "delete") return textResult(await directWrite("delete_local_storage", () => safari.deleteLocalStorage(args)));
+    }
+    if (args.store === "session") {
+      if (args.action === "get") return textResult((await safari.getSessionStorage({ key: args.key })) || "(empty)", { untrusted: true });
+      if (args.action === "set") return textResult(await directWrite("set_session_storage", () => safari.setSessionStorage(args)));
+      if (args.action === "delete") return textResult(await directWrite("delete_session_storage", () => safari.deleteSessionStorage(args)));
+    }
+    if (args.store === "indexeddb") {
+      if (args.action === "list") return textResult(await safari.listIndexedDBs(), { untrusted: true });
+      if (args.action === "get") return textResult(await safari.getIndexedDB(args), { untrusted: true });
+    }
+    if (args.store === "all") {
+      if (args.action === "export") return textResult(await safari.exportStorageState(), { untrusted: true });
+      if (args.action === "import") return textResult(await directWrite("import_storage", () => safari.importStorageState({ state: unwrapPageText(args.state) })));
+    }
+    return errorResult(`Unsupported storage operation: ${args.store}.${args.action}`);
   }
 );
 
-// ========== CSS COVERAGE ==========
-
 server.tool(
-  "safari_css_coverage",
-  "Analyze CSS coverage: find unused CSS rules across all stylesheets. Shows coverage percentage per stylesheet.",
-  {},
-  async () => {
-    const result = await safari.getCSSCoverage();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== FORM AUTO-DETECT ==========
-
-server.tool(
-  "safari_detect_forms",
-  "Auto-detect all forms on the page with their fields, types, selectors, and submit buttons. Great for automated form filling.",
-  {},
-  async () => {
-    const result = await safari.detectForms();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
-);
-
-// ========== SCROLL TO ELEMENT ==========
-
-server.tool(
-  "safari_scroll_to_element",
-  "Scroll to element by CSS selector OR text. For virtual DOM (Airtable) use text — scrolls down until text appears in DOM.",
+  "safari_network",
+  "Network overview, capture, mock, and throttling operations.",
   {
-    selector: z.string().optional().describe("CSS selector of target element"),
-    text: z.string().optional().describe("Text to find — scrolls down until it appears (for virtual DOM/lazy loading)"),
-    block: z.enum(["start", "center", "end", "nearest"]).optional().describe("Scroll alignment (default: center)"),
-    timeout: z.coerce.number().optional().describe("Max time to scroll in ms (default: 10000)"),
+    action: z.enum(["overview", "capture_start", "details", "clear", "mock", "clear_mocks", "throttle"]).optional().describe("Network action"),
+    limit: z.coerce.number().optional().describe("Result limit"),
+    filter: z.string().optional().describe("URL filter"),
+    urlPattern: z.string().optional().describe("URL pattern for action=mock"),
+    response: z.object({
+      status: z.coerce.number().optional(),
+      body: z.string().optional(),
+      contentType: z.string().optional(),
+    }).optional().describe("Mock response"),
+    profile: z.string().optional().describe("Throttle preset"),
+    latency: z.coerce.number().optional().describe("Custom latency"),
+    downloadKbps: z.coerce.number().optional().describe("Custom download speed"),
+    uploadKbps: z.coerce.number().optional().describe("Custom upload speed"),
   },
   async (args) => {
-    const result = await extensionOrFallback(
-      "scroll_to_element",
-      { selector: args.selector, text: args.text, block: args.block },
-      () => safari.scrollToElement(args)
-    );
-    return { content: [{ type: "text", text: result }] };
+    const action = args.action || "overview";
+    if (action === "overview") return textResult(await safari.getNetworkRequests(args), { untrusted: true });
+    if (action === "capture_start") return textResult(await directWrite("start_network_capture", () => safari.startNetworkCapture()));
+    if (action === "details") return textResult(await safari.getNetworkDetails(args), { untrusted: true });
+    if (action === "clear") return textResult(await directWrite("clear_network", () => safari.clearNetworkCapture()));
+    if (action === "mock") return textResult(await directWrite("mock_route", () => safari.mockNetworkRoute(args)));
+    if (action === "clear_mocks") return textResult(await directWrite("clear_mocks", () => safari.clearNetworkMocks()));
+    if (action === "throttle") return textResult(await directWrite("throttle_network", () => safari.throttleNetwork(args)));
+    return unknownAction("network", action);
   }
 );
 
-// ========== COMBO TOOLS (fast multi-step operations) ==========
+server.tool(
+  "safari_console",
+  "Console capture operations.",
+  {
+    action: z.enum(["start", "get", "clear"]).describe("Console action"),
+    level: z.enum(["log", "warn", "error", "info"]).optional().describe("Optional level filter for action=get"),
+  },
+  async ({ action, level }) => {
+    if (action === "start") return textResult(await directWrite("start_console", () => safari.startConsoleCapture()));
+    if (action === "get") return textResult(level ? await safari.getConsoleByLevel({ level }) : await safari.getConsoleMessages(), { untrusted: true });
+    if (action === "clear") return textResult(await directWrite("clear_console", () => safari.clearConsoleCapture()));
+    return unknownAction("console", action);
+  }
+);
 
 server.tool(
-  "safari_click_and_wait",
-  "Click an element AND wait for the result (page load or element). Use instead of click + wait_for separately.",
+  "safari_browser",
+  "Browser environment, files, clipboard, dialog, scroll, PDF, and extension maintenance.",
   {
-    selector: z.string().optional().describe("CSS selector to click"),
-    text: z.string().optional().describe("Visible text to click"),
-    waitFor: z.string().optional().describe("CSS selector to wait for after click"),
-    timeout: z.coerce.number().optional().describe("Wait timeout in ms (default: 10000)"),
+    action: z.enum(["scroll", "scroll_to", "scroll_to_element", "dialog", "resize", "emulate", "reset_emulation", "upload_file", "paste_image", "save_pdf", "clipboard_read", "clipboard_write", "geolocation", "reload_extension"]).describe("Browser action"),
+    dialogAction: z.enum(["accept", "dismiss"]).optional().describe("Dialog action for action=dialog"),
+    direction: z.enum(["up", "down"]).optional().describe("Scroll direction"),
+    amount: z.coerce.number().optional().describe("Scroll amount"),
+    x: z.coerce.number().optional().describe("X position"),
+    y: z.coerce.number().optional().describe("Y position"),
+    selector: z.string().optional().describe("CSS selector"),
+    text: z.string().optional().describe("Text for dialog prompt, clipboard write, or scroll target"),
+    block: z.enum(["start", "center", "end", "nearest"]).optional().describe("Scroll alignment"),
+    timeout: z.coerce.number().optional().describe("Timeout in ms"),
+    width: z.coerce.number().optional().describe("Window or viewport width"),
+    height: z.coerce.number().optional().describe("Window or viewport height"),
+    device: z.string().optional().describe("Device preset"),
+    userAgent: z.string().optional().describe("User agent"),
+    scale: z.coerce.number().optional().describe("Viewport scale"),
+    filePath: z.string().optional().describe("File path for upload/paste image"),
+    path: z.string().optional().describe("Output path for save_pdf"),
+    latitude: z.coerce.number().optional().describe("Geolocation latitude"),
+    longitude: z.coerce.number().optional().describe("Geolocation longitude"),
+    accuracy: z.coerce.number().optional().describe("Geolocation accuracy"),
   },
   async (args) => {
-    const result = await directWrite("click_and_wait", () => safari.clickAndWait(args));
-    return { content: [{ type: "text", text: result }] };
+    if (args.action === "scroll") return textResult(await extensionOrFallback("scroll", { direction: args.direction, amount: args.amount }, () => safari.scroll(args)));
+    if (args.action === "scroll_to") return textResult(await extensionOrFallback("scroll_to", { x: args.x, y: args.y }, () => safari.scrollTo(args)));
+    if (args.action === "scroll_to_element") return textResult(await extensionOrFallback("scroll_to_element", { selector: args.selector, text: args.text, block: args.block }, () => safari.scrollToElement(args)));
+    if (args.action === "dialog") return textResult(await directWrite("handle_dialog", () => safari.handleDialog({ action: args.dialogAction, text: args.text })));
+    if (args.action === "resize") return textResult(await directWrite("resize", () => safari.resizeWindow(args)));
+    if (args.action === "emulate") return textResult(await directWrite("emulate", () => safari.emulate(args)));
+    if (args.action === "reset_emulation") return textResult(await directWrite("reset_emulation", () => safari.resetEmulation()));
+    if (args.action === "upload_file") return textResult(await directWrite("upload_file", () => safari.uploadFile(args)));
+    if (args.action === "paste_image") return textResult(await directWrite("paste_image", () => safari.pasteImageFromFile(args)));
+    if (args.action === "save_pdf") return textResult(await directWrite("save_pdf", () => safari.savePDF(args)));
+    if (args.action === "clipboard_read") return textResult(await directWrite("clipboard_read", () => safari.clipboardRead()));
+    if (args.action === "clipboard_write") return textResult(await directWrite("clipboard_write", () => safari.clipboardWrite(args)));
+    if (args.action === "geolocation") return textResult(await directWrite("override_geolocation", () => safari.overrideGeolocation(args)));
+    if (args.action === "reload_extension") return textResult(await extensionOrFallback("reload_extension", {}, async () => "Extension fallback not available — this command requires the Safari MCP Bridge extension."));
+    return unknownAction("browser", args.action);
   }
 );
 
 server.tool(
-  "safari_fill_and_submit",
-  "Fill a form AND submit it in one operation. Finds submit button automatically if not specified.",
+  "safari_run_script",
+  "Batch multiple Safari actions in one call. Prefer typed tools for single actions.",
   {
-    fields: z.array(z.object({
-      selector: z.string().describe("CSS selector"),
-      value: z.string().describe("Value to fill"),
-    })).describe("Fields to fill"),
-    submitSelector: z.string().optional().describe("Submit button selector (auto-detected if omitted)"),
+    steps: z.array(z.object({
+      action: z.string().describe("safari.js action name, e.g. navigate, click, fill, evaluate"),
+      args: z.record(z.string(), z.unknown()).optional().describe("Arguments for the action"),
+    })).describe("Steps to execute sequentially"),
   },
-  async (args) => {
-    const result = await directWrite("fill_and_submit", () => safari.fillAndSubmit(args));
-    return { content: [{ type: "text", text: result }] };
-  }
-);
-
-server.tool(
-  "safari_analyze_page",
-  "Full page analysis in ONE call: title, URL, meta tags, OG, headings, link stats, image stats, forms, and text preview. Perfect for SEO/audit.",
-  {},
-  async () => {
-    const result = await safari.analyzePage();
-    return { content: [{ type: "text", text: pageText(result) }] };
-  }
+  async ({ steps }) => textResult(await directWrite("run_script", () => safari.runScript({ steps })))
 );
 
 // ========== START SERVER ==========
@@ -2415,7 +1551,7 @@ try {
       let version = "?";
       try { version = JSON.parse(readFileSync(pkgPath, "utf8")).version; } catch {}
       console.error("");
-      console.error(`[Safari MCP] 🦁 v${version} ready — 80 tools, native WebKit, zero Chrome.`);
+      console.error(`[Safari MCP] 🦁 v${version} ready — 19 compact tools, native WebKit, zero Chrome.`);
       console.error(`[Safari MCP] ⭐ Like it? Star: https://github.com/achiya-automation/safari-mcp`);
       console.error("");
       try { writeFileSync(bannerStateFile, String(Date.now()), { mode: 0o600 }); } catch {}

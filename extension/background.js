@@ -273,7 +273,7 @@ async function handleCommand(type, payload) {
   if (type !== "new_tab" && !_readOnlyCommands.has(type) && !_isTabOwnedBySession(sessionId, tabId)) {
     const anyOwned = _sessionOwnedTabs.has(sessionId) && _sessionOwnedTabs.get(sessionId).size > 0;
     if (anyOwned) {
-      throw new Error(`⚠️ Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — not opened by this MCP session. Use safari_new_tab first.`);
+      throw new Error(`Tab safety: refusing "${type}" on tab ${tabId} (${targetTab.url || 'unknown'}) — not opened by this MCP session. Use safari_tabs action=new first.`);
     }
     // If no tabs owned yet, allow operation (backward compatibility for sessions that don't use new_tab)
   }
@@ -657,7 +657,7 @@ async function handleCommand(type, payload) {
           el.focus();
           try { el.showPicker(); return "Opened SELECT picker"; } catch (_) {}
           // showPicker not available — return helpful message
-          return "SELECT element focused. Use safari_select_option to set a value, or safari_press_key with 'space' to open the dropdown.";
+          return "SELECT element focused. Use safari_form action=select to set a value, or safari_keyboard action=press with key 'space' to open the dropdown.";
         }
 
         el.dispatchEvent(new PointerEvent("pointerenter", { ...p, buttons: 0 }));
@@ -891,7 +891,7 @@ async function handleCommand(type, payload) {
               // If editor already has content, warn. If empty, type char-by-char.
               const hasContent = el.textContent && el.textContent.trim().length > 0;
               if (hasContent) {
-                ceResult = "ERROR: Closure/Medium editor detected — safari_fill cannot replace existing content without breaking the editor. Use safari_click to focus this element, then safari_type_text to type into it. To clear first, manually select all and delete via safari_press_key.";
+                ceResult = "ERROR: Closure/Medium editor detected — safari_fill cannot replace existing content without breaking the editor. Use safari_click to focus this element, then safari_keyboard action=type to type into it. To clear first, manually select all and delete via safari_keyboard action=press.";
               } else {
                 // Empty editor — char-by-char with Enter handling (matches type_text strategy)
                 (window.__mcpClosureType || function(){})(value, el);

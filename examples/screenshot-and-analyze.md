@@ -8,10 +8,10 @@ Navigate to a page and capture the entire scrollable content.
 
 ```json
 // Step 1: Open a new tab (never touch user's existing tabs)
-{ "tool": "safari_new_tab", "arguments": { "url": "https://github.com/trending" } }
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "https://github.com/trending" } }
 
 // Step 2: Wait for the page to fully render
-{ "tool": "safari_wait_for", "arguments": { "selector": "article.Box-row", "timeout": 5000 } }
+{ "tool": "safari_wait", "arguments": { "selector": "article.Box-row", "timeout": 5000 } }
 
 // Step 3: Full-page screenshot
 { "tool": "safari_screenshot", "arguments": { "fullPage": true } }
@@ -35,7 +35,7 @@ Capture a single element, useful for inspecting a component, chart, or error mes
 
 ```json
 // Capture only the navigation bar
-{ "tool": "safari_screenshot_element", "arguments": { "selector": "nav.global-nav" } }
+{ "tool": "safari_screenshot", "arguments": { "selector": "nav.global-nav" } }
 ```
 
 **Expected output:** A cropped screenshot containing only the matched element and its contents.
@@ -62,7 +62,7 @@ For most tasks, `safari_snapshot` is cheaper and faster than a screenshot. It re
 Get a comprehensive audit: title, meta tags, heading structure, link stats, image stats, and forms.
 
 ```json
-{ "tool": "safari_analyze_page", "arguments": {} }
+{ "tool": "safari_extract", "arguments": { "kind": "analyze" } }
 ```
 
 **Expected output:** JSON with title, URL, meta description, OG tags, heading hierarchy (H1-H6 counts), total links (internal/external), images (with/without alt text), and detected forms.
@@ -72,7 +72,7 @@ Get a comprehensive audit: title, meta tags, heading structure, link stats, imag
 Save the current page as a PDF file.
 
 ```json
-{ "tool": "safari_save_pdf", "arguments": { "path": "/tmp/github-trending.pdf" } }
+{ "tool": "safari_browser", "arguments": { "action": "save_pdf", "path": "/tmp/github-trending.pdf" } }
 ```
 
 **Expected output:** PDF saved to the specified path. Note: this tool briefly activates Safari (brings it to foreground) because it uses the native Export menu.

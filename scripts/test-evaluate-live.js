@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Live integration test for safari_evaluate (sync + async) and safari_wait_for
+ * Live integration test for safari_evaluate (sync + async) and safari_wait
  * against real Safari — verifies the v2.11.0 async-via-do-JavaScript fix end to end.
  *
  * `do JavaScript` never awaits a Promise, so before the fix every async script
- * returned "(undefined)" and safari_wait_for never actually waited. This test
+ * returned "(undefined)" and safari_wait never actually waited. This test
  * exercises the real AppleScript bridge, not just the string-building logic.
  *
  * Run:  SAFARI_PROFILE='אוטומציות' node scripts/test-evaluate-live.js
@@ -23,7 +23,7 @@ function check(name, got, expectFn) {
 }
 
 async function main() {
-  console.log('— safari_evaluate / safari_wait_for live test —\n');
+  console.log('— safari_evaluate / safari_wait live test —\n');
   const before = JSON.parse(await safari.listTabs());
   await safari.newTab('https://example.com/');
 

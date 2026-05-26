@@ -191,7 +191,7 @@ let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 // _activeTabIndex or fail loudly — never silently target the user's tab.
 let _lastNewTabAt = 0;
 const NEW_TAB_GRACE_MS = 30000;
-// Becomes true once safari_new_tab is called for the first time in this session.
+// Becomes true once safari_tabs action=new is called for the first time in this session.
 // Once true, write operations (navigate/click/fill) MUST NOT fall back to
 // "current tab of window" — that targets the USER'S active tab. The 30s grace
 // window was insufficient: tab tracking can be lost much later in a session
@@ -335,7 +335,7 @@ function _assertNotFallingBackToUserTab(opName) {
   if (_hasOwnedTab) {
     throw new Error(
       `Tab tracking lost — refusing to ${opName} via fallback to "current tab of window" (would target the user's active tab). ` +
-      `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a known tab.`
+      `This session previously opened its own tab via safari_tabs action=new; re-run safari_tabs action=new to recover, or call safari_tabs action=list and safari_tabs action=switch to re-anchor to a known tab.`
     );
   }
   // No tab ever owned by this session — fallback to front document is intentional.
@@ -876,7 +876,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   if (!idx) idx = _activeTabIndex;
   // Once this session owns a tab, never silently run on the user's current tab.
   if (!idx && _hasOwnedTab && SAFARI_PROFILE) {
-    throw new Error('Tab tracking lost during runJS — refusing to target the user\'s current tab. Call safari_new_tab to reopen.');
+    throw new Error('Tab tracking lost during runJS — refusing to target the user\'s current tab. Call safari_tabs action=new to reopen.');
   }
   const target = idx
     ? `tab ${idx} of ${getTargetWindowRef()}`
@@ -915,7 +915,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
         throw new Error(
           `Tab tracking lost during runJS — original tab ${idx} no longer exists, and URL-based resolution failed. ` +
           `Refusing to fall back to "current tab of window" (would target user's active tab). ` +
-          `Call safari_new_tab to open a fresh tab and retry.`
+          `Call safari_tabs action=new to open a fresh tab and retry.`
         );
       }
       // No owned tab in this session — front-document fallback is intentional.
@@ -944,7 +944,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   if (!idx && _hasOwnedTab) {
     throw new Error(
       `Tab tracking lost during runJSLarge — refusing to fall back to "current tab of window" (would target user's active tab). ` +
-      `Call safari_new_tab to open a fresh tab and retry.`
+      `Call safari_tabs action=new to open a fresh tab and retry.`
     );
   }
   const target = idx
@@ -1318,7 +1318,7 @@ export async function click({ selector, text, x, y, ref }) {
 
   if (typeof result === 'string' && result.startsWith('__SELECT_GUARD__:')) {
     const detail = result.substring('__SELECT_GUARD__:'.length);
-    throw new Error(`Target is a native <select> (${detail}). Use safari_select_option with a value matching one of the options instead — clicking it would open the OS picker and block.`);
+    throw new Error(`Target is a native <select> (${detail}). Use safari_form with action "select" and a matching value instead — clicking it would open the OS picker and block.`);
   }
 
   // Structured result from coreJS. Fall back to the raw string for forward-compat.
@@ -1344,7 +1344,7 @@ export async function click({ selector, text, x, y, ref }) {
     await nativeClick({ selector, text, x, y, ref });
     return 'Clicked (native fallback — synthetic click had no effect): ' + label;
   } catch (e) {
-    return 'Clicked: ' + label + ' — ⚠️ synthetic click produced no detectable effect and the native fallback is unavailable (' + ((e && e.message) || e) + '). Retry with safari_native_click.';
+    return 'Clicked: ' + label + ' — synthetic click produced no detectable effect and the native fallback is unavailable (' + ((e && e.message) || e) + '). Retry with safari_click using native:true.';
   }
 }
 

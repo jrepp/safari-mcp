@@ -1,9 +1,6 @@
 /**
- * Safari MCP — TypeScript type declarations
- * Covers all ~83 registered tools and the MCP server export.
+ * Safari MCP — TypeScript type declarations for the compact 19-tool surface.
  */
-
-// ========== CORE TYPES ==========
 
 export type MCPContent =
   | { type: "text"; text: string }
@@ -27,85 +24,60 @@ export interface MCPTool<TInput extends Record<string, unknown> = Record<string,
   handler: (input: TInput) => Promise<MCPToolResult>;
 }
 
-
-// ========== TOOL INPUT TYPES ==========
-
-// Navigation
 export interface SafariNavigateInput { url: string }
-export interface SafariGoBackInput {}
-export interface SafariGoForwardInput {}
-export interface SafariReloadInput { hard?: boolean }
-export interface SafariNavigateAndReadInput { url: string; maxLength?: number; timeout?: number }
-
-// Page Info
-export interface SafariReadPageInput { selector?: string; maxLength?: number }
-export interface SafariGetSourceInput { maxLength?: number }
+export interface SafariReadPageInput { selector?: string; maxLength?: number; format?: "text" | "source" }
 export interface SafariSnapshotInput { selector?: string }
 
-// Click
-export interface SafariClickInput { ref?: string; selector?: string; text?: string; x?: number; y?: number }
-export interface SafariClickAndReadInput { text?: string; selector?: string; x?: number; y?: number; wait?: number; maxLength?: number }
-export interface SafariDoubleClickInput { selector?: string; x?: number; y?: number }
-export interface SafariRightClickInput { selector?: string; x?: number; y?: number }
-export interface SafariNativeClickInput { ref?: string; selector?: string; text?: string; x?: number; y?: number; doubleClick?: boolean }
-
-// Form Input
-export interface SafariFillInput { ref?: string; selector?: string; value: string }
-export interface SafariClearFieldInput { selector: string }
-export interface SafariSelectOptionInput { selector: string; value: string }
-export interface SafariFillFormField { selector: string; value: string }
-export interface SafariFillFormInput { fields: SafariFillFormField[] }
-
-// Keyboard
-export interface SafariPressKeyInput { key: string; modifiers?: string[] }
-export interface SafariTypeTextInput { text: string; ref?: string; selector?: string }
-
-// Code Editor
-export interface SafariReplaceEditorInput { text: string }
-
-// Screenshot
-export interface SafariScreenshotInput { fullPage?: boolean }
-export interface SafariScreenshotElementInput { selector: string }
-
-// Scroll
-export interface SafariScrollInput { direction?: "up" | "down"; amount?: number }
-export interface SafariScrollToInput { x?: number; y?: number }
-export interface SafariScrollToElementInput {
+export interface SafariClickInput {
+  ref?: string;
   selector?: string;
   text?: string;
-  block?: "start" | "center" | "end" | "nearest";
+  x?: number;
+  y?: number;
+  button?: "left" | "right";
+  count?: number;
+  native?: boolean;
+  waitFor?: string;
+  wait?: number;
+  read?: boolean;
+  maxLength?: number;
+}
+
+export interface SafariFillInput {
+  ref?: string;
+  selector?: string;
+  value: string;
+  native?: boolean;
+  verify?: boolean;
+}
+
+export interface SafariScreenshotInput { fullPage?: boolean; selector?: string }
+export interface SafariWaitInput { action?: "for" | "time"; selector?: string; text?: string; timeout?: number; ms?: number }
+export interface SafariEvaluateInput { script: string }
+
+export interface SafariTabsInput {
+  action: "list" | "search" | "new" | "switch" | "close" | "wait_for_new";
+  query?: string;
+  titleContains?: string;
+  activate?: boolean;
+  url?: string;
+  urlContains?: string;
+  index?: number;
   timeout?: number;
 }
 
-// Tab Management
-export interface SafariListTabsInput {}
-export interface SafariNewTabInput { url?: string }
-export interface SafariCloseTabInput {}
-export interface SafariSwitchTabInput { index: number }
-export interface SafariWaitForNewTabInput { timeout?: number; urlContains?: string }
+export interface SafariHistoryInput { action: "back" | "forward" | "reload"; hard?: boolean }
 
-// Wait
-export interface SafariWaitForInput { selector?: string; text?: string; timeout?: number }
-export interface SafariWaitInput { ms: number }
-
-// Evaluate
-export interface SafariEvaluateInput { script: string }
-
-// Element Info
-export interface SafariGetElementInput { selector: string }
-export interface SafariQueryAllInput { selector: string; limit?: number }
-
-// Hover
-export interface SafariHoverInput { ref?: string; selector?: string; x?: number; y?: number }
-
-// Dialog
-export interface SafariHandleDialogInput { action?: "accept" | "dismiss"; text?: string }
-
-// Window
-export interface SafariResizeInput { width: number; height: number }
-
-// Drag
-export interface SafariDragInput {
+export interface SafariPointerInput {
+  action: "hover" | "drag";
+  ref?: string;
+  selector?: string;
+  text?: string;
+  x?: number;
+  y?: number;
+  native?: boolean;
+  dwellMs?: number;
+  restoreMouse?: boolean;
   sourceSelector?: string;
   targetSelector?: string;
   sourceX?: number;
@@ -114,92 +86,93 @@ export interface SafariDragInput {
   targetY?: number;
 }
 
-// File / Image
-export interface SafariUploadFileInput { selector: string; filePath: string }
-export interface SafariPasteImageInput { filePath: string }
+export interface SafariKeyboardInput {
+  action: "press" | "type" | "replace_editor";
+  key?: string;
+  modifiers?: string[];
+  text?: string;
+  selector?: string;
+  ref?: string;
+  native?: boolean;
+}
 
-// Emulation
-export interface SafariEmulateInput { device?: string; width?: number; height?: number; userAgent?: string; scale?: number }
-export interface SafariResetEmulationInput {}
+export interface SafariFormField { selector: string; value: string }
+export interface SafariFormInput {
+  action: "clear" | "select" | "fill_all" | "submit" | "verify" | "detect" | "react_select_set" | "react_select_options";
+  selector?: string;
+  ref?: string;
+  value?: string;
+  expected?: string;
+  fields?: SafariFormField[];
+  submitSelector?: string;
+}
 
-// Cookies & Storage
-export interface SafariGetCookiesInput {}
-export interface SafariLocalStorageInput { key?: string }
-export interface SafariSetCookieInput {
-  name: string;
-  value: string;
+export interface SafariExtractInput {
+  kind: "element" | "query" | "style" | "accessibility" | "tables" | "meta" | "images" | "links" | "analyze" | "performance" | "css_coverage";
+  selector?: string;
+  limit?: number;
+  filter?: string;
+  properties?: string[];
+  maxDepth?: number;
+}
+
+export interface SafariStorageInput {
+  store: "cookies" | "local" | "session" | "indexeddb" | "all";
+  action: "get" | "set" | "delete" | "export" | "import" | "list";
+  key?: string;
+  value?: string;
+  name?: string;
   domain?: string;
   path?: string;
   expires?: string;
   secure?: boolean;
   sameSite?: "Strict" | "Lax" | "None";
+  all?: boolean;
+  state?: string;
+  dbName?: string;
+  storeName?: string;
+  limit?: number;
 }
-export interface SafariDeleteCookiesInput { name?: string; all?: boolean }
-export interface SafariSessionStorageInput { key?: string }
-export interface SafariSetSessionStorageInput { key: string; value: string }
-export interface SafariSetLocalStorageInput { key: string; value: string }
-export interface SafariDeleteLocalStorageInput { key?: string }
-export interface SafariDeleteSessionStorageInput { key?: string }
-export interface SafariExportStorageInput {}
-export interface SafariImportStorageInput { state: string }
 
-// Clipboard
-export interface SafariClipboardReadInput {}
-export interface SafariClipboardWriteInput { text: string }
+export interface SafariNetworkInput {
+  action?: "overview" | "capture_start" | "details" | "clear" | "mock" | "clear_mocks" | "throttle";
+  limit?: number;
+  filter?: string;
+  urlPattern?: string;
+  response?: { status?: number; body?: string; contentType?: string };
+  profile?: string;
+  latency?: number;
+  downloadKbps?: number;
+  uploadKbps?: number;
+}
 
-// Network
-export interface SafariNetworkInput { limit?: number }
-export interface SafariMockRouteResponse { status?: number; body?: string; contentType?: string }
-export interface SafariMockRouteInput { urlPattern: string; response: SafariMockRouteResponse }
-export interface SafariClearMocksInput {}
-export interface SafariStartNetworkCaptureInput {}
-export interface SafariNetworkDetailsInput { limit?: number; filter?: string }
-export interface SafariClearNetworkInput {}
-export interface SafariThrottleNetworkInput { profile?: string; latency?: number; downloadKbps?: number }
+export interface SafariConsoleInput { action: "start" | "get" | "clear"; level?: "log" | "warn" | "error" | "info" }
 
-// Console
-export interface SafariStartConsoleInput {}
-export interface SafariGetConsoleInput {}
-export interface SafariClearConsoleInput {}
-export interface SafariConsoleFilterInput { level: "log" | "warn" | "error" | "info" }
+export interface SafariBrowserInput {
+  action: "scroll" | "scroll_to" | "scroll_to_element" | "dialog" | "resize" | "emulate" | "reset_emulation" | "upload_file" | "paste_image" | "save_pdf" | "clipboard_read" | "clipboard_write" | "geolocation" | "reload_extension";
+  dialogAction?: "accept" | "dismiss";
+  direction?: "up" | "down";
+  amount?: number;
+  x?: number;
+  y?: number;
+  selector?: string;
+  text?: string;
+  block?: "start" | "center" | "end" | "nearest";
+  timeout?: number;
+  width?: number;
+  height?: number;
+  device?: string;
+  userAgent?: string;
+  scale?: number;
+  filePath?: string;
+  path?: string;
+  latitude?: number;
+  longitude?: number;
+  accuracy?: number;
+}
 
-// PDF
-export interface SafariSavePDFInput { path: string }
-
-// Accessibility
-export interface SafariAccessibilitySnapshotInput { selector?: string; maxDepth?: number }
-
-// Performance
-export interface SafariPerformanceMetricsInput {}
-export interface SafariCSSCoverageInput {}
-
-// Data Extraction
-export interface SafariExtractTablesInput { selector?: string; limit?: number }
-export interface SafariExtractMetaInput {}
-export interface SafariExtractImagesInput { limit?: number }
-export interface SafariExtractLinksInput { limit?: number; filter?: string }
-
-// Geolocation
-export interface SafariOverrideGeolocationInput { latitude: number; longitude: number; accuracy?: number }
-
-// Computed Styles
-export interface SafariGetComputedStyleInput { selector: string; properties?: string[] }
-
-// IndexedDB
-export interface SafariListIndexedDBsInput {}
-export interface SafariGetIndexedDBInput { dbName: string; storeName: string; limit?: number }
-
-// Form Detection
-export interface SafariDetectFormsInput {}
-
-// Batch / Combo Tools
 export interface SafariRunScriptStep { action: string; args?: Record<string, unknown> }
 export interface SafariRunScriptInput { steps: SafariRunScriptStep[] }
-export interface SafariClickAndWaitInput { selector?: string; text?: string; waitFor?: string; timeout?: number }
-export interface SafariFillAndSubmitInput { fields: SafariFillFormField[]; submitSelector?: string }
-export interface SafariAnalyzePageInput {}
-
-// ========== TAB INFO ==========
 
 export interface SafariTab {
   index: number;
@@ -207,7 +180,6 @@ export interface SafariTab {
   url: string;
 }
 
-// ========== MODULE DECLARATION ==========
 export interface McpServer {
   connect(transport: unknown): Promise<void>;
   tool(name: string, description: string, schema: unknown, handler: (input: unknown) => Promise<MCPToolResult>): unknown;
