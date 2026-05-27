@@ -9,5 +9,8 @@ node_modules/
 # MCP Registry publisher binary (downloaded locally, not for commit)
 mcp-publisher
 
+# Safari helper binary (built/downloaded locally, not for commit)
+safari-helper
+
 # Smithery build artifacts
 .smithery/
