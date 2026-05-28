@@ -120,7 +120,27 @@ For data that doesn't fit neatly into tables or links, use `safari_evaluate` to 
 ]
 ```
 
-## 6. Read page text content
+## 6. Diagnose layout and clickability
+
+Use `kind: "layout"` to explain why an element is hidden, clipped, offscreen, or covered. This pairs well with `safari_snapshot` refs.
+
+```json
+// Optional: open the local manual fixture from this repo
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "file:///Users/jrepp/d/safari-mcp/scripts/fixtures/layout-cases.html" } }
+
+// Capture refs first
+{ "tool": "safari_snapshot", "arguments": {} }
+
+// Inspect a selector directly
+{ "tool": "safari_extract", "arguments": { "kind": "layout", "selector": ".covered-button" } }
+
+// Or inspect a specific snapshot ref with ancestor diagnostics
+{ "tool": "safari_extract", "arguments": { "kind": "layout", "ref": "12_4", "includeAncestors": true } }
+```
+
+**Expected output:** Compact JSON with `rect`, `visible`, `clickable`, `issues`, a style subset, and `topmostAtCenter` details for coverage debugging.
+
+## 7. Read page text content
 
 Get the readable text content of a page, useful for summarization or content analysis.
 
@@ -134,7 +154,7 @@ Get the readable text content of a page, useful for summarization or content ana
 
 **Expected output:** Title, URL, and the text content of the page (or selected element), stripped of HTML tags.
 
-## 7. Combine extraction with authenticated access
+## 8. Combine extraction with authenticated access
 
 The real power: extract data from pages that require login. Since Safari MCP uses your actual browser session, you can scrape dashboards you are already logged into.
 

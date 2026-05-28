@@ -1371,12 +1371,18 @@ server.tool(
   "safari_extract",
   "Extract structured data or inspect elements/page metadata.",
   {
-    kind: z.enum(["element", "query", "style", "accessibility", "tables", "meta", "images", "links", "analyze", "performance", "css_coverage"]).describe("Extraction kind"),
+    kind: z.enum(["element", "query", "style", "accessibility", "tables", "meta", "images", "links", "analyze", "performance", "css_coverage", "layout"]).describe("Extraction kind"),
     selector: z.string().optional().describe("CSS selector"),
+    ref: z.string().optional().describe("Snapshot ref"),
+    refs: z.array(z.string()).optional().describe("Several snapshot refs"),
     limit: z.coerce.number().optional().describe("Result limit"),
     filter: z.string().optional().describe("Filter string"),
     properties: z.array(z.string()).optional().describe("CSS properties for kind=style"),
     maxDepth: z.coerce.number().optional().describe("Max depth for kind=accessibility"),
+    includeAncestors: z.boolean().optional().describe("Include scroll, clipping, positioned, and transformed ancestors"),
+    includeChildren: z.boolean().optional().describe("Include immediate children"),
+    viewportOnly: z.boolean().optional().describe("Restrict omitted-target mode to viewport-relevant items"),
+    diagnostics: z.boolean().optional().describe("Include issue labels and follow-up suggestions"),
   },
   async (args) => {
     const { kind } = args;
@@ -1391,6 +1397,7 @@ server.tool(
     if (kind === "analyze") return textResult(await safari.analyzePage(), { untrusted: true });
     if (kind === "performance") return textResult(await safari.getPerformanceMetrics(), { untrusted: true });
     if (kind === "css_coverage") return textResult(await safari.getCSSCoverage(), { untrusted: true });
+    if (kind === "layout") return textResult(await safari.extractLayout(args), { untrusted: true });
     return unknownAction("extract", kind);
   }
 );

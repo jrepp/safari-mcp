@@ -4519,6 +4519,403 @@ export async function overrideGeolocation({ latitude, longitude, accuracy = 100 
   );
 }
 
+// ========== LAYOUT DIAGNOSTICS ==========
+
+export async function extractLayout({
+  selector,
+  ref,
+  refs,
+  limit = 20,
+  properties,
+  includeAncestors = false,
+  includeChildren = false,
+  viewportOnly = true,
+  diagnostics = true,
+} = {}) {
+  const options = {
+    selector: selector || null,
+    ref: ref || null,
+    refs: Array.isArray(refs) ? refs.filter(Boolean) : [],
+    limit: Math.max(1, Math.min(Number(limit) || 20, 50)),
+    properties: Array.isArray(properties) && properties.length ? properties : null,
+    includeAncestors: !!includeAncestors,
+    includeChildren: !!includeChildren,
+    viewportOnly: viewportOnly !== false,
+    diagnostics: diagnostics !== false,
+  };
+
+  return runJS(
+    `(function(){
+      var opts = ${JSON.stringify(options)};
+      var defaultStyleProps = ['display','visibility','opacity','pointer-events','position','z-index','overflow','overflow-x','overflow-y','transform'];
+      var styleProps = Array.isArray(opts.properties) && opts.properties.length ? opts.properties : defaultStyleProps;
+      var getShadowRoot = window.__mcpGetShadowRoot || function(el){ return el ? (el.shadowRoot || null) : null; };
+      var viewport = {
+        width: Math.round(window.innerWidth || 0),
+        height: Math.round(window.innerHeight || 0),
+        scrollX: Math.round(window.scrollX || 0),
+        scrollY: Math.round(window.scrollY || 0),
+        devicePixelRatio: window.devicePixelRatio || 1
+      };
+
+      function clampRect(rect) {
+        return {
+          x: Math.round(rect.left * 100) / 100,
+          y: Math.round(rect.top * 100) / 100,
+          width: Math.round(rect.width * 100) / 100,
+          height: Math.round(rect.height * 100) / 100
+        };
+      }
+
+      function asRect(obj) {
+        return {
+          left: obj.left,
+          top: obj.top,
+          right: obj.right,
+          bottom: obj.bottom,
+          width: Math.max(0, obj.right - obj.left),
+          height: Math.max(0, obj.bottom - obj.top)
+        };
+      }
+
+      function intersectRect(a, b) {
+        var left = Math.max(a.left, b.left);
+        var top = Math.max(a.top, b.top);
+        var right = Math.min(a.right, b.right);
+        var bottom = Math.min(a.bottom, b.bottom);
+        if (right <= left || bottom <= top) return null;
+        return { left: left, top: top, right: right, bottom: bottom };
+      }
+
+      function rectArea(rect) {
+        if (!rect) return 0;
+        return Math.max(0, rect.right - rect.left) * Math.max(0, rect.bottom - rect.top);
+      }
+
+      function makeSelector(el) {
+        if (!el || !el.tagName) return null;
+        var tag = el.tagName.toLowerCase();
+        if (el.id) return tag + '#' + el.id;
+        var cls = Array.from(el.classList || []).slice(0, 2).join('.');
+        if (cls) return tag + '.' + cls;
+        if (el.getAttribute && el.getAttribute('name')) return tag + '[name="' + el.getAttribute('name').slice(0, 40) + '"]';
+        if (el.getAttribute && el.getAttribute('data-testid')) return tag + '[data-testid="' + el.getAttribute('data-testid').slice(0, 40) + '"]';
+        return tag;
+      }
+
+      function textSnippet(el) {
+        if (!el) return '';
+        var text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+        return text.slice(0, 80);
+      }
+
+      function getRef(el) {
+        return el && el.getAttribute ? (el.getAttribute('data-mcp-ref') || null) : null;
+      }
+
+      function isElementDisabled(el) {
+        return !!(el && (el.disabled || el.getAttribute('aria-disabled') === 'true'));
+      }
+
+      function getDeepParent(el) {
+        if (!el) return null;
+        if (el.parentElement) return el.parentElement;
+        var root = el.getRootNode ? el.getRootNode() : null;
+        return root && root.host ? root.host : null;
+      }
+
+      function walkDeep(root, visit) {
+        if (!root || !visit) return;
+        var children = root.children || [];
+        for (var i = 0; i < children.length; i++) {
+          var child = children[i];
+          if (visit(child) === false) return false;
+          var shadow = getShadowRoot(child);
+          if (shadow && walkDeep(shadow, visit) === false) return false;
+          if (walkDeep(child, visit) === false) return false;
+        }
+      }
+
+      function deepQueryAll(selectorText, maxCount) {
+        var found = [];
+        var seen = new Set();
+        walkDeep(document.documentElement, function(node) {
+          if (!node.matches) return;
+          try {
+            if (node.matches(selectorText) && !seen.has(node)) {
+              seen.add(node);
+              found.push(node);
+              if (found.length >= maxCount) return false;
+            }
+          } catch (_err) {}
+        });
+        return found;
+      }
+
+      function resolveByRef(refValue) {
+        if (!refValue) return null;
+        var matches = deepQueryAll('[data-mcp-ref]', 2000);
+        for (var i = 0; i < matches.length; i++) {
+          if (matches[i].getAttribute('data-mcp-ref') === refValue) return matches[i];
+        }
+        return null;
+      }
+
+      function collectDefaultTargets(maxCount) {
+        var targets = [];
+        var seen = new Set();
+        var refKeys = window.__mcpRefs ? Object.keys(window.__mcpRefs) : [];
+        for (var i = 0; i < refKeys.length; i++) {
+          var el = resolveByRef(refKeys[i]);
+          if (!el || seen.has(el)) continue;
+          seen.add(el);
+          targets.push(el);
+          if (targets.length >= maxCount) return targets;
+        }
+        walkDeep(document.documentElement, function(node) {
+          if (!node || !node.tagName || seen.has(node)) return;
+          var tag = node.tagName;
+          var interactive = ['A','BUTTON','INPUT','TEXTAREA','SELECT','SUMMARY','DETAILS'].indexOf(tag) >= 0;
+          if (!interactive && !node.getAttribute('role') && node.getAttribute('tabindex') === null && !node.onclick && !node.isContentEditable) return;
+          seen.add(node);
+          targets.push(node);
+          if (targets.length >= maxCount) return false;
+        });
+        return targets;
+      }
+
+      function getComputedSubset(el) {
+        var styles = window.getComputedStyle(el);
+        var out = {};
+        for (var i = 0; i < styleProps.length; i++) {
+          out[styleProps[i]] = styles.getPropertyValue(styleProps[i]);
+        }
+        return { styles: styles, subset: out };
+      }
+
+      function getImmediateChildren(el) {
+        var items = [];
+        var children = Array.from(el.children || []);
+        for (var i = 0; i < children.length && i < 10; i++) {
+          items.push({
+            ref: getRef(children[i]),
+            tag: children[i].tagName,
+            selector: makeSelector(children[i]),
+            rect: clampRect(children[i].getBoundingClientRect())
+          });
+        }
+        var shadow = getShadowRoot(el);
+        if (shadow) {
+          var shadowChildren = Array.from(shadow.children || []);
+          for (var j = 0; j < shadowChildren.length && items.length < 10; j++) {
+            items.push({
+              ref: getRef(shadowChildren[j]),
+              tag: shadowChildren[j].tagName,
+              selector: makeSelector(shadowChildren[j]),
+              rect: clampRect(shadowChildren[j].getBoundingClientRect()),
+              shadowChild: true
+            });
+          }
+        }
+        return items;
+      }
+
+      function summarizeElement(el) {
+        var computed = getComputedSubset(el);
+        var styles = computed.styles;
+        var rect = el.getBoundingClientRect();
+        var rawRect = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+        var viewportRect = { left: 0, top: 0, right: window.innerWidth || 0, bottom: window.innerHeight || 0 };
+        var viewportIntersection = intersectRect(rawRect, viewportRect);
+        var clipRect = viewportIntersection;
+        var ancestorDetails = [];
+        var current = getDeepParent(el);
+        while (current) {
+          var currentStyles = window.getComputedStyle(current);
+          var overflowX = currentStyles.overflowX || currentStyles.overflow;
+          var overflowY = currentStyles.overflowY || currentStyles.overflow;
+          var shouldClip = ['hidden', 'clip', 'scroll', 'auto'].indexOf(overflowX) >= 0 || ['hidden', 'clip', 'scroll', 'auto'].indexOf(overflowY) >= 0;
+          if (shouldClip) {
+            var ancestorRect = current.getBoundingClientRect();
+            clipRect = intersectRect(clipRect || rawRect, {
+              left: ancestorRect.left,
+              top: ancestorRect.top,
+              right: ancestorRect.right,
+              bottom: ancestorRect.bottom
+            });
+          }
+          if (opts.includeAncestors && ancestorDetails.length < 12) {
+            var transformed = currentStyles.transform && currentStyles.transform !== 'none';
+            var positioned = currentStyles.position && currentStyles.position !== 'static';
+            if (shouldClip || transformed || positioned) {
+              ancestorDetails.push({
+                ref: getRef(current),
+                tag: current.tagName,
+                selector: makeSelector(current),
+                rect: clampRect(current.getBoundingClientRect()),
+                overflowX: overflowX,
+                overflowY: overflowY,
+                position: currentStyles.position,
+                transform: transformed ? currentStyles.transform : undefined
+              });
+            }
+          }
+          current = getDeepParent(current);
+        }
+
+        var center = { x: rect.left + (rect.width / 2), y: rect.top + (rect.height / 2) };
+        var centerInsideViewport = center.x >= 0 && center.x <= viewportRect.right && center.y >= 0 && center.y <= viewportRect.bottom;
+        var centerStack = centerInsideViewport ? document.elementsFromPoint(center.x, center.y) : [];
+        var topmost = centerStack.length ? centerStack[0] : null;
+        var topmostInfo = topmost ? {
+          ref: getRef(topmost),
+          tag: topmost.tagName,
+          selector: makeSelector(topmost),
+          text: textSnippet(topmost)
+        } : null;
+
+        var issues = [];
+        if (styles.display === 'none') issues.push('display-none');
+        if (styles.visibility === 'hidden' || styles.visibility === 'collapse') issues.push('visibility-hidden');
+        if (rect.width <= 0 || rect.height <= 0) issues.push('zero-size');
+        if (!viewportIntersection) issues.push('offscreen');
+        var area = rectArea(rawRect);
+        var clippedArea = rectArea(clipRect);
+        if (area > 0 && clippedArea < area - 1) issues.push('clipped');
+        if (parseFloat(styles.opacity || '1') === 0) issues.push('opacity-zero');
+        if (styles.pointerEvents === 'none') issues.push('pointer-events-none');
+        if (isElementDisabled(el)) issues.push('disabled');
+        var centerTopmost = centerInsideViewport && !!topmost && (topmost === el || el.contains(topmost));
+        if (centerInsideViewport && !centerTopmost) issues.push('covered-at-center');
+
+        var visible = issues.indexOf('display-none') === -1 &&
+          issues.indexOf('visibility-hidden') === -1 &&
+          issues.indexOf('zero-size') === -1 &&
+          issues.indexOf('offscreen') === -1 &&
+          issues.indexOf('opacity-zero') === -1 &&
+          clippedArea > 0;
+        var clickable = visible &&
+          centerInsideViewport &&
+          centerTopmost &&
+          issues.indexOf('pointer-events-none') === -1 &&
+          issues.indexOf('disabled') === -1;
+
+        var item = {
+          ref: getRef(el),
+          selector: makeSelector(el),
+          tag: el.tagName,
+          text: textSnippet(el),
+          rect: clampRect(rect),
+          visible: visible,
+          clickable: clickable,
+          centerTopmost: centerTopmost,
+          topmostAtCenter: topmostInfo,
+          issues: opts.diagnostics ? issues : [],
+          style: computed.subset
+        };
+        if (opts.includeAncestors) item.ancestors = ancestorDetails;
+        if (opts.includeChildren) item.children = getImmediateChildren(el);
+        if (opts.diagnostics) {
+          item.viewportIntersection = viewportIntersection ? clampRect(asRect(viewportIntersection)) : null;
+          item.center = { x: Math.round(center.x * 100) / 100, y: Math.round(center.y * 100) / 100 };
+          item.centerStackDepth = centerStack.length;
+        }
+        return item;
+      }
+
+      var targets = [];
+      var seen = new Set();
+      function pushTarget(el) {
+        if (!el || seen.has(el)) return;
+        seen.add(el);
+        targets.push(el);
+      }
+
+      if (opts.ref) pushTarget(resolveByRef(opts.ref));
+      if (Array.isArray(opts.refs)) {
+        for (var i = 0; i < opts.refs.length; i++) pushTarget(resolveByRef(opts.refs[i]));
+      }
+      if (opts.selector) {
+        var matches = deepQueryAll(opts.selector, opts.limit * 3);
+        for (var j = 0; j < matches.length; j++) pushTarget(matches[j]);
+      }
+      if (!targets.length) {
+        var defaults = collectDefaultTargets(opts.limit * 3);
+        for (var k = 0; k < defaults.length; k++) pushTarget(defaults[k]);
+      }
+
+      var items = [];
+      for (var m = 0; m < targets.length; m++) {
+        var summary = summarizeElement(targets[m]);
+        if (opts.viewportOnly && !opts.selector && !opts.ref && !opts.refs.length && !summary.visible && summary.issues.indexOf('covered-at-center') === -1) {
+          continue;
+        }
+        items.push(summary);
+        if (items.length >= opts.limit) break;
+      }
+
+      var response = {
+        viewport: viewport,
+        items: items
+      };
+
+      if (opts.diagnostics) {
+        response.next = [];
+        for (var n = 0; n < items.length && response.next.length < 5; n++) {
+          if (items[n].ref && items[n].issues.indexOf('covered-at-center') >= 0) {
+            response.next.push('call safari_extract kind=layout ref=' + items[n].ref + ' includeAncestors=true');
+          } else if (items[n].selector && items[n].issues.indexOf('offscreen') >= 0) {
+            response.next.push('call safari_browser action=scroll_to_element selector="' + items[n].selector + '"');
+          }
+        }
+      }
+
+      function serialize(value) {
+        try { return JSON.stringify(value); } catch (_err) { return '{"error":"layout serialization failed"}'; }
+      }
+
+      function compactForBudget(value) {
+        var compact = value;
+        var serialized = serialize(compact);
+        var budgetMode = !opts.properties && !opts.includeAncestors && !opts.includeChildren && opts.limit <= 20;
+        if (!budgetMode || serialized.length <= 12000) return serialized;
+
+        delete compact.next;
+        serialized = serialize(compact);
+        if (serialized.length <= 12000) return serialized;
+
+        compact.items.forEach(function(item) {
+          if (item.text) item.text = item.text.slice(0, 40);
+          delete item.viewportIntersection;
+          delete item.center;
+          delete item.centerStackDepth;
+          if (item.topmostAtCenter && item.topmostAtCenter.text) item.topmostAtCenter.text = item.topmostAtCenter.text.slice(0, 32);
+        });
+        serialized = serialize(compact);
+        if (serialized.length <= 12000) return serialized;
+
+        compact.items.forEach(function(item) {
+          if (item.selector) item.selector = item.selector.slice(0, 60);
+          if (item.style) {
+            delete item.style['overflow-x'];
+            delete item.style['overflow-y'];
+            delete item.style.transform;
+          }
+        });
+        serialized = serialize(compact);
+        if (serialized.length <= 12000) return serialized;
+
+        if (compact.items.length > 12) compact.items = compact.items.slice(0, 12);
+        serialized = serialize(compact);
+        return serialized;
+      }
+
+      return compactForBudget(response);
+    })()`,
+    { timeout: 15000 }
+  );
+}
+
 // ========== COMPUTED STYLES ==========
 
 export async function getComputedStyles({ selector, properties }) {

@@ -108,12 +108,18 @@ export interface SafariFormInput {
 }
 
 export interface SafariExtractInput {
-  kind: "element" | "query" | "style" | "accessibility" | "tables" | "meta" | "images" | "links" | "analyze" | "performance" | "css_coverage";
+  kind: "element" | "query" | "style" | "accessibility" | "tables" | "meta" | "images" | "links" | "analyze" | "performance" | "css_coverage" | "layout";
   selector?: string;
+  ref?: string;
+  refs?: string[];
   limit?: number;
   filter?: string;
   properties?: string[];
   maxDepth?: number;
+  includeAncestors?: boolean;
+  includeChildren?: boolean;
+  viewportOnly?: boolean;
+  diagnostics?: boolean;
 }
 
 export interface SafariStorageInput {
