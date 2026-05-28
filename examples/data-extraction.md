@@ -126,7 +126,8 @@ Use `kind: "layout"` to explain why an element is hidden, clipped, offscreen, or
 
 ```json
 // Optional: open the local manual fixture from this repo
-{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "file:///Users/jrepp/d/safari-mcp/scripts/fixtures/layout-cases.html" } }
+// Replace /ABSOLUTE/PATH/TO with your local checkout root
+{ "tool": "safari_tabs", "arguments": { "action": "new", "url": "file:///ABSOLUTE/PATH/TO/safari-mcp/scripts/fixtures/layout-cases.html" } }
 
 // Capture refs first
 { "tool": "safari_snapshot", "arguments": {} }
@@ -139,6 +140,7 @@ Use `kind: "layout"` to explain why an element is hidden, clipped, offscreen, or
 ```
 
 **Expected output:** Compact JSON with `rect`, `visible`, `clickable`, `issues`, a style subset, and `topmostAtCenter` details for coverage debugging.
+For a real-browser validation pass, run `node scripts/test-layout-live.js`.
 
 ## 7. Read page text content
 

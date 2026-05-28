@@ -18,6 +18,11 @@ Practical examples showing how AI agents use Safari MCP tools via the Model Cont
 | [Network Monitoring](network-monitoring.md) | Capture API calls, inspect request/response details, and mock network responses |
 | [Multi-Tab Workflow](multi-tab-workflow.md) | Safely manage multiple tabs without touching the user's existing tabs |
 
+## Local fixtures
+
+- `scripts/fixtures/layout-cases.html` exercises hidden, clipped, covered, transformed, fixed, sticky, and offscreen layout cases.
+- `node scripts/test-layout-live.js` runs a live Safari validation pass against that fixture when a Safari profile window is available.
+
 ## How to read these examples
 
 Each example shows MCP tool calls as JSON objects with:

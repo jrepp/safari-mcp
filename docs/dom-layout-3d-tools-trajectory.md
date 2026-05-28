@@ -165,6 +165,7 @@ Status:
 
 - Implemented in `safari_extract kind=layout`.
 - Manual fixture added at `scripts/fixtures/layout-cases.html`.
+- Live validation script added at `scripts/test-layout-live.js`.
 
 ## Phase 2: Hit Testing and Screenshot Overlays
 
