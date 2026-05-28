@@ -2,6 +2,9 @@ node_modules/
 .DS_Store
 *.log
 .npmrc
+coverage/
+dist/
+build/
 
 .mcpregistry_*
 .launch-day/
@@ -11,6 +14,16 @@ mcp-publisher
 
 # Safari helper binary (built/downloaded locally, not for commit)
 safari-helper
+
+# Swift/Xcode build artifacts and local user state
+.build/
+DerivedData/
+*.dSYM/
+*.xcarchive/
+*.xcresult/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
 
 # Smithery build artifacts
 .smithery/
