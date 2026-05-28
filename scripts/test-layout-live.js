@@ -3,6 +3,7 @@
  * Live integration test for safari_extract kind=layout against the local fixture.
  *
  * Run:
+ *   node scripts/test-layout-live.js
  *   SAFARI_PROFILE='Your Profile' node scripts/test-layout-live.js
  *
  * Requirements:
@@ -10,11 +11,8 @@
  * - "Allow JavaScript from Apple Events" enabled
  */
 
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-
-process.env.SAFARI_PROFILE = process.env.SAFARI_PROFILE || "אוטומציות";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixtureUrl = pathToFileURL(join(__dirname, "fixtures", "layout-cases.html")).href;
@@ -42,6 +40,9 @@ function findBySelector(result, fragment) {
 
 async function main() {
   console.log("— safari_extract kind=layout live test —\n");
+  console.log(process.env.SAFARI_PROFILE
+    ? `Using Safari profile: ${process.env.SAFARI_PROFILE}`
+    : "Using Safari front window (set SAFARI_PROFILE to target a specific profile window)");
   const before = JSON.parse(await safari.listTabs());
   await safari.newTab(fixtureUrl);
   await safari.waitFor({ selector: ".covered-button", timeout: 5000 });

@@ -7,10 +7,11 @@
  * returned "(undefined)" and safari_wait never actually waited. This test
  * exercises the real AppleScript bridge, not just the string-building logic.
  *
- * Run:  SAFARI_PROFILE='אוטומציות' node scripts/test-evaluate-live.js
- * Requires the profile window open and "Allow JavaScript from Apple Events".
+ * Run:
+ *   node scripts/test-evaluate-live.js
+ *   SAFARI_PROFILE='Your Profile' node scripts/test-evaluate-live.js
+ * Requires Safari running and "Allow JavaScript from Apple Events".
  */
-process.env.SAFARI_PROFILE = process.env.SAFARI_PROFILE || 'אוטומציות';
 
 const safari = await import('../safari.js');
 
@@ -24,6 +25,9 @@ function check(name, got, expectFn) {
 
 async function main() {
   console.log('— safari_evaluate / safari_wait live test —\n');
+  console.log(process.env.SAFARI_PROFILE
+    ? `Using Safari profile: ${process.env.SAFARI_PROFILE}`
+    : 'Using Safari front window (set SAFARI_PROFILE to target a specific profile window)');
   const before = JSON.parse(await safari.listTabs());
   await safari.newTab('https://example.com/');
 
