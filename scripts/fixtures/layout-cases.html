@@ -203,6 +203,21 @@
         <h2>WebGL</h2>
         <canvas class="animated-webgl" width="180" height="80" style="width: 180px; height: 80px; border: 2px solid #1e1b18;"></canvas>
       </article>
+
+      <article class="card">
+        <h2>Blank Canvas</h2>
+        <canvas class="blank-canvas" width="180" height="80" style="width: 180px; height: 80px; border: 2px solid #1e1b18;"></canvas>
+      </article>
+
+      <article class="card">
+        <h2>Static Canvas</h2>
+        <canvas class="static-canvas" width="180" height="80" style="width: 180px; height: 80px; border: 2px solid #1e1b18;"></canvas>
+      </article>
+
+      <article class="card">
+        <h2>Blank WebGL</h2>
+        <canvas class="blank-webgl" width="180" height="80" style="width: 180px; height: 80px; border: 2px solid #1e1b18;"></canvas>
+      </article>
     </section>
 
     <a href="#offscreen" class="offscreen-link">Offscreen link far below the fold</a>
@@ -227,8 +242,12 @@
 
     const canvas = document.querySelector(".animated-canvas");
     const ctx = canvas.getContext("2d");
+    const staticCanvas = document.querySelector(".static-canvas");
+    const staticCtx = staticCanvas.getContext("2d");
     const webglCanvas = document.querySelector(".animated-webgl");
     const gl = webglCanvas.getContext("webgl", { preserveDrawingBuffer: true });
+    const blankWebglCanvas = document.querySelector(".blank-webgl");
+    const blankGl = blankWebglCanvas.getContext("webgl", { preserveDrawingBuffer: true });
     let frame = 0;
     let webglFrame = 0;
     function drawCanvas() {
@@ -246,13 +265,28 @@
       gl.clearColor((webglFrame % 5) / 5, 0.25, 0.75, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
     }
+    function drawStaticCanvas() {
+      staticCtx.fillStyle = "#1d6b4f";
+      staticCtx.fillRect(0, 0, staticCanvas.width, staticCanvas.height);
+      staticCtx.fillStyle = "#fdf7ec";
+      staticCtx.fillRect(24, 18, 80, 36);
+    }
+    function drawBlankWebgl() {
+      if (!blankGl) return;
+      blankGl.viewport(0, 0, blankWebglCanvas.width, blankWebglCanvas.height);
+      blankGl.clearColor(0, 0, 0, 0);
+      blankGl.clear(blankGl.COLOR_BUFFER_BIT);
+    }
     drawCanvas();
     drawWebgl();
+    drawStaticCanvas();
+    drawBlankWebgl();
     setInterval(drawCanvas, 80);
     setInterval(drawWebgl, 80);
     window.__mcpBeforeCanvasSample = function(sampledCanvas) {
       if (sampledCanvas === canvas) drawCanvas();
       if (sampledCanvas === webglCanvas) drawWebgl();
+      if (sampledCanvas === blankWebglCanvas) drawBlankWebgl();
     };
   </script>
 </body>
