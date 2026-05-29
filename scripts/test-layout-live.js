@@ -63,6 +63,11 @@ async function main() {
   check("covered button labeled covered-at-center", covered, (item) => item.issues.includes("covered-at-center"));
   check("covered button has topmostAtCenter", covered, (item) => item.topmostAtCenter && item.topmostAtCenter.tag === "DIV");
 
+  const coveredHit = parseJson(await safari.hitTest({ ref: covered.ref }));
+  check("hit_test ref returns stack", coveredHit, (result) => Array.isArray(result.stack) && result.stack.length >= 1);
+  check("hit_test ref reports intended topmost state", coveredHit, (result) => result.intended && result.intended.ref === covered.ref && result.intended.topmostAtCenter === false);
+  check("hit_test coordinate returns same top element", parseJson(await safari.hitTest(coveredHit.point)), (result) => Array.isArray(result.stack) && result.stack[0] && result.stack[0].tag === coveredHit.stack[0].tag);
+
   const hiddenLayout = parseJson(await safari.extractLayout({ selector: ".display-none", viewportOnly: false }));
   const hidden = findBySelector(hiddenLayout, ".display-none");
   check("display:none element reported", hidden, (item) => !!item);

@@ -2630,9 +2630,128 @@ export async function replaceEditorContent({ text }) {
 
 // ========== SCREENSHOT ==========
 
-export async function screenshot({ fullPage = false } = {}) {
+async function installScreenshotOverlay(mode) {
+  if (!mode) return false;
+  const safeMode = String(mode).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const result = await runJS(
+    `(function(){
+      var mode='${safeMode}';
+      var old=document.getElementById('__mcp_screenshot_overlay');
+      if(old) old.remove();
+      var wrap=document.createElement('div');
+      wrap.id='__mcp_screenshot_overlay';
+      wrap.setAttribute('data-mcp-overlay','true');
+      wrap.style.cssText='position:fixed;inset:0;z-index:2147483647;pointer-events:none;width:100vw;height:100vh;';
+      var canvas=document.createElement('canvas');
+      var dpr=window.devicePixelRatio||1;
+      canvas.width=Math.max(1,Math.round(window.innerWidth*dpr));
+      canvas.height=Math.max(1,Math.round(window.innerHeight*dpr));
+      canvas.style.cssText='width:100%;height:100%;display:block;';
+      wrap.appendChild(canvas);
+      document.documentElement.appendChild(wrap);
+      var ctx=canvas.getContext('2d');
+      ctx.scale(dpr,dpr);
+      ctx.font='11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif';
+      ctx.lineWidth=2;
+      var lastHit=window.__mcpLastHitTest&&window.__mcpLastHitTest.point;
+
+      function ref(el){return el&&el.getAttribute?el.getAttribute('data-mcp-ref'):null;}
+      function selector(el){
+        if(!el||!el.tagName)return '';
+        var tag=el.tagName.toLowerCase();
+        if(el.id)return tag+'#'+el.id;
+        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
+        if(cls)return tag+'.'+cls;
+        return tag;
+      }
+      function text(el){
+        return ((el&&((el.innerText||el.textContent)||''))||'').replace(/\\s+/g,' ').trim().slice(0,24);
+      }
+      function isHidden(el, r, cs){
+        return !r.width||!r.height||cs.display==='none'||cs.visibility==='hidden'||cs.visibility==='collapse'||parseFloat(cs.opacity||'1')===0;
+      }
+      function isCovered(el, r){
+        var x=r.left+r.width/2, y=r.top+r.height/2;
+        if(x<0||y<0||x>window.innerWidth||y>window.innerHeight)return false;
+        var top=document.elementFromPoint(x,y);
+        return !!top&&top!==el&&!el.contains(top)&&!top.closest('#__mcp_screenshot_overlay');
+      }
+      function drawBox(el, label, color, fill){
+        var r=el.getBoundingClientRect();
+        if(r.right<0||r.bottom<0||r.left>window.innerWidth||r.top>window.innerHeight)return;
+        var x=Math.max(0,r.left), y=Math.max(0,r.top);
+        var w=Math.max(1,Math.min(window.innerWidth,r.right)-x);
+        var h=Math.max(1,Math.min(window.innerHeight,r.bottom)-y);
+        ctx.strokeStyle=color;
+        ctx.fillStyle=fill||'rgba(0,0,0,0)';
+        if(fill)ctx.fillRect(x,y,w,h);
+        ctx.strokeRect(x+1,y+1,Math.max(1,w-2),Math.max(1,h-2));
+        if(label){
+          var labelText=String(label).slice(0,36);
+          var tw=Math.min(ctx.measureText(labelText).width+8, Math.max(32,w));
+          ctx.fillStyle=color;
+          ctx.fillRect(x+1,Math.max(0,y-16),tw,15);
+          ctx.fillStyle='#fff';
+          ctx.fillText(labelText,x+5,Math.max(11,y-4));
+        }
+        var cx=r.left+r.width/2, cy=r.top+r.height/2;
+        if(cx>=0&&cy>=0&&cx<=window.innerWidth&&cy<=window.innerHeight){
+          ctx.beginPath();ctx.arc(cx,cy,3,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
+        }
+      }
+
+      var nodes=Array.from(document.querySelectorAll('[data-mcp-ref]')).filter(function(el){return !el.closest('#__mcp_screenshot_overlay');}).slice(0,80);
+      if(mode==='refs'){
+        nodes.forEach(function(el){drawBox(el, ref(el)||selector(el), '#2563eb', 'rgba(37,99,235,0.08)');});
+      } else if(mode==='layout'){
+        nodes.forEach(function(el){
+          var r=el.getBoundingClientRect();
+          var cs=getComputedStyle(el);
+          var off=r.right<0||r.bottom<0||r.left>window.innerWidth||r.top>window.innerHeight;
+          var hidden=isHidden(el,r,cs);
+          var covered=isCovered(el,r);
+          var clipped=false;
+          var p=el.parentElement;
+          while(p&&!clipped){
+            var ps=getComputedStyle(p);
+            if(['hidden','clip','scroll','auto'].indexOf(ps.overflowX)>=0||['hidden','clip','scroll','auto'].indexOf(ps.overflowY)>=0){
+              var pr=p.getBoundingClientRect();
+              clipped=r.left<pr.left||r.top<pr.top||r.right>pr.right||r.bottom>pr.bottom;
+            }
+            p=p.parentElement;
+          }
+          var color=hidden||off?'#dc2626':(covered?'#d97706':(clipped?'#9333ea':'#16a34a'));
+          var issue=hidden?'hidden':(off?'offscreen':(covered?'covered':(clipped?'clipped':'ok')));
+          drawBox(el, (ref(el)||selector(el))+':'+issue, color, color==='#16a34a'?'rgba(22,163,74,0.05)':'rgba(220,38,38,0.08)');
+        });
+      } else if(mode==='hit_test'){
+        if(lastHit){
+          var stack=document.elementsFromPoint(lastHit.x,lastHit.y).slice(0,10);
+          stack.forEach(function(el,i){drawBox(el, i+':'+(ref(el)||selector(el)||text(el)), i===0?'#dc2626':'#0f766e', i===0?'rgba(220,38,38,0.1)':'rgba(15,118,110,0.06)');});
+          ctx.beginPath();ctx.arc(lastHit.x,lastHit.y,7,0,Math.PI*2);ctx.strokeStyle='#dc2626';ctx.lineWidth=3;ctx.stroke();
+          ctx.beginPath();ctx.moveTo(lastHit.x-12,lastHit.y);ctx.lineTo(lastHit.x+12,lastHit.y);ctx.moveTo(lastHit.x,lastHit.y-12);ctx.lineTo(lastHit.x,lastHit.y+12);ctx.stroke();
+        } else {
+          ctx.fillStyle='rgba(220,38,38,0.9)';
+          ctx.fillRect(8,8,180,20);
+          ctx.fillStyle='#fff';
+          ctx.fillText('No prior hit_test point',14,22);
+        }
+      }
+      return 'overlay installed: '+mode;
+    })()`,
+    { timeout: 5000 }
+  );
+  return typeof result === "string" && result.startsWith("overlay installed");
+}
+
+async function removeScreenshotOverlay() {
+  await runJS("(function(){var el=document.getElementById('__mcp_screenshot_overlay');if(el)el.remove();return 'overlay removed';})()", { timeout: 5000 }).catch(() => {});
+}
+
+export async function screenshot({ fullPage = false, overlay } = {}) {
   await refreshTargetWindow();
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
+  const overlayInstalled = await installScreenshotOverlay(overlay).catch(() => false);
   try {
     // Check if target tab is a background tab — if so, use JS screenshot to avoid tab jumping
     let isBackgroundTab = false;
@@ -2757,17 +2876,20 @@ export async function screenshot({ fullPage = false } = {}) {
     // Final fallback: throw with clear message for the retry logic in index.js
     throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen Recording, then restart Safari.");
   } finally {
+    if (overlayInstalled) await removeScreenshotOverlay();
     await unlink(tmpFile).catch(() => {});
   }
 }
 
 // ========== ELEMENT SCREENSHOT ==========
 
-export async function screenshotElement({ selector }) {
+export async function screenshotElement({ selector, overlay }) {
   const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const overlayInstalled = await installScreenshotOverlay(overlay).catch(() => false);
   // Use html2canvas-like approach: capture element via SVG foreignObject
-  const result = await runJS(
-    `(async function(){
+  try {
+    const result = await runJS(
+      `(async function(){
       var el = document.querySelector('${sel}');
       if (!el) return 'Element not found: ${sel}';
       var rect = el.getBoundingClientRect();
@@ -2811,10 +2933,10 @@ export async function screenshotElement({ selector }) {
         img.src = url;
       });
     })()`,
-    { timeout: 15000 }
-  );
+      { timeout: 15000 }
+    );
 
-  if (result === "SVG_RENDER_FAILED" || result.startsWith("Element")) {
+    if (result === "SVG_RENDER_FAILED" || result.startsWith("Element")) {
     // Fallback: use screencapture + crop
     const tmpFile = join(tmpdir(), `safari-el-${Date.now()}.png`);
     try {
@@ -2848,9 +2970,12 @@ export async function screenshotElement({ selector }) {
       await unlink(tmpFile.replace('safari-el-', 'safari-el-crop-')).catch(() => {});
       throw new Error(`Element screenshot failed: ${e.message}`);
     }
-  }
+    }
 
-  return result;
+    return result;
+  } finally {
+    if (overlayInstalled) await removeScreenshotOverlay();
+  }
 }
 
 // ========== SCROLL ==========
@@ -3207,6 +3332,106 @@ export async function hover({ selector, x, y, ref }) {
     );
   }
   throw new Error("hover requires selector or x/y coordinates");
+}
+
+export async function hitTest({ x, y, ref } = {}) {
+  const options = {
+    x: x === undefined ? null : Number(x),
+    y: y === undefined ? null : Number(y),
+    ref: ref || null,
+  };
+  return runJS(
+    `(function(){
+      var opts=${JSON.stringify(options)};
+      function getShadowRoot(el){return window.__mcpGetShadowRoot ? window.__mcpGetShadowRoot(el) : (el && el.shadowRoot ? el.shadowRoot : null);}
+      function walkDeep(root, visit){
+        if(!root||!visit)return;
+        var children=root.children||[];
+        for(var i=0;i<children.length;i++){
+          var child=children[i];
+          if(visit(child)===false)return false;
+          var shadow=getShadowRoot(child);
+          if(shadow&&walkDeep(shadow,visit)===false)return false;
+          if(walkDeep(child,visit)===false)return false;
+        }
+      }
+      function resolveByRef(refValue){
+        if(!refValue)return null;
+        var found=null;
+        walkDeep(document.documentElement,function(node){
+          if(node.getAttribute&&node.getAttribute('data-mcp-ref')===refValue){found=node;return false;}
+        });
+        return found;
+      }
+      function selector(el){
+        if(!el||!el.tagName)return null;
+        var tag=el.tagName.toLowerCase();
+        if(el.id)return tag+'#'+el.id;
+        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
+        if(cls)return tag+'.'+cls;
+        if(el.getAttribute&&el.getAttribute('name'))return tag+'[name="'+el.getAttribute('name').slice(0,40)+'"]';
+        if(el.getAttribute&&el.getAttribute('data-testid'))return tag+'[data-testid="'+el.getAttribute('data-testid').slice(0,40)+'"]';
+        return tag;
+      }
+      function text(el){
+        return ((el&&((el.innerText||el.textContent)||''))||'').replace(/\\s+/g,' ').trim().slice(0,60);
+      }
+      function refOf(el){return el&&el.getAttribute?el.getAttribute('data-mcp-ref'):null;}
+      function roleOf(el){return el&&el.getAttribute?(el.getAttribute('role')||null):null;}
+      function isInteractive(el){
+        if(!el||!el.tagName)return false;
+        var tag=el.tagName;
+        return ['A','BUTTON','INPUT','TEXTAREA','SELECT','SUMMARY','LABEL'].indexOf(tag)>=0 ||
+          !!roleOf(el) || el.getAttribute('tabindex')!==null || !!el.onclick || !!el.isContentEditable;
+      }
+      var intended=null;
+      var point=null;
+      if(opts.ref){
+        intended=resolveByRef(opts.ref);
+        if(!intended)return JSON.stringify({ error:'Ref not found: '+opts.ref });
+        var r=intended.getBoundingClientRect();
+        point={ x:Math.round((r.left+r.width/2)*100)/100, y:Math.round((r.top+r.height/2)*100)/100 };
+      } else if(Number.isFinite(opts.x)&&Number.isFinite(opts.y)) {
+        point={ x:opts.x, y:opts.y };
+      } else {
+        return JSON.stringify({ error:'hit_test requires ref or x/y' });
+      }
+      var stack=document.elementsFromPoint(point.x,point.y);
+      var items=stack.map(function(el, index){
+        var cs=getComputedStyle(el);
+        return {
+          depth:index,
+          ref:refOf(el),
+          tag:el.tagName,
+          selector:selector(el),
+          text:text(el),
+          role:roleOf(el),
+          pointerEvents:cs.pointerEvents,
+          visibility:cs.visibility,
+          opacity:cs.opacity,
+          interactive:isInteractive(el)
+        };
+      });
+      var actionable=null;
+      for(var i=0;i<stack.length;i++){
+        if(isInteractive(stack[i]) && getComputedStyle(stack[i]).pointerEvents!=='none'){
+          actionable={ ref:refOf(stack[i]), tag:stack[i].tagName, selector:selector(stack[i]), depth:i, reason:i===0?'topmost interactive element':'first interactive element in stack' };
+          break;
+        }
+      }
+      var topmost=stack[0]||null;
+      var intendedTopmost=!!intended && !!topmost && (topmost===intended || intended.contains(topmost));
+      var result={
+        point:point,
+        stack:items,
+        actionable:actionable,
+        intended: intended ? { ref:opts.ref, selector:selector(intended), tag:intended.tagName, topmostAtCenter:intendedTopmost } : null
+      };
+      window.__mcpLastHitTest={ point:point, ref:opts.ref||null, time:Date.now() };
+      return JSON.stringify(result);
+    })()`,
+    { timeout: 5000 }
+  );
 }
 
 // ========== DIALOG HANDLING ==========

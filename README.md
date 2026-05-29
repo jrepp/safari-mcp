@@ -314,12 +314,12 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_snapshot` | Structured page state with refs for interaction |
 | `safari_click` | Click by ref, selector, text, or coordinates; supports native/double/right/wait/read options |
 | `safari_fill` | Fill text directly or through native paste; optional state verification |
-| `safari_screenshot` | Viewport/full-page screenshot, or element screenshot with `selector` |
+| `safari_screenshot` | Viewport/full-page screenshot, or element screenshot with `selector`; optional `overlay` diagnostics |
 | `safari_wait` | Wait for selector/text or fixed milliseconds |
 | `safari_evaluate` | Execute JavaScript in the current page |
 | `safari_tabs` | `list`, `search`, `new`, `switch`, `close`, `wait_for_new`; prefer `search` with `activate: true` before opening a new tab |
 | `safari_history` | `back`, `forward`, `reload` |
-| `safari_pointer` | `hover` and `drag`, with native hover support |
+| `safari_pointer` | `hover`, `drag`, and `hit_test`, with native hover support |
 | `safari_keyboard` | `press`, `type`, `replace_editor`, with native support |
 | `safari_form` | `clear`, `select`, `fill_all`, `submit`, `verify`, `detect`, react-select helpers |
 | `safari_extract` | Element/query/style/layout/a11y/tables/meta/images/links/analyze/performance/CSS coverage |

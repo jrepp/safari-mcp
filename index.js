@@ -1202,11 +1202,14 @@ server.tool(
   {
     fullPage: z.boolean().optional().describe("Capture full page"),
     selector: z.string().optional().describe("Element selector for element-only screenshot"),
+    overlay: z.enum(["refs", "layout", "hit_test"]).optional().describe("Temporary diagnostic overlay to draw before capture"),
   },
-  async ({ fullPage, selector }) => {
-    const base64 = selector
-      ? await extensionOrFallback("screenshot_element", { selector }, () => safari.screenshotElement({ selector }))
-      : await extensionOrFallback("screenshot", { fullPage }, () => safari.screenshot({ fullPage }));
+  async ({ fullPage, selector, overlay }) => {
+    const base64 = overlay
+      ? (selector ? await safari.screenshotElement({ selector, overlay }) : await safari.screenshot({ fullPage, overlay }))
+      : (selector
+        ? await extensionOrFallback("screenshot_element", { selector }, () => safari.screenshotElement({ selector }))
+        : await extensionOrFallback("screenshot", { fullPage }, () => safari.screenshot({ fullPage })));
     return { content: [{ type: "image", data: base64, mimeType: selector ? "image/png" : "image/jpeg" }] };
   }
 );
@@ -1287,9 +1290,9 @@ server.tool(
 
 server.tool(
   "safari_pointer",
-  "Pointer interactions other than simple clicks: hover, native hover, and drag.",
+  "Pointer interactions other than simple clicks: hover, native hover, drag, and hit testing.",
   {
-    action: z.enum(["hover", "drag"]).describe("Pointer action"),
+    action: z.enum(["hover", "drag", "hit_test"]).describe("Pointer action"),
     ref: z.string().optional().describe("Ref from safari_snapshot"),
     selector: z.string().optional().describe("CSS selector"),
     text: z.string().optional().describe("Visible text"),
@@ -1312,6 +1315,7 @@ server.tool(
       return textResult(await extensionOrFallback("hover", { selector: sel }, () => safari.hover(args)));
     }
     if (args.action === "drag") return textResult(await directWrite("drag", () => safari.drag(args)));
+    if (args.action === "hit_test") return textResult(await safari.hitTest(args), { untrusted: true });
     return unknownAction("pointer", args.action);
   }
 );

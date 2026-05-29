@@ -239,6 +239,12 @@ Overlay modes:
 - Temporary overlay nodes are removed even if screenshot capture fails.
 - Overlay capture works for viewport screenshots and selector screenshots.
 
+Status:
+
+- Implemented `safari_pointer action=hit_test` for coordinate and ref-center stack inspection.
+- Added `safari_screenshot overlay=refs|layout|hit_test` with temporary fixed canvas overlays.
+- `overlay=hit_test` uses the last hit-test point stored in page context.
+
 ## Phase 3: Structured DOM Tree
 
 ### User Value

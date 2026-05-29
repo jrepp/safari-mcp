@@ -51,7 +51,7 @@ export interface SafariFillInput {
   verify?: boolean;
 }
 
-export interface SafariScreenshotInput { fullPage?: boolean; selector?: string }
+export interface SafariScreenshotInput { fullPage?: boolean; selector?: string; overlay?: "refs" | "layout" | "hit_test" }
 export interface SafariWaitInput { action?: "for" | "time"; selector?: string; text?: string; timeout?: number; ms?: number }
 export interface SafariEvaluateInput { script: string }
 
@@ -69,7 +69,7 @@ export interface SafariTabsInput {
 export interface SafariHistoryInput { action: "back" | "forward" | "reload"; hard?: boolean }
 
 export interface SafariPointerInput {
-  action: "hover" | "drag";
+  action: "hover" | "drag" | "hit_test";
   ref?: string;
   selector?: string;
   text?: string;
