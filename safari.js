@@ -5293,6 +5293,140 @@ export async function extractCanvas({
   return JSON.stringify(first);
 }
 
+export async function extractVisual({
+  selector = "canvas",
+  mode = "scene_health",
+  sampleFrames = 2,
+  sampleDelayMs = 250,
+  limit = 10,
+  includePixels = false,
+  includeWebGL = true,
+} = {}) {
+  const visualMode = ["scene_health", "pixel_stats", "threejs"].includes(mode) ? mode : "scene_health";
+  const canvasRaw = await extractCanvas({
+    selector,
+    sampleFrames,
+    sampleDelayMs,
+    includePixels: visualMode === "pixel_stats" || includePixels,
+    includeWebGL,
+    limit,
+  });
+  const canvasResult = JSON.parse(canvasRaw);
+  const canvases = canvasResult.canvases || [];
+  const issueCounts = {};
+  for (const canvas of canvases) {
+    for (const issue of canvas.issues || []) issueCounts[issue] = (issueCounts[issue] || 0) + 1;
+  }
+  const renderingCanvasCount = canvases.filter((canvas) => canvas.visible && canvas.blank === false && !canvas.tainted && !(canvas.issues || []).includes("zero-drawing-buffer")).length;
+  const animatedCanvasCount = canvases.filter((canvas) => canvas.changing === true).length;
+  const blankCanvasCount = canvases.filter((canvas) => canvas.blank === true).length;
+  const visibleCanvasCount = canvases.filter((canvas) => canvas.visible).length;
+  const webglCanvasCount = canvases.filter((canvas) => canvas.context === "webgl" || canvas.context === "webgl2").length;
+
+  let primaryIssue = null;
+  if (!canvases.length) primaryIssue = "canvas-not-mounted";
+  else if (!visibleCanvasCount) primaryIssue = "no-visible-canvas";
+  else if (canvases.some((canvas) => (canvas.issues || []).includes("zero-drawing-buffer"))) primaryIssue = "zero-drawing-buffer";
+  else if (blankCanvasCount === visibleCanvasCount) primaryIssue = "blank-canvas";
+  else if (!animatedCanvasCount && renderingCanvasCount > 0) primaryIssue = "static-canvas";
+  else if (canvases.some((canvas) => canvas.webgl && canvas.webgl.contextLost)) primaryIssue = "webgl-context-lost";
+
+  const recommendations = [];
+  if (!canvases.length) recommendations.push("No canvas matched the selector. Check mount timing or selector scope.");
+  else if (!visibleCanvasCount) recommendations.push("Canvas exists but is hidden or zero-sized. Inspect layout for the canvas element.");
+  else if (primaryIssue === "blank-canvas") recommendations.push("Canvas pixels are blank. Check clear color, camera framing, render loop, and asset load state.");
+  else if (primaryIssue === "static-canvas") recommendations.push("Canvas is rendering but did not change across samples. If animation is expected, check requestAnimationFrame and render-loop state.");
+  else recommendations.push("Canvas is rendering. Use screenshot overlay=refs or kind=canvas includePixels=true for targeted evidence.");
+
+  const result = {
+    mode: visualMode,
+    summary: {
+      visibleCanvasCount,
+      renderingCanvasCount,
+      animatedCanvasCount,
+      blankCanvasCount,
+      webglCanvasCount,
+      primaryIssue,
+    },
+    issues: Object.keys(issueCounts).map((issue) => ({ issue, count: issueCounts[issue] })).slice(0, 5),
+    recommendations,
+  };
+
+  if (visualMode === "pixel_stats") {
+    result.canvases = canvases.map((canvas) => ({
+      ref: canvas.ref,
+      selector: canvas.selector,
+      context: canvas.context,
+      rect: canvas.rect,
+      drawingBuffer: canvas.drawingBuffer,
+      blank: canvas.blank,
+      changing: canvas.changing,
+      issues: canvas.issues,
+      pixels: canvas.pixels,
+    }));
+  } else {
+    result.canvases = canvases.slice(0, 5).map((canvas) => ({
+      ref: canvas.ref,
+      selector: canvas.selector,
+      context: canvas.context,
+      visible: canvas.visible,
+      blank: canvas.blank,
+      changing: canvas.changing,
+      issues: canvas.issues,
+      webgl: canvas.webgl ? {
+        drawingBuffer: canvas.webgl.drawingBuffer,
+        viewport: canvas.webgl.viewport,
+        renderer: canvas.webgl.renderer,
+        contextLost: canvas.webgl.contextLost,
+      } : null,
+    }));
+  }
+
+  if (visualMode === "threejs") {
+    result.threejs = JSON.parse(await runJS(
+      `(function(){
+        var out={detected:false,global:false,version:null,renderers:[]};
+        try{
+          if(window.THREE){out.detected=true;out.global=true;out.version=window.THREE.REVISION||null;}
+          var seen=[];
+          function addRenderer(value,path){
+            if(!value||seen.indexOf(value)>=0)return;
+            var dom=value.domElement||value.canvas;
+            var info=value.info||null;
+            var caps=value.capabilities||null;
+            if(dom&&dom.tagName==='CANVAS'&&(info||caps||typeof value.render==='function')){
+              seen.push(value);
+              out.detected=true;
+              out.renderers.push({
+                path:path,
+                canvasRef:dom.getAttribute&&dom.getAttribute('data-mcp-ref'),
+                canvasSelector:(dom.id?'canvas#'+dom.id:(dom.className?'canvas.'+String(dom.className).trim().split(/\\s+/).slice(0,2).join('.'):'canvas')),
+                pixelRatio:typeof value.getPixelRatio==='function'?value.getPixelRatio():null,
+                size:typeof value.getSize==='function'?(function(){var v=value.getSize({x:0,y:0,set:function(x,y){this.x=x;this.y=y;}});return {width:v.x||0,height:v.y||0};})():null,
+                info:info?{memory:info.memory||null,render:info.render||null,programs:info.programs?info.programs.length:undefined}:null,
+                capabilities:caps?{isWebGL2:!!caps.isWebGL2,maxTextureSize:caps.maxTextureSize||null,precision:caps.precision||null}:null
+              });
+            }
+          }
+          Object.keys(window).slice(0,1500).forEach(function(key){
+            try{
+              var value=window[key];
+              addRenderer(value,'window.'+key);
+              if(value&&typeof value==='object'){
+                ['renderer','webglRenderer','gl','threeRenderer'].forEach(function(prop){try{addRenderer(value[prop],'window.'+key+'.'+prop);}catch(_err){}});
+              }
+            }catch(_err){}
+          });
+        }catch(err){out.error=String(err&&err.message||err);}
+        return JSON.stringify(out);
+      })()`,
+      { timeout: 5000 }
+    ));
+  }
+
+  return JSON.stringify(result);
+}
+
 // ========== GEOLOCATION OVERRIDE ==========
 
 export async function overrideGeolocation({ latitude, longitude, accuracy = 100 }) {

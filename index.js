@@ -1375,7 +1375,7 @@ server.tool(
   "safari_extract",
   "Extract structured data or inspect elements/page metadata.",
   {
-    kind: z.enum(["element", "query", "style", "accessibility", "tables", "meta", "images", "links", "analyze", "performance", "css_coverage", "layout", "dom_tree", "canvas"]).describe("Extraction kind"),
+    kind: z.enum(["element", "query", "style", "accessibility", "tables", "meta", "images", "links", "analyze", "performance", "css_coverage", "layout", "dom_tree", "canvas", "visual"]).describe("Extraction kind"),
     selector: z.string().optional().describe("CSS selector"),
     ref: z.string().optional().describe("Snapshot ref"),
     refs: z.array(z.string()).optional().describe("Several snapshot refs"),
@@ -1396,6 +1396,7 @@ server.tool(
     sampleDelayMs: z.coerce.number().optional().describe("Delay between canvas frame samples"),
     includePixels: z.boolean().optional().describe("Include compact pixel statistics for kind=canvas"),
     includeWebGL: z.boolean().optional().describe("Include WebGL metadata for kind=canvas"),
+    mode: z.enum(["scene_health", "pixel_stats", "threejs"]).optional().describe("Visual extraction mode for kind=visual"),
   },
   async (args) => {
     const { kind } = args;
@@ -1413,6 +1414,7 @@ server.tool(
     if (kind === "layout") return textResult(await safari.extractLayout(args), { untrusted: true });
     if (kind === "dom_tree") return textResult(await safari.extractDomTree(args), { untrusted: true });
     if (kind === "canvas") return textResult(await safari.extractCanvas(args), { untrusted: true });
+    if (kind === "visual") return textResult(await safari.extractVisual(args), { untrusted: true });
     return unknownAction("extract", kind);
   }
 );

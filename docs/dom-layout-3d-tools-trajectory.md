@@ -523,6 +523,12 @@ Best-effort only:
 - It opportunistically reports Three.js `renderer.info` when accessible.
 - It stays useful when Three.js is bundled and not exposed globally.
 
+Status:
+
+- Implemented `safari_extract kind=visual mode=scene_health|pixel_stats|threejs`.
+- `scene_health` summarizes canvas visibility, rendering, animation, blank/static state, WebGL counts, and top issues.
+- `threejs` performs best-effort global/renderer discovery while falling back to generic canvas diagnostics.
+
 ## Output Budgets
 
 Default budgets keep agent context efficient:

@@ -124,6 +124,12 @@ async function main() {
   check("canvas diagnostics detects nonblank canvas", animatedCanvas, (item) => item.blank === false && !item.issues.includes("blank"));
   check("canvas diagnostics detects animation", animatedCanvas, (item) => item.changing === true);
 
+  const sceneHealth = parseJson(await safari.extractVisual({ selector: ".animated-canvas", mode: "scene_health", sampleFrames: 2, sampleDelayMs: 300 }));
+  check("visual scene_health summarizes rendering", sceneHealth, (result) => result.summary && result.summary.renderingCanvasCount === 1 && result.summary.blankCanvasCount === 0);
+  check("visual scene_health returns recommendations", sceneHealth, (result) => Array.isArray(result.recommendations) && result.recommendations.length >= 1);
+  const pixelStats = parseJson(await safari.extractVisual({ selector: ".animated-canvas", mode: "pixel_stats", sampleFrames: 2, sampleDelayMs: 300 }));
+  check("visual pixel_stats includes samples", pixelStats, (result) => result.canvases && result.canvases[0] && Array.isArray(result.canvases[0].pixels));
+
   await safari.closeTab();
   const after = JSON.parse(await safari.listTabs());
   check("user tabs untouched", after.length, (count) => count === before.length);
