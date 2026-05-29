@@ -116,6 +116,14 @@ async function main() {
   const clearedEvents = parseJson(await safari.clearLayoutEvents());
   check("clear_layout_events clears observer", clearedEvents, (result) => result.observing === false && result.eventCount === 0);
 
+  await safari.scrollToElement({ selector: ".animated-canvas", block: "center" });
+  await safari.waitForTime({ ms: 100 });
+  const canvasDiagnostics = parseJson(await safari.extractCanvas({ selector: ".animated-canvas", sampleFrames: 2, sampleDelayMs: 300 }));
+  const animatedCanvas = canvasDiagnostics.canvases && canvasDiagnostics.canvases[0];
+  check("canvas diagnostics finds canvas", animatedCanvas, (item) => item && item.context === "2d" && item.visible === true);
+  check("canvas diagnostics detects nonblank canvas", animatedCanvas, (item) => item.blank === false && !item.issues.includes("blank"));
+  check("canvas diagnostics detects animation", animatedCanvas, (item) => item.changing === true);
+
   await safari.closeTab();
   const after = JSON.parse(await safari.listTabs());
   check("user tabs untouched", after.length, (count) => count === before.length);

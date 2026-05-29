@@ -5108,6 +5108,191 @@ export async function extractDomTree({
   );
 }
 
+// ========== CANVAS DIAGNOSTICS ==========
+
+export async function extractCanvas({
+  selector = "canvas",
+  sampleFrames = 2,
+  sampleDelayMs = 250,
+  includePixels = false,
+  includeWebGL = true,
+  limit = 10,
+} = {}) {
+  const options = {
+    selector: selector || "canvas",
+    sampleFrames: Math.max(1, Math.min(Number(sampleFrames) || 2, 5)),
+    sampleDelayMs: Math.max(0, Math.min(Number(sampleDelayMs) || 250, 2000)),
+    includePixels: !!includePixels,
+    includeWebGL: includeWebGL !== false,
+    limit: Math.max(1, Math.min(Number(limit) || 10, 50)),
+  };
+
+  const sampleScript = `(function(){
+      var opts=${JSON.stringify(options)};
+      var getShadowRoot=window.__mcpGetShadowRoot||function(el){return el?(el.shadowRoot||null):null;};
+      function rect(canvas){
+        var r=canvas.getBoundingClientRect();
+        return {x:Math.round(r.left*100)/100,y:Math.round(r.top*100)/100,width:Math.round(r.width*100)/100,height:Math.round(r.height*100)/100};
+      }
+      function selectorFor(el){
+        if(!el||!el.tagName)return null;
+        var tag=el.tagName.toLowerCase();
+        if(el.id)return tag+'#'+el.id;
+        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
+        if(cls)return tag+'.'+cls;
+        return tag;
+      }
+      function ref(el){return el&&el.getAttribute?el.getAttribute('data-mcp-ref'):null;}
+      function visible(el){
+        var cs=getComputedStyle(el);
+        var r=el.getBoundingClientRect();
+        return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden'&&cs.visibility!=='collapse'&&parseFloat(cs.opacity||'1')!==0;
+      }
+      function findCanvases(root, out, seen){
+        if(!root||out.length>=opts.limit)return;
+        var matches=[];
+        try{matches=Array.from(root.querySelectorAll(opts.selector));}catch(_err){matches=[];}
+        matches.forEach(function(canvas){
+          if(canvas.tagName==='CANVAS'&&!seen.has(canvas)&&out.length<opts.limit){seen.add(canvas);out.push(canvas);}
+        });
+        var all=root.querySelectorAll?root.querySelectorAll('*'):[];
+        for(var i=0;i<all.length&&out.length<opts.limit;i++){
+          var shadow=getShadowRoot(all[i]);
+          if(shadow)findCanvases(shadow,out,seen);
+        }
+      }
+      function contextInfo(canvas){
+        var ctx=null, type=null;
+        try{ctx=canvas.getContext('2d',{willReadFrequently:true});if(ctx)type='2d';}catch(_err){}
+        if(!ctx&&opts.includeWebGL){try{ctx=canvas.getContext('webgl2',{preserveDrawingBuffer:true});if(ctx)type='webgl2';}catch(_err){}}
+        if(!ctx&&opts.includeWebGL){try{ctx=canvas.getContext('webgl',{preserveDrawingBuffer:true})||canvas.getContext('experimental-webgl',{preserveDrawingBuffer:true});if(ctx)type='webgl';}catch(_err){}}
+        return {ctx:ctx,type:type};
+      }
+      function statsFromBytes(bytes, width, height, stride){
+        var nonZero=0, alphaNonZero=0, total=0, r=0, g=0, b=0, a=0, hash=2166136261;
+        var step=Math.max(4, stride||4);
+        for(var i=0;i<bytes.length;i+=step){
+          var rr=bytes[i]||0, gg=bytes[i+1]||0, bb=bytes[i+2]||0, aa=bytes[i+3]||0;
+          if(rr||gg||bb||aa)nonZero++;
+          if(aa)alphaNonZero++;
+          r+=rr;g+=gg;b+=bb;a+=aa;total++;
+          hash^=rr;hash=(hash*16777619)>>>0;
+          hash^=gg;hash=(hash*16777619)>>>0;
+          hash^=bb;hash=(hash*16777619)>>>0;
+          hash^=aa;hash=(hash*16777619)>>>0;
+        }
+        return {
+          width:width,
+          height:height,
+          sampledPixels:total,
+          nonZeroRatio:total?Math.round((nonZero/total)*10000)/10000:0,
+          alphaNonZeroRatio:total?Math.round((alphaNonZero/total)*10000)/10000:0,
+          avg:[total?Math.round(r/total):0,total?Math.round(g/total):0,total?Math.round(b/total):0,total?Math.round(a/total):0],
+          hash:String(hash)
+        };
+      }
+      function sampleCanvas(canvas, ctx, type){
+        var width=canvas.width||0, height=canvas.height||0;
+        if(type==='2d'){
+          var sw=Math.min(width,64), sh=Math.min(height,64);
+          if(!sw||!sh)return {stats:statsFromBytes([],width,height),tainted:false};
+          var sampleCanvasEl=document.createElement('canvas');
+          sampleCanvasEl.width=sw;
+          sampleCanvasEl.height=sh;
+          var sampleCtx=sampleCanvasEl.getContext('2d',{willReadFrequently:true});
+          sampleCtx.drawImage(canvas,0,0,sw,sh);
+          var data=sampleCtx.getImageData(0,0,sw,sh).data;
+          return {stats:statsFromBytes(data,sw,sh),tainted:false};
+        }
+        if(type==='webgl'||type==='webgl2'){
+          var gl=ctx;
+          var gw=gl.drawingBufferWidth||width, gh=gl.drawingBufferHeight||height;
+          var rw=Math.min(gw,64), rh=Math.min(gh,64);
+          var bytes=new Uint8Array(Math.max(0,rw*rh*4));
+          if(rw&&rh)gl.readPixels(0,0,rw,rh,gl.RGBA,gl.UNSIGNED_BYTE,bytes);
+          return {stats:statsFromBytes(bytes,rw,rh),tainted:false};
+        }
+        return {stats:null,tainted:false};
+      }
+      function webglInfo(ctx, type){
+        if(!ctx||!(type==='webgl'||type==='webgl2'))return null;
+        var info={drawingBuffer:{width:ctx.drawingBufferWidth||0,height:ctx.drawingBufferHeight||0},contextLost:ctx.isContextLost?ctx.isContextLost():false};
+        try{
+          var dbg=ctx.getExtension('WEBGL_debug_renderer_info');
+          if(dbg){
+            info.vendor=ctx.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+            info.renderer=ctx.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+          } else {
+            info.vendor=ctx.getParameter(ctx.VENDOR);
+            info.renderer=ctx.getParameter(ctx.RENDERER);
+          }
+          var vp=ctx.getParameter(ctx.VIEWPORT);
+          if(vp)info.viewport={x:vp[0],y:vp[1],width:vp[2],height:vp[3]};
+          var err=ctx.getError();
+          info.error=err===ctx.NO_ERROR?null:err;
+        }catch(_err){}
+        return info;
+      }
+      var canvases=[];
+      findCanvases(document,canvases,new Set());
+      var results=[];
+      for(var i=0;i<canvases.length;i++){
+        var canvas=canvases[i];
+        var ci=contextInfo(canvas);
+        var item={
+          ref:ref(canvas),
+          selector:selectorFor(canvas),
+          rect:rect(canvas),
+          drawingBuffer:{width:canvas.width||0,height:canvas.height||0},
+          context:ci.type||'none',
+          visible:visible(canvas),
+          tainted:false,
+          blank:null,
+          changing:null,
+          issues:[]
+        };
+        try{
+          var sample=sampleCanvas(canvas,ci.ctx,ci.type);
+          item.tainted=!!sample.tainted;
+          if(sample.stats)item.pixelSample=sample.stats;
+        }catch(err){
+          item.tainted=true;
+          item.issues.push('tainted-or-unreadable');
+        }
+        if(item.pixelSample)item.blank=item.pixelSample.nonZeroRatio===0||item.pixelSample.alphaNonZeroRatio===0;
+        if(!item.visible)item.issues.push('hidden-or-zero-size');
+        if(!item.drawingBuffer.width||!item.drawingBuffer.height)item.issues.push('zero-drawing-buffer');
+        if(item.blank===true)item.issues.push('blank');
+        if(opts.includeWebGL)item.webgl=webglInfo(ci.ctx,ci.type);
+        if(item.webgl&&item.webgl.contextLost)item.issues.push('webgl-context-lost');
+        results.push(item);
+      }
+      return JSON.stringify({canvases:results,count:results.length});
+    })()`;
+
+  const frames = [];
+  for (let i = 0; i < options.sampleFrames; i++) {
+    if (i > 0 && options.sampleDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, options.sampleDelayMs));
+    }
+    frames.push(JSON.parse(await runJS(sampleScript, { timeout: 10000 })));
+  }
+
+  const first = frames[0] || { canvases: [], count: 0 };
+  for (let i = 0; i < first.canvases.length; i++) {
+    const item = first.canvases[i];
+    const samples = frames.map((frame) => frame.canvases && frame.canvases[i] && frame.canvases[i].pixelSample).filter(Boolean);
+    if (samples.length) {
+      item.blank = samples[0].nonZeroRatio === 0 || samples[0].alphaNonZeroRatio === 0;
+      item.changing = samples.length > 1 && samples.some((sample) => sample.hash !== samples[0].hash);
+      if (options.includePixels) item.pixels = samples;
+      delete item.pixelSample;
+    }
+    if (options.sampleFrames > 1 && item.changing === false && !item.blank && !item.issues.includes("static")) item.issues.push("static");
+  }
+  return JSON.stringify(first);
+}
+
 // ========== GEOLOCATION OVERRIDE ==========
 
 export async function overrideGeolocation({ latitude, longitude, accuracy = 100 }) {

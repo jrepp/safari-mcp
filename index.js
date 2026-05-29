@@ -1375,7 +1375,7 @@ server.tool(
   "safari_extract",
   "Extract structured data or inspect elements/page metadata.",
   {
-    kind: z.enum(["element", "query", "style", "accessibility", "tables", "meta", "images", "links", "analyze", "performance", "css_coverage", "layout", "dom_tree"]).describe("Extraction kind"),
+    kind: z.enum(["element", "query", "style", "accessibility", "tables", "meta", "images", "links", "analyze", "performance", "css_coverage", "layout", "dom_tree", "canvas"]).describe("Extraction kind"),
     selector: z.string().optional().describe("CSS selector"),
     ref: z.string().optional().describe("Snapshot ref"),
     refs: z.array(z.string()).optional().describe("Several snapshot refs"),
@@ -1392,6 +1392,10 @@ server.tool(
     includeGeometry: z.boolean().optional().describe("Include element geometry for kind=dom_tree"),
     includeHidden: z.boolean().optional().describe("Include hidden nodes for kind=dom_tree"),
     pierceShadow: z.boolean().optional().describe("Traverse open/captured shadow roots for kind=dom_tree"),
+    sampleFrames: z.coerce.number().optional().describe("Canvas frame samples for kind=canvas"),
+    sampleDelayMs: z.coerce.number().optional().describe("Delay between canvas frame samples"),
+    includePixels: z.boolean().optional().describe("Include compact pixel statistics for kind=canvas"),
+    includeWebGL: z.boolean().optional().describe("Include WebGL metadata for kind=canvas"),
   },
   async (args) => {
     const { kind } = args;
@@ -1408,6 +1412,7 @@ server.tool(
     if (kind === "css_coverage") return textResult(await safari.getCSSCoverage(), { untrusted: true });
     if (kind === "layout") return textResult(await safari.extractLayout(args), { untrusted: true });
     if (kind === "dom_tree") return textResult(await safari.extractDomTree(args), { untrusted: true });
+    if (kind === "canvas") return textResult(await safari.extractCanvas(args), { untrusted: true });
     return unknownAction("extract", kind);
   }
 );

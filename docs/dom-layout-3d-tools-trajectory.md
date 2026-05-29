@@ -453,6 +453,12 @@ Optional arguments:
 - It does not throw on tainted canvases or cross-origin resources; it reports `tainted: true`.
 - It has a fixture for blank canvas, static canvas, animated 2D canvas, blank WebGL, and animated WebGL.
 
+Status:
+
+- Implemented `safari_extract kind=canvas` with bounded canvas discovery, 2D/WebGL pixel sampling, blank/static/changing checks, and basic WebGL metadata.
+- Live fixture covers animated 2D canvas detection.
+- WebGL instrumentation hooks and full canvas/WebGL fixture matrix remain future work.
+
 ## Phase 6: 3D Scene Helpers
 
 ### User Value

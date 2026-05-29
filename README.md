@@ -322,7 +322,7 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_pointer` | `hover`, `drag`, and `hit_test`, with native hover support |
 | `safari_keyboard` | `press`, `type`, `replace_editor`, with native support |
 | `safari_form` | `clear`, `select`, `fill_all`, `submit`, `verify`, `detect`, react-select helpers |
-| `safari_extract` | Element/query/style/layout/dom_tree/a11y/tables/meta/images/links/analyze/performance/CSS coverage |
+| `safari_extract` | Element/query/style/layout/dom_tree/canvas/a11y/tables/meta/images/links/analyze/performance/CSS coverage |
 | `safari_storage` | Cookies, localStorage, sessionStorage, IndexedDB, export/import |
 | `safari_network` | Overview, capture, details, clear, mock, clear mocks, throttle |
 | `safari_console` | Start, get, filter by level, clear console capture |

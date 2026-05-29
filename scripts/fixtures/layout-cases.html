@@ -193,6 +193,11 @@
           srcdoc="<main><button class='frame-button'>Frame action</button></main>"
           style="width: 100%; height: 88px; border: 2px solid #204980; background: white;"></iframe>
       </article>
+
+      <article class="card">
+        <h2>Canvas</h2>
+        <canvas class="animated-canvas" width="180" height="80" style="width: 180px; height: 80px; border: 2px solid #1e1b18;"></canvas>
+      </article>
     </section>
 
     <a href="#offscreen" class="offscreen-link">Offscreen link far below the fold</a>
@@ -214,6 +219,20 @@
       </style>
       <button class="shadow-action">Shadow action</button>
     `;
+
+    const canvas = document.querySelector(".animated-canvas");
+    const ctx = canvas.getContext("2d");
+    let frame = 0;
+    function drawCanvas() {
+      frame += 1;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#204980";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#e98b2a";
+      ctx.fillRect((frame * 7) % 140, 18, 36, 36);
+    }
+    drawCanvas();
+    setInterval(drawCanvas, 80);
   </script>
 </body>
 </html>
