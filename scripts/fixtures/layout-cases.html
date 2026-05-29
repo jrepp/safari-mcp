@@ -180,11 +180,40 @@
         <h2>Disabled</h2>
         <button disabled>Disabled button</button>
       </article>
+
+      <article class="card">
+        <h2>Shadow DOM</h2>
+        <div id="shadow-host"></div>
+      </article>
+
+      <article class="card">
+        <h2>Iframe</h2>
+        <iframe
+          title="Same-origin fixture frame"
+          srcdoc="<main><button class='frame-button'>Frame action</button></main>"
+          style="width: 100%; height: 88px; border: 2px solid #204980; background: white;"></iframe>
+      </article>
     </section>
 
     <a href="#offscreen" class="offscreen-link">Offscreen link far below the fold</a>
   </main>
 
   <button class="fixed-chip">Fixed helper</button>
+  <script>
+    const shadowHost = document.getElementById("shadow-host");
+    const shadow = shadowHost.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+      <style>
+        button {
+          font: inherit;
+          padding: 10px 14px;
+          border: 0;
+          background: #5b3f99;
+          color: white;
+        }
+      </style>
+      <button class="shadow-action">Shadow action</button>
+    `;
+  </script>
 </body>
 </html>

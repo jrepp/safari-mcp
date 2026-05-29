@@ -38,6 +38,16 @@ function findBySelector(result, fragment) {
   return (result.items || []).find((item) => typeof item.selector === "string" && item.selector.includes(fragment));
 }
 
+function walkTree(node, predicate) {
+  if (!node) return null;
+  if (predicate(node)) return node;
+  for (const child of node.children || []) {
+    const found = walkTree(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+
 async function main() {
   console.log("— safari_extract kind=layout live test —\n");
   console.log(process.env.SAFARI_PROFILE
@@ -90,6 +100,12 @@ async function main() {
   const omittedLayout = parseJson(omittedLayoutRaw);
   check("omitted target mode returns items", omittedLayout, (result) => result.items.length >= 1);
   check("default response stays under 12KB", omittedLayoutRaw, (raw) => raw.length < 12000);
+
+  const domTree = parseJson(await safari.extractDomTree({ selector: "main", maxDepth: 5, limit: 120 }));
+  check("dom_tree returns bounded root", domTree, (result) => result.root && result.root.tag === "MAIN" && result.counts.nodes <= 120);
+  check("dom_tree includes click-compatible refs", domTree, (result) => !!walkTree(result.root, (node) => node.tag === "BUTTON" && typeof node.ref === "string"));
+  check("dom_tree pierces open shadow root", domTree, (result) => !!walkTree(result.root, (node) => node.selector === "div#shadow-host" && node.shadowRoot === "open") && !!walkTree(result.root, (node) => node.selector === "button.shadow-action"));
+  check("dom_tree marks iframe boundary", domTree, (result) => !!walkTree(result.root, (node) => node.tag === "IFRAME" && node.iframe === "same-origin"));
 
   await safari.closeTab();
   const after = JSON.parse(await safari.listTabs());

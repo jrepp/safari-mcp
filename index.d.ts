@@ -108,7 +108,7 @@ export interface SafariFormInput {
 }
 
 export interface SafariExtractInput {
-  kind: "element" | "query" | "style" | "accessibility" | "tables" | "meta" | "images" | "links" | "analyze" | "performance" | "css_coverage" | "layout";
+  kind: "element" | "query" | "style" | "accessibility" | "tables" | "meta" | "images" | "links" | "analyze" | "performance" | "css_coverage" | "layout" | "dom_tree";
   selector?: string;
   ref?: string;
   refs?: string[];
@@ -120,6 +120,11 @@ export interface SafariExtractInput {
   includeChildren?: boolean;
   viewportOnly?: boolean;
   diagnostics?: boolean;
+  includeText?: boolean;
+  includeStyles?: boolean;
+  includeGeometry?: boolean;
+  includeHidden?: boolean;
+  pierceShadow?: boolean;
 }
 
 export interface SafariStorageInput {

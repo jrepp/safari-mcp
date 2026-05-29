@@ -309,6 +309,12 @@ Return bounded JSON nodes:
 - It avoids text bloat by default.
 - It has tests or manual fixtures for nested DOM, shadow DOM, and iframe cases.
 
+Status:
+
+- Implemented in `safari_extract kind=dom_tree`.
+- Supports `selector`, `ref`, `maxDepth`, `limit`, `includeText`, `includeStyles`, `includeGeometry`, `includeHidden`, and `pierceShadow`.
+- Live fixture now includes open shadow DOM and a same-origin `srcdoc` iframe.
+
 ## Phase 4: Layout Observation
 
 ### User Value
