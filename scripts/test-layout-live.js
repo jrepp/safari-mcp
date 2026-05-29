@@ -107,6 +107,15 @@ async function main() {
   check("dom_tree pierces open shadow root", domTree, (result) => !!walkTree(result.root, (node) => node.selector === "div#shadow-host" && node.shadowRoot === "open") && !!walkTree(result.root, (node) => node.selector === "button.shadow-action"));
   check("dom_tree marks iframe boundary", domTree, (result) => !!walkTree(result.root, (node) => node.tag === "IFRAME" && node.iframe === "same-origin"));
 
+  const observeStart = parseJson(await safari.observeLayout({ selector: "main" }));
+  check("observe_layout starts", observeStart, (result) => result.observing === true && result.selector === "main");
+  await safari.evaluate({ script: "const el=document.createElement('div');el.className='observer-added';el.textContent='Observer added';document.querySelector('main').appendChild(el);document.querySelector('.covered-button').classList.toggle('observer-toggled');" });
+  await safari.waitForTime({ ms: 100 });
+  const layoutEvents = parseJson(await safari.getLayoutEvents({ limit: 50 }));
+  check("layout_events summarizes mutations", layoutEvents, (result) => result.observing === true && result.summary.some((event) => event.type === "mutation" && (event.added > 0 || event.attribute)));
+  const clearedEvents = parseJson(await safari.clearLayoutEvents());
+  check("clear_layout_events clears observer", clearedEvents, (result) => result.observing === false && result.eventCount === 0);
+
   await safari.closeTab();
   const after = JSON.parse(await safari.listTabs());
   check("user tabs untouched", after.length, (count) => count === before.length);

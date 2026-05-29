@@ -326,7 +326,7 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_storage` | Cookies, localStorage, sessionStorage, IndexedDB, export/import |
 | `safari_network` | Overview, capture, details, clear, mock, clear mocks, throttle |
 | `safari_console` | Start, get, filter by level, clear console capture |
-| `safari_browser` | Scroll, dialog, resize, emulation, files, PDF, clipboard, geolocation, extension reload |
+| `safari_browser` | Scroll, dialog, resize, layout observation, emulation, files, PDF, clipboard, geolocation, extension reload |
 | `safari_run_script` | Batch multiple lower-level `safari.js` actions in one call |
 
 </details>

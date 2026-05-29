@@ -160,7 +160,7 @@ export interface SafariNetworkInput {
 export interface SafariConsoleInput { action: "start" | "get" | "clear"; level?: "log" | "warn" | "error" | "info" }
 
 export interface SafariBrowserInput {
-  action: "scroll" | "scroll_to" | "scroll_to_element" | "dialog" | "resize" | "emulate" | "reset_emulation" | "upload_file" | "paste_image" | "save_pdf" | "clipboard_read" | "clipboard_write" | "geolocation" | "reload_extension";
+  action: "scroll" | "scroll_to" | "scroll_to_element" | "dialog" | "resize" | "emulate" | "reset_emulation" | "upload_file" | "paste_image" | "save_pdf" | "clipboard_read" | "clipboard_write" | "geolocation" | "reload_extension" | "observe_layout" | "layout_events" | "clear_layout_events";
   dialogAction?: "accept" | "dismiss";
   direction?: "up" | "down";
   amount?: number;
@@ -180,6 +180,8 @@ export interface SafariBrowserInput {
   latitude?: number;
   longitude?: number;
   accuracy?: number;
+  limit?: number;
+  detail?: boolean;
 }
 
 export interface SafariRunScriptStep { action: string; args?: Record<string, unknown> }

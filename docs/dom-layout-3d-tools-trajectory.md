@@ -372,6 +372,12 @@ Prefer extending `safari_browser`:
 - Events include refs when targets are known.
 - A click that opens a modal produces a concise summary of added nodes, changed visibility, and layout shift.
 
+Status:
+
+- Implemented as `safari_browser action=observe_layout|layout_events|clear_layout_events`.
+- Uses bounded page-context buffers and summarizes events by type/target.
+- Live validation covers mutation summary and observer cleanup.
+
 ## Phase 5: Canvas and WebGL Diagnostics
 
 ### User Value

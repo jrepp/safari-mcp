@@ -1510,7 +1510,7 @@ server.tool(
   "safari_browser",
   "Browser environment, files, clipboard, dialog, scroll, PDF, and extension maintenance.",
   {
-    action: z.enum(["scroll", "scroll_to", "scroll_to_element", "dialog", "resize", "emulate", "reset_emulation", "upload_file", "paste_image", "save_pdf", "clipboard_read", "clipboard_write", "geolocation", "reload_extension"]).describe("Browser action"),
+    action: z.enum(["scroll", "scroll_to", "scroll_to_element", "dialog", "resize", "emulate", "reset_emulation", "upload_file", "paste_image", "save_pdf", "clipboard_read", "clipboard_write", "geolocation", "reload_extension", "observe_layout", "layout_events", "clear_layout_events"]).describe("Browser action"),
     dialogAction: z.enum(["accept", "dismiss"]).optional().describe("Dialog action for action=dialog"),
     direction: z.enum(["up", "down"]).optional().describe("Scroll direction"),
     amount: z.coerce.number().optional().describe("Scroll amount"),
@@ -1530,6 +1530,8 @@ server.tool(
     latitude: z.coerce.number().optional().describe("Geolocation latitude"),
     longitude: z.coerce.number().optional().describe("Geolocation longitude"),
     accuracy: z.coerce.number().optional().describe("Geolocation accuracy"),
+    limit: z.coerce.number().optional().describe("Result/event limit"),
+    detail: z.boolean().optional().describe("Include raw layout observer events"),
   },
   async (args) => {
     if (args.action === "scroll") return textResult(await extensionOrFallback("scroll", { direction: args.direction, amount: args.amount }, () => safari.scroll(args)));
@@ -1546,6 +1548,9 @@ server.tool(
     if (args.action === "clipboard_write") return textResult(await directWrite("clipboard_write", () => safari.clipboardWrite(args)));
     if (args.action === "geolocation") return textResult(await directWrite("override_geolocation", () => safari.overrideGeolocation(args)));
     if (args.action === "reload_extension") return textResult(await extensionOrFallback("reload_extension", {}, async () => "Extension fallback not available — this command requires the Safari MCP Bridge extension."));
+    if (args.action === "observe_layout") return textResult(await safari.observeLayout(args), { untrusted: true });
+    if (args.action === "layout_events") return textResult(await safari.getLayoutEvents(args), { untrusted: true });
+    if (args.action === "clear_layout_events") return textResult(await safari.clearLayoutEvents(), { untrusted: true });
     return unknownAction("browser", args.action);
   }
 );
