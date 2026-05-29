@@ -5192,6 +5192,9 @@ export async function extractCanvas({
         };
       }
       function sampleCanvas(canvas, ctx, type){
+        try{
+          if(typeof window.__mcpBeforeCanvasSample==='function')window.__mcpBeforeCanvasSample(canvas);
+        }catch(_err){}
         var width=canvas.width||0, height=canvas.height||0;
         if(type==='2d'){
           var sw=Math.min(width,64), sh=Math.min(height,64);
@@ -5233,6 +5236,12 @@ export async function extractCanvas({
         }catch(_err){}
         return info;
       }
+      function instrumentationInfo(canvas){
+        try{
+          if(window.__mcpGetCanvasInstrumentation)return window.__mcpGetCanvasInstrumentation(canvas);
+        }catch(_err){}
+        return null;
+      }
       var canvases=[];
       findCanvases(document,canvases,new Set());
       var results=[];
@@ -5264,7 +5273,19 @@ export async function extractCanvas({
         if(!item.drawingBuffer.width||!item.drawingBuffer.height)item.issues.push('zero-drawing-buffer');
         if(item.blank===true)item.issues.push('blank');
         if(opts.includeWebGL)item.webgl=webglInfo(ci.ctx,ci.type);
+        var instrumentation=instrumentationInfo(canvas);
+        if(instrumentation){
+          item.instrumentation=instrumentation;
+          if(item.webgl){
+            item.webgl.drawCallsLastFrame=instrumentation.drawCalls;
+            item.webgl.shaderErrors=instrumentation.shaderErrors||[];
+            item.webgl.programLinkErrors=instrumentation.programLinkErrors||[];
+            if(instrumentation.viewport)item.webgl.viewport=instrumentation.viewport;
+          }
+        }
         if(item.webgl&&item.webgl.contextLost)item.issues.push('webgl-context-lost');
+        if(item.webgl&&item.webgl.shaderErrors&&item.webgl.shaderErrors.length)item.issues.push('shader-errors');
+        if(item.webgl&&item.webgl.programLinkErrors&&item.webgl.programLinkErrors.length)item.issues.push('program-link-errors');
         results.push(item);
       }
       return JSON.stringify({canvases:results,count:results.length});

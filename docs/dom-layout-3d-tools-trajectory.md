@@ -457,7 +457,8 @@ Status:
 
 - Implemented `safari_extract kind=canvas` with bounded canvas discovery, 2D/WebGL pixel sampling, blank/static/changing checks, and basic WebGL metadata.
 - Live fixture covers animated 2D canvas detection.
-- WebGL instrumentation hooks and full canvas/WebGL fixture matrix remain future work.
+- Added lightweight document-start WebGL instrumentation in `extension/content.js` for context creation, draw/clear/viewport counters, shader compile errors, and program link errors.
+- Full canvas/WebGL fixture matrix remains future work.
 
 ## Phase 6: 3D Scene Helpers
 

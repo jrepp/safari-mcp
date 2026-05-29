@@ -233,6 +233,9 @@
     }
     drawCanvas();
     setInterval(drawCanvas, 80);
+    window.__mcpBeforeCanvasSample = function(sampledCanvas) {
+      if (sampledCanvas === canvas) drawCanvas();
+    };
   </script>
 </body>
 </html>

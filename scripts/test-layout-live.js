@@ -54,7 +54,7 @@ async function main() {
     ? `Using Safari profile: ${process.env.SAFARI_PROFILE}`
     : "Using Safari front window (set SAFARI_PROFILE to target a specific profile window)");
   const before = JSON.parse(await safari.listTabs());
-  await safari.newTab(fixtureUrl);
+  const openedTab = parseJson(await safari.newTab(fixtureUrl));
   await safari.waitFor({ selector: ".covered-button", timeout: 5000 });
 
   const snapshot = await safari.takeSnapshot();
@@ -130,6 +130,7 @@ async function main() {
   const pixelStats = parseJson(await safari.extractVisual({ selector: ".animated-canvas", mode: "pixel_stats", sampleFrames: 2, sampleDelayMs: 300 }));
   check("visual pixel_stats includes samples", pixelStats, (result) => result.canvases && result.canvases[0] && Array.isArray(result.canvases[0].pixels));
 
+  if (openedTab.tabIndex) await safari.switchTab(openedTab.tabIndex);
   await safari.closeTab();
   const after = JSON.parse(await safari.listTabs());
   check("user tabs untouched", after.length, (count) => count === before.length);
