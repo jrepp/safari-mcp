@@ -198,6 +198,11 @@
         <h2>Canvas</h2>
         <canvas class="animated-canvas" width="180" height="80" style="width: 180px; height: 80px; border: 2px solid #1e1b18;"></canvas>
       </article>
+
+      <article class="card">
+        <h2>WebGL</h2>
+        <canvas class="animated-webgl" width="180" height="80" style="width: 180px; height: 80px; border: 2px solid #1e1b18;"></canvas>
+      </article>
     </section>
 
     <a href="#offscreen" class="offscreen-link">Offscreen link far below the fold</a>
@@ -222,7 +227,10 @@
 
     const canvas = document.querySelector(".animated-canvas");
     const ctx = canvas.getContext("2d");
+    const webglCanvas = document.querySelector(".animated-webgl");
+    const gl = webglCanvas.getContext("webgl", { preserveDrawingBuffer: true });
     let frame = 0;
+    let webglFrame = 0;
     function drawCanvas() {
       frame += 1;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -231,10 +239,20 @@
       ctx.fillStyle = "#e98b2a";
       ctx.fillRect((frame * 7) % 140, 18, 36, 36);
     }
+    function drawWebgl() {
+      if (!gl) return;
+      webglFrame += 1;
+      gl.viewport(0, 0, webglCanvas.width, webglCanvas.height);
+      gl.clearColor((webglFrame % 5) / 5, 0.25, 0.75, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
     drawCanvas();
+    drawWebgl();
     setInterval(drawCanvas, 80);
+    setInterval(drawWebgl, 80);
     window.__mcpBeforeCanvasSample = function(sampledCanvas) {
       if (sampledCanvas === canvas) drawCanvas();
+      if (sampledCanvas === webglCanvas) drawWebgl();
     };
   </script>
 </body>

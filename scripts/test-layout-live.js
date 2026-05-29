@@ -124,6 +124,12 @@ async function main() {
   check("canvas diagnostics detects nonblank canvas", animatedCanvas, (item) => item.blank === false && !item.issues.includes("blank"));
   check("canvas diagnostics detects animation", animatedCanvas, (item) => item.changing === true);
 
+  const webglDiagnostics = parseJson(await safari.extractCanvas({ selector: ".animated-webgl", sampleFrames: 2, sampleDelayMs: 300 }));
+  const animatedWebgl = webglDiagnostics.canvases && webglDiagnostics.canvases[0];
+  check("canvas diagnostics finds WebGL canvas", animatedWebgl, (item) => item && item.context === "webgl" && item.visible === true);
+  check("canvas diagnostics reads WebGL pixels", animatedWebgl, (item) => item.blank === false && item.webgl && item.webgl.drawingBuffer.width > 0);
+  check("canvas diagnostics detects WebGL animation", animatedWebgl, (item) => item.changing === true);
+
   const sceneHealth = parseJson(await safari.extractVisual({ selector: ".animated-canvas", mode: "scene_health", sampleFrames: 2, sampleDelayMs: 300 }));
   check("visual scene_health summarizes rendering", sceneHealth, (result) => result.summary && result.summary.renderingCanvasCount === 1 && result.summary.blankCanvasCount === 0);
   check("visual scene_health returns recommendations", sceneHealth, (result) => Array.isArray(result.recommendations) && result.recommendations.length >= 1);
