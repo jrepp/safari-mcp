@@ -368,9 +368,9 @@ Use `safari_site action=list` to discover hooks, `action=state` for app state, a
 To generate a site-onboarding prompt for a coding agent:
 
 ```bash
-safari-mcp-onboard --site-name "Example App" | codex
+safari-mcp --prompt --site-name "Example App" | codex
 # or
-npx safari-mcp-onboard --site-name "Example App" | claude
+npx safari-mcp -- --prompt --site-name "Example App" | claude
 ```
 
 The prompt asks the site owner which behaviors should be exposed, explains the hook model, and asks the agent to produce a steering prompt before implementation.

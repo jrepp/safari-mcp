@@ -8,7 +8,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import * as safari from "./safari.js";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import { randomUUID, randomBytes } from "node:crypto";
@@ -17,6 +16,14 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { printOnboardingPrompt } from "./scripts/onboarding-prompt.js";
+
+if (process.argv.includes("--prompt")) {
+  printOnboardingPrompt(process.argv.slice(2));
+  process.exit(0);
+}
+
+const safari = await import("./safari.js");
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB cap on POST body — prevents DoS
 const BRIDGE_TOKEN_BYTES = 32;

@@ -1,26 +1,25 @@
 #!/usr/bin/env node
 
-const args = new Set(process.argv.slice(2));
+import { fileURLToPath } from "node:url";
 
-if (args.has("--help") || args.has("-h")) {
-  process.stdout.write(`Usage:
-  safari-mcp-onboard [--site-name <name>]
+export function onboardingUsage(command = "safari-mcp --prompt") {
+  return `Usage:
+  ${command} [--site-name <name>]
 
 Prints a prompt you can pipe into a coding agent inside a website/app repo:
+  safari-mcp --prompt --site-name "Acme CRM" | codex
+  npx safari-mcp -- --prompt --site-name "Acme CRM" | claude
   safari-mcp-onboard --site-name "Acme CRM" | codex
-  npx safari-mcp-onboard | claude
-`);
-  process.exit(0);
+`;
 }
 
-function valueAfter(flag) {
-  const index = process.argv.indexOf(flag);
-  return index >= 0 ? process.argv[index + 1] : "";
+export function valueAfter(argv, flag) {
+  const index = argv.indexOf(flag);
+  return index >= 0 ? argv[index + 1] : "";
 }
 
-const siteName = valueAfter("--site-name") || valueAfter("--app-name") || "this site";
-
-const prompt = `You are working inside the codebase for ${siteName}. Your job is to onboard this site into Safari MCP's site-provided hook workflow.
+export function buildOnboardingPrompt({ siteName = "this site" } = {}) {
+  return `You are working inside the codebase for ${siteName}. Your job is to onboard this site into Safari MCP's site-provided hook workflow.
 
 Start by interviewing the user. Do not implement hooks until you have asked these questions and received answers, unless the answers are already obvious from prior context:
 
@@ -147,6 +146,22 @@ After implementing, provide:
   4. Run a read-only hook with safari_site action=call.
   5. Run a write hook only with allowWrite:true when appropriate.
 `;
+}
 
-process.stdout.write(prompt);
-if (!prompt.endsWith("\n")) process.stdout.write("\n");
+export function printOnboardingPrompt(argv = process.argv.slice(2), output = process.stdout) {
+  const args = new Set(argv);
+
+  if (args.has("--help") || args.has("-h")) {
+    output.write(onboardingUsage(args.has("--prompt") ? "safari-mcp --prompt" : "safari-mcp-onboard"));
+    return;
+  }
+
+  const siteName = valueAfter(argv, "--site-name") || valueAfter(argv, "--app-name") || "this site";
+  const prompt = buildOnboardingPrompt({ siteName });
+  output.write(prompt);
+  if (!prompt.endsWith("\n")) output.write("\n");
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  printOnboardingPrompt();
+}
