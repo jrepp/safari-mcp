@@ -3300,6 +3300,117 @@ export async function evaluate({ script }) {
   return result;
 }
 
+// ========== SITE-PROVIDED HOOKS ==========
+
+function _jsonForPage(value) {
+  return JSON.stringify(value === undefined ? null : value)
+    .replace(/</g, "\\u003c")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+export async function listSiteHooks() {
+  return runJS(
+    `(function(){
+      function root(){
+        return window.__safariMcp || window.__safariMCP || window.__safariMcpHooks || window.__mcpSiteHooks || null;
+      }
+      function hookMap(api){
+        return (api && (api.hooks || api.workflows || api.actions)) || {};
+      }
+      function describeHook(name, hook){
+        var fn = typeof hook === 'function';
+        var meta = fn ? {} : (hook || {});
+        return {
+          name: name,
+          description: meta.description || meta.title || '',
+          readOnly: meta.readOnly !== false && meta.mutates !== true,
+          inputSchema: meta.inputSchema || meta.schema || null,
+          returns: meta.returns || null
+        };
+      }
+      var api = root();
+      if (!api) return JSON.stringify({available:false,hooks:[],contract:'window.__safariMcp = { name, version, getState, hooks: { hookName: { readOnly, description, inputSchema, run(args, context) } } }'});
+      var hooks = hookMap(api);
+      return JSON.stringify({
+        available:true,
+        name:api.name || api.app || null,
+        version:api.version || null,
+        description:api.description || null,
+        hasState:typeof api.getState === 'function' || typeof api.inspect === 'function' || typeof api.state === 'function',
+        hooks:Object.keys(hooks).map(function(name){return describeHook(name,hooks[name]);})
+      });
+    })()`,
+    { timeout: 5000 }
+  );
+}
+
+async function _callSiteAsync(expr, timeout = 15000) {
+  const token = '__mcpSiteHook_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const timeoutMs = Math.max(1000, Math.min(Number(timeout) || 15000, 60000));
+  const startJs =
+    `(function(){` +
+    `var token='${token}';` +
+    `window[token]={done:false,value:null,error:null};` +
+    `Promise.resolve().then(function(){return (${expr});}).then(function(v){` +
+    `window[token].value=v===undefined?null:v;window[token].done=true;` +
+    `},function(e){window[token].error=String(e&&e.message||e);window[token].done=true;});` +
+    `return token;` +
+    `})()`;
+  await runJS(startJs, { timeout: 5000 });
+  const pollJs =
+    `(function(){var s=window['${token}'];if(!s)return '__MCP_GONE__';if(!s.done)return '';` +
+    `try{return JSON.stringify({value:s.value,error:s.error});}catch(e){return JSON.stringify({error:'Hook result is not JSON-serializable: '+e.message});}})()`;
+  const deadline = Date.now() + timeoutMs;
+  let raw = "";
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    raw = await runJS(pollJs, { timeout: 5000 }).catch(() => "");
+    if (raw === "__MCP_GONE__") return JSON.stringify({ error: "page navigated while site hook was running" });
+    if (raw) break;
+  }
+  runJS(`(function(){try{delete window['${token}'];}catch(e){window['${token}']=undefined;}return '';})()`).catch(() => {});
+  if (!raw) return JSON.stringify({ error: `site hook timed out after ${timeoutMs}ms` });
+  return raw;
+}
+
+export async function getSiteState({ timeout } = {}) {
+  const expr =
+    `(function(){` +
+    `var api=window.__safariMcp||window.__safariMCP||window.__safariMcpHooks||window.__mcpSiteHooks;` +
+    `if(!api)return {available:false,error:'No site hook API registered'};` +
+    `var ctx={url:location.href,title:document.title,now:Date.now()};` +
+    `if(typeof api.getState==='function')return api.getState(ctx);` +
+    `if(typeof api.inspect==='function')return api.inspect(ctx);` +
+    `if(typeof api.state==='function')return api.state(ctx);` +
+    `if(api.state!==undefined)return api.state;` +
+    `return {available:true,error:'No getState/inspect/state hook registered'};` +
+    `})()`;
+  return _callSiteAsync(expr, timeout);
+}
+
+export async function callSiteHook({ hook, params = {}, allowWrite = false, timeout } = {}) {
+  if (!hook) return JSON.stringify({ error: "site hook call requires hook" });
+  const hookJson = _jsonForPage(String(hook));
+  const argsJson = _jsonForPage(params);
+  const expr =
+    `(function(){` +
+    `var api=window.__safariMcp||window.__safariMCP||window.__safariMcpHooks||window.__mcpSiteHooks;` +
+    `if(!api)return {error:'No site hook API registered'};` +
+    `var hooks=api.hooks||api.workflows||api.actions||{};` +
+    `var hookName=${hookJson};` +
+    `var entry=hooks[hookName];` +
+    `if(!entry)return {error:'Unknown site hook: '+hookName,available:Object.keys(hooks)};` +
+    `var fn=typeof entry==='function'?entry:(entry.run||entry.call||entry.handler);` +
+    `if(typeof fn!=='function')return {error:'Site hook is not callable: '+hookName};` +
+    `var readOnly=typeof entry==='function'?true:(entry.readOnly!==false&&entry.mutates!==true);` +
+    `if(!readOnly&&!${allowWrite ? "true" : "false"})return {error:'Hook '+hookName+' is declared readOnly:false. Retry with allowWrite:true on an MCP-owned tab.',readOnly:false};` +
+    `var ctx={url:location.href,title:document.title,now:Date.now(),hook:hookName,readOnly:readOnly};` +
+    `return fn.call(entry,${argsJson},ctx);` +
+    `})()`;
+  return _callSiteAsync(expr, timeout);
+}
+
 // ========== ELEMENT INFO ==========
 
 export async function getElementInfo({ selector }) {
@@ -4354,6 +4465,7 @@ export async function runScript({ steps }) {
         getCookies, setCookie, deleteCookies, getElementInfo, querySelectorAll,
         extractTables, extractMeta, extractImages, extractLinks,
         analyzePage, detectForms, getAccessibilityTree, getPerformanceMetrics,
+        listSiteHooks, getSiteState, callSiteHook,
       };
       const fn = actions[action];
       if (!fn) {

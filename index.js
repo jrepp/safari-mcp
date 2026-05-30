@@ -1514,6 +1514,27 @@ server.tool(
 );
 
 server.tool(
+  "safari_site",
+  "Discover and call optional site-provided Safari MCP hooks for app-state inspection and site-native workflows.",
+  {
+    action: z.enum(["list", "state", "call"]).describe("Hook action"),
+    hook: z.string().optional().describe("Hook name for action=call"),
+    params: z.record(z.string(), z.unknown()).optional().describe("JSON-serializable hook arguments"),
+    allowWrite: z.boolean().optional().describe("Allow calling a hook declared readOnly:false"),
+    timeout: z.coerce.number().optional().describe("Hook timeout in ms"),
+  },
+  async (args) => {
+    if (args.action === "list") return textResult(await safari.listSiteHooks(), { untrusted: true });
+    if (args.action === "state") return textResult(await safari.getSiteState({ timeout: args.timeout }), { untrusted: true });
+    if (args.action === "call") {
+      const runner = () => safari.callSiteHook({ hook: args.hook, params: args.params || {}, allowWrite: !!args.allowWrite, timeout: args.timeout });
+      return textResult(args.allowWrite ? await directWrite("site_hook", runner) : await runner(), { untrusted: true });
+    }
+    return unknownAction("site", args.action);
+  }
+);
+
+server.tool(
   "safari_browser",
   "Browser environment, files, clipboard, dialog, scroll, PDF, and extension maintenance.",
   {

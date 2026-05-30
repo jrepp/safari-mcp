@@ -143,6 +143,17 @@ async function main() {
   const pixelStats = parseJson(await safari.extractVisual({ selector: ".animated-canvas", mode: "pixel_stats", sampleFrames: 2, sampleDelayMs: 300 }));
   check("visual pixel_stats includes samples", pixelStats, (result) => result.canvases && result.canvases[0] && Array.isArray(result.canvases[0].pixels));
 
+  const siteHooks = parseJson(await safari.listSiteHooks());
+  check("site hooks list registered hooks", siteHooks, (result) => result.available === true && result.hooks.some((hook) => hook.name === "inspectCards"));
+  const siteState = parseJson(await safari.getSiteState());
+  check("site hooks read state model", siteState, (result) => result.value && result.value.cards >= 1 && result.value.workflowRuns === 0);
+  const inspectedCards = parseJson(await safari.callSiteHook({ hook: "inspectCards", params: { limit: 3 } }));
+  check("site hooks call read-only hook", inspectedCards, (result) => Array.isArray(result.value) && result.value.length === 3);
+  const blockedWorkflow = parseJson(await safari.callSiteHook({ hook: "markWorkflowRun", params: { label: "blocked" } }));
+  check("site hooks block write hook without allowWrite", blockedWorkflow, (result) => result.value && result.value.readOnly === false && String(result.value.error).includes("allowWrite"));
+  const workflowResult = parseJson(await safari.callSiteHook({ hook: "markWorkflowRun", params: { label: "live-test" }, allowWrite: true }));
+  check("site hooks run write hook with allowWrite", workflowResult, (result) => result.value && result.value.workflowRuns === 1 && result.value.lastWorkflow === "live-test");
+
   if (openedTab.tabIndex) await safari.switchTab(openedTab.tabIndex);
   await safari.closeTab();
   const after = JSON.parse(await safari.listTabs());

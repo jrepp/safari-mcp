@@ -164,6 +164,14 @@ export interface SafariNetworkInput {
 
 export interface SafariConsoleInput { action: "start" | "get" | "clear"; level?: "log" | "warn" | "error" | "info" }
 
+export interface SafariSiteInput {
+  action: "list" | "state" | "call";
+  hook?: string;
+  params?: Record<string, unknown>;
+  allowWrite?: boolean;
+  timeout?: number;
+}
+
 export interface SafariBrowserInput {
   action: "scroll" | "scroll_to" | "scroll_to_element" | "dialog" | "resize" | "emulate" | "reset_emulation" | "upload_file" | "paste_image" | "save_pdf" | "clipboard_read" | "clipboard_write" | "geolocation" | "reload_extension" | "observe_layout" | "layout_events" | "clear_layout_events";
   dialogAction?: "accept" | "dismiss";

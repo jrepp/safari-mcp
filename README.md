@@ -302,7 +302,7 @@ The recommended pattern for AI agents using Safari MCP:
 
 ---
 
-## Tools (19)
+## Tools (20)
 
 <details>
 <summary><b>Click to expand the compact tool list</b></summary>
@@ -326,10 +326,44 @@ The recommended pattern for AI agents using Safari MCP:
 | `safari_storage` | Cookies, localStorage, sessionStorage, IndexedDB, export/import |
 | `safari_network` | Overview, capture, details, clear, mock, clear mocks, throttle |
 | `safari_console` | Start, get, filter by level, clear console capture |
+| `safari_site` | Discover and call optional site-provided hooks for app-state inspection and native workflows |
 | `safari_browser` | Scroll, dialog, resize, layout observation, emulation, files, PDF, clipboard, geolocation, extension reload |
 | `safari_run_script` | Batch multiple lower-level `safari.js` actions in one call |
 
 </details>
+
+### Site-Provided Hooks
+
+Sites can expose app-aware inspection and workflow hooks to Safari MCP:
+
+```js
+window.__safariMcp = {
+  name: "Example App",
+  version: "1.0.0",
+  getState() {
+    return { route: app.router.currentRoute, selectedIds: app.store.selectedIds };
+  },
+  hooks: {
+    inspectSelection: {
+      readOnly: true,
+      description: "Return selected domain objects",
+      run(args, context) {
+        return app.store.getSelectedObjects();
+      }
+    },
+    applyBulkLabel: {
+      readOnly: false,
+      description: "Apply a label through the app state model",
+      inputSchema: { type: "object", properties: { label: { type: "string" } } },
+      run(args) {
+        return app.actions.applyLabel(args.label);
+      }
+    }
+  }
+};
+```
+
+Use `safari_site action=list` to discover hooks, `action=state` for app state, and `action=call` to invoke one. Hooks marked `readOnly:false` require `allowWrite:true` and an MCP-owned tab.
 
 ---
 

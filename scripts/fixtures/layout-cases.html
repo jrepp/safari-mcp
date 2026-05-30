@@ -288,6 +288,57 @@
       if (sampledCanvas === webglCanvas) drawWebgl();
       if (sampledCanvas === blankWebglCanvas) drawBlankWebgl();
     };
+
+    const fixtureState = {
+      workflowRuns: 0,
+      lastWorkflow: null
+    };
+    window.__safariMcp = {
+      name: "Safari MCP Layout Fixture",
+      version: "1.0.0",
+      getState() {
+        return {
+          title: document.title,
+          cards: document.querySelectorAll(".card").length,
+          workflowRuns: fixtureState.workflowRuns,
+          lastWorkflow: fixtureState.lastWorkflow
+        };
+      },
+      hooks: {
+        inspectCards: {
+          description: "Return card headings from the fixture state model.",
+          readOnly: true,
+          inputSchema: {
+            type: "object",
+            properties: {
+              limit: { type: "number" }
+            }
+          },
+          run(args) {
+            const limit = Number(args && args.limit) || 5;
+            return Array.from(document.querySelectorAll(".card h2"))
+              .slice(0, limit)
+              .map((heading) => heading.textContent.trim());
+          }
+        },
+        markWorkflowRun: {
+          description: "Mutate fixture state to prove write workflow hooks are gated.",
+          readOnly: false,
+          inputSchema: {
+            type: "object",
+            properties: {
+              label: { type: "string" }
+            }
+          },
+          run(args) {
+            fixtureState.workflowRuns += 1;
+            fixtureState.lastWorkflow = args && args.label || "unnamed";
+            document.body.dataset.workflowRuns = String(fixtureState.workflowRuns);
+            return { workflowRuns: fixtureState.workflowRuns, lastWorkflow: fixtureState.lastWorkflow };
+          }
+        }
+      }
+    };
   </script>
 </body>
 </html>
