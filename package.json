@@ -7,10 +7,12 @@
   "types": "index.d.ts",
   "main": "index.js",
   "bin": {
-    "safari-mcp": "index.js"
+    "safari-mcp": "index.js",
+    "safari-mcp-onboard": "scripts/onboarding-prompt.js"
   },
   "scripts": {
     "start": "node index.js",
+    "onboard": "node scripts/onboarding-prompt.js",
     "postinstall": "node scripts/postinstall.cjs || true"
   },
   "keywords": [
@@ -69,6 +71,7 @@
     "LICENSE",
     "README.md",
     "index.d.ts",
+    "scripts/onboarding-prompt.js",
     "scripts/postinstall.cjs"
   ],
   "dependencies": {
