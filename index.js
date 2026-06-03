@@ -1531,7 +1531,7 @@ server.tool(
     timeout: z.coerce.number().optional().describe("Hook timeout in ms"),
   },
   async (args) => {
-    if (args.action === "list") return textResult(await safari.listSiteHooks(), { untrusted: true });
+    if (args.action === "list") return textResult(await safari.listSiteHooks({ timeout: args.timeout }), { untrusted: true });
     if (args.action === "state") return textResult(await safari.getSiteState({ timeout: args.timeout }), { untrusted: true });
     if (args.action === "call") {
       const runner = () => safari.callSiteHook({ hook: args.hook, params: args.params || {}, allowWrite: !!args.allowWrite, timeout: args.timeout });

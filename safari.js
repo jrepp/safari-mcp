@@ -3309,7 +3309,8 @@ function _jsonForPage(value) {
     .replace(/\u2029/g, "\\u2029");
 }
 
-export async function listSiteHooks() {
+export async function listSiteHooks({ timeout } = {}) {
+  const timeoutMs = Math.max(1000, Math.min(Number(timeout) || 5000, 60000));
   return runJS(
     `(function(){
       function root(){
@@ -3341,7 +3342,7 @@ export async function listSiteHooks() {
         hooks:Object.keys(hooks).map(function(name){return describeHook(name,hooks[name]);})
       });
     })()`,
-    { timeout: 5000 }
+    { timeout: timeoutMs }
   );
 }
 
