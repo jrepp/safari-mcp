@@ -3,7 +3,7 @@
 // 2. AppleScript + Swift daemon (~5ms) — keeps logins, always available
 // Extension is preferred. AppleScript is fallback when extension is not connected.
 
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
@@ -11,6 +11,8 @@ import { readFile, writeFile, unlink, appendFile, realpath, lstat } from "node:f
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } from "./injected-validators.js";
+import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
@@ -19,6 +21,8 @@ const LOCAL_FILE_MAX_BYTES = parseInt(process.env.SAFARI_MCP_MAX_FILE_BYTES || S
 // Local session ID — kept in sync with index.js SESSION_ID for tab marker generation
 // Both files need their own const because they're separate ES modules; the marker only needs to be unique per process
 const SESSION_ID = randomUUID().slice(0, 8);
+
+export { escJsSingleQuote, escAppleScriptString };
 
 // ========== SWIFT HELPER DAEMON ==========
 // Persistent process — no subprocess spawn overhead (~5ms vs ~90ms)
@@ -50,6 +54,7 @@ function _drainHelperQueue(reason) {
 }
 
 function startHelper() {
+  if (_helperProc) return;
   const helperPath = join(__dirname, "safari-helper");
   try {
     _helperProc = spawn(helperPath, [], { stdio: ["pipe", "pipe", "ignore"] });
@@ -138,6 +143,7 @@ function safariNotRunningError() {
 // While locked, any new clipboard operation waits until the current one completes.
 let _clipboardLocked = false;
 let _clipboardRestoreTimer = null;
+let _pendingClipboardRestore;
 
 async function _acquireClipboardLock(timeoutMs = 10000) {
   const start = Date.now();
@@ -162,17 +168,22 @@ async function _saveClipboard() {
   } catch { return null; }
 }
 
+function _pbcopy(text) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
+    proc.stdin.on("error", reject);
+    proc.on("error", reject);
+    proc.on("close", resolve);
+    proc.stdin.write(text);
+    proc.stdin.end();
+  });
+}
+
 // Restore clipboard immediately (no async setTimeout leak)
 async function _restoreClipboard(savedContent) {
   if (savedContent === null) return;
   try {
-    await new Promise((resolve, reject) => {
-      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      proc.stdin.write(savedContent);
-      proc.stdin.end();
-      proc.on("close", resolve);
-      proc.on("error", reject);
-    });
+    await _pbcopy(savedContent);
   } catch {}
 }
 
@@ -303,15 +314,18 @@ if (SAFARI_PROFILE) {
   }, 3000); // Check every 3 seconds
 }
 
-// Initialize profile window at startup (ES module top-level await)
+// Initialize profile window in the background so MCP initialize never blocks on
+// profile-window detection.
 if (SAFARI_PROFILE) {
-  await new Promise(r => setTimeout(r, 50)); // Let helper process initialize
-  await refreshTargetWindow(true);
-  if (_targetWindowRef) {
-    _logProfile(`Startup: Profile "${SAFARI_PROFILE}" → targeting ${_targetWindowRef}`);
-  } else {
-    _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
-  }
+  (async () => {
+    await new Promise(r => setTimeout(r, 50));
+    await refreshTargetWindow(true).catch(() => {});
+    if (_targetWindowRef) {
+      _logProfile(`Startup: Profile "${SAFARI_PROFILE}" -> targeting ${_targetWindowRef}`);
+    } else {
+      _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
+    }
+  })();
 }
 
 // Detect stale window ID errors and invalidate cache
@@ -675,6 +689,40 @@ function _osascriptFastHelper(script, timeout) {
       if (idx >= 0) _helperQueue.splice(idx, 1);
       clearTimeout(timer);
       reject(new Error("safari-helper write failed: " + writeErr.message));
+    }
+  }));
+}
+
+function _helperPreflight(timeout = 3000) {
+  return _withHelperLock(() => new Promise((resolve, reject) => {
+    if (!_helperProc) startHelper();
+    if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
+      reject(new Error("safari-helper not available"));
+      return;
+    }
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue[idx] = () => {};
+      reject(new Error("preflight timeout"));
+    }, timeout);
+    function cb(line) {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      try { resolve(JSON.parse(line)); }
+      catch { reject(new Error("unparseable preflight reply")); }
+    }
+    _helperQueue.push(cb);
+    try {
+      _helperProc.stdin.write(JSON.stringify({ preflight: true }) + "\n");
+    } catch (writeErr) {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      reject(new Error("preflight write failed: " + writeErr.message));
     }
   }));
 }
@@ -4671,19 +4719,15 @@ export async function clipboardWrite({ text, restore = true }) {
     const oldClipboard = restore ? await _saveClipboard() : null;
 
     // Use spawn + stdin pipe — safe from shell injection (no shell involved)
-    await new Promise((resolve, reject) => {
-      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      proc.stdin.write(text);
-      proc.stdin.end();
-      proc.on("close", resolve);
-      proc.on("error", reject);
-    });
+    await _pbcopy(text);
 
     // Restore clipboard after 2 seconds (reduced from 5s — shorter exposure window)
     if (restore && oldClipboard !== null) {
       if (_clipboardRestoreTimer) clearTimeout(_clipboardRestoreTimer);
+      _pendingClipboardRestore = oldClipboard;
       _clipboardRestoreTimer = setTimeout(async () => {
         await _restoreClipboard(oldClipboard);
+        _pendingClipboardRestore = undefined;
         _clipboardRestoreTimer = null;
         _releaseClipboardLock();
       }, 2000);
@@ -4696,6 +4740,20 @@ export async function clipboardWrite({ text, restore = true }) {
     _releaseClipboardLock();
     throw err;
   }
+}
+
+export function flushClipboardRestore() {
+  if (_clipboardRestoreTimer) {
+    clearTimeout(_clipboardRestoreTimer);
+    _clipboardRestoreTimer = null;
+  }
+  if (_pendingClipboardRestore === undefined) return;
+  const content = _pendingClipboardRestore;
+  _pendingClipboardRestore = undefined;
+  try {
+    spawnSync("pbcopy", [], { input: content });
+  } catch {}
+  _releaseClipboardLock();
 }
 
 // ========== NETWORK MOCKING ==========
@@ -6076,6 +6134,98 @@ export async function getCSSCoverage() {
       return JSON.stringify(results);
     })()`
   );
+}
+
+// ========== WEBKIT / iOS WEB-DEV VALIDATION ==========
+
+export async function inspectViewport() {
+  return runJS(VIEWPORT_SCRIPT);
+}
+
+export async function safeAreaInsets() {
+  return runJS(SAFE_AREA_SCRIPT);
+}
+
+export async function getSafeAreaInsets() {
+  return safeAreaInsets();
+}
+
+export async function checkPWA() {
+  return runJS(PWA_SCRIPT);
+}
+
+export async function webkitCompat() {
+  return runJS(WEBKIT_COMPAT_SCRIPT);
+}
+
+export async function checkWebKitCompat() {
+  return webkitCompat();
+}
+
+export async function doctor() {
+  const checks = [];
+  const add = (ok, label, detail, fix) => checks.push({ ok, label, detail, fix: ok ? null : fix });
+
+  let safariUp = false;
+  try {
+    const { stdout } = await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
+    safariUp = stdout.trim().length > 0;
+  } catch {
+    safariUp = false;
+  }
+  add(safariUp, "Safari running", safariUp ? "Safari process is up" : "Safari is not running", "Open Safari, then retry.");
+
+  let aeOk = false;
+  let aeDetail = "";
+  try {
+    const out = await osascript(`tell application "Safari" to return (count of windows) as string`, { timeout: 5000 });
+    aeOk = /^\d+$/.test(String(out).trim());
+    aeDetail = aeOk ? `OK (${String(out).trim()} window(s) visible)` : `unexpected reply: ${String(out).slice(0, 60)}`;
+  } catch (e) {
+    const m = e.message || "";
+    if (m.includes("-1743") || /not authoriz/i.test(m)) aeDetail = "Automation permission denied (-1743)";
+    else if (m.includes("-600") || /isn.t running/i.test(m)) aeDetail = "Safari not running";
+    else aeDetail = m.slice(0, 80);
+  }
+  add(aeOk, "Apple Events / Automation", aeDetail,
+    "System Settings > Privacy & Security > Automation -> enable Safari for your terminal/host app; and Safari > Develop > Allow JavaScript from Apple Events.");
+
+  let pf = null;
+  let pfErr = "";
+  try { pf = await _helperPreflight(); } catch (e) { pfErr = e.message || String(e); }
+  add(!!pf, "Native helper daemon", pf ? "safari-helper responding" : `not responding: ${pfErr}`,
+    "It auto-restarts; if this persists, reinstall safari-mcp.");
+  add(!!pf && pf.accessibility === true, "Accessibility (native clicks)",
+    pf ? (pf.accessibility ? "CGEvent posting permitted" : "NOT permitted; native clicks silently no-op") : "unknown (helper not responding)",
+    "System Settings > Privacy & Security > Accessibility -> enable safari-helper, then retry.");
+  add(!!pf && pf.screenRecording === true, "Screen Recording (screenshots)",
+    pf ? (pf.screenRecording ? "permitted" : "NOT permitted; screenshots may be blank/blocked") : "unknown (helper not responding)",
+    "System Settings > Privacy & Security > Screen Recording -> enable your terminal/host app.");
+
+  let idOk = false;
+  let idDetail = "";
+  const helperPath = join(__dirname, "safari-helper");
+  try {
+    const res = await execFileAsync("codesign", ["-d", "--verbose=2", helperPath], { timeout: 4000 })
+      .catch((e) => ({ stdout: "", stderr: e.stderr || "" }));
+    const text = (res.stdout || "") + (res.stderr || "");
+    const m = /Identifier=(.+)/.exec(text);
+    const id = m ? m[1].trim() : "(unknown)";
+    idOk = id === "com.achiya-automation.safari-mcp";
+    idDetail = idOk ? `stable identifier: ${id}` : `unstable identifier "${id}"; Accessibility grant will not persist across reinstalls`;
+  } catch (e) {
+    idDetail = "could not read codesign identity: " + (e.message || "").slice(0, 60);
+  }
+  add(idOk, "Helper codesign identity", idDetail,
+    `Re-sign: codesign -s - -f --identifier com.achiya-automation.safari-mcp --entitlements safari-helper.entitlements "${helperPath}"`);
+
+  const passed = checks.filter((c) => c.ok).length;
+  const lines = [`Safari MCP doctor - ${passed}/${checks.length} checks passed`, ""];
+  for (const c of checks) {
+    lines.push(`${c.ok ? "OK" : "FAIL"} ${c.label}: ${c.detail}`);
+    if (!c.ok && c.fix) lines.push(`   -> ${c.fix}`);
+  }
+  return lines.join("\n");
 }
 
 // ========== FORM AUTO-DETECT ==========

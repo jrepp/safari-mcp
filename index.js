@@ -15,8 +15,19 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import { printOnboardingPrompt } from "./scripts/onboarding-prompt.js";
+import {
+  OWNERSHIP_DIR,
+  BLANK_TAB_SENTINEL,
+  _openedTabs,
+  _ownedTabURLs,
+  _isURLOwned,
+  _markBlankTabOpened,
+  _addOwnedURL,
+  _removeOwnedURL,
+  _trackTab,
+  _untrackTab,
+} from "./ownership-state.js";
 
 if (process.argv.includes("--prompt")) {
   printOnboardingPrompt(process.argv.slice(2));
@@ -41,16 +52,7 @@ const PAIRING_CODE_TTL_MS = 2 * 60 * 1000;
 // ========== SESSION ID (unique per MCP process — enables per-session tab tracking) ==========
 const SESSION_ID = randomUUID().slice(0, 8);
 
-// ========== PERSISTENT TAB OWNERSHIP ==========
-// The in-memory _ownedTabURLs set is wiped when the MCP process restarts
-// (Claude Code periodically recycles MCP servers). Without persistence, every
-// restart re-triggers "Tab safety: no tabs opened yet" errors forcing a
-// re-open of every tab. Persist the set to a JSON file with a TTL so tabs
-// remain "owned" across process restarts for up to OWNERSHIP_TTL_MS.
-const OWNERSHIP_DIR = join(homedir(), ".safari-mcp");
-const OWNERSHIP_FILE = join(OWNERSHIP_DIR, "owned-tabs.json");
 const SESSION_FILE = join(OWNERSHIP_DIR, "session.json");
-const OWNERSHIP_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 const BRIDGE_SECRET = process.env.SAFARI_MCP_BRIDGE_SECRET || randomBytes(BRIDGE_TOKEN_BYTES).toString("base64url");
 let _pairingCode = _newPairingCode();
@@ -118,113 +120,14 @@ function _safeExtensionOrigin(origin) {
   return !origin || origin.startsWith("safari-web-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("chrome-extension://");
 }
 
-function _loadOwnershipFile() {
-  try {
-    if (!existsSync(OWNERSHIP_FILE)) return [];
-    const raw = readFileSync(OWNERSHIP_FILE, "utf8");
-    const data = JSON.parse(raw);
-    if (!Array.isArray(data)) return [];
-    const cutoff = Date.now() - OWNERSHIP_TTL_MS;
-    return data.filter(e => e && typeof e.url === "string" && typeof e.ts === "number" && e.ts > cutoff);
-  } catch { return []; }
-}
-
-function _saveOwnershipFile(urls) {
-  try {
-    if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
-    const now = Date.now();
-    const entries = Array.from(urls).map(url => ({ url, ts: now }));
-    writeFileSync(OWNERSHIP_FILE, JSON.stringify(entries), { mode: 0o600 });
-  } catch { /* best-effort */ }
-}
-
 // ========== MEMORY GUARD: track & auto-close MCP-opened tabs ==========
 const MAX_TABS = parseInt(process.env.MCP_MAX_TABS || "6", 10);
 const MEMORY_CHECK_INTERVAL_MS = parseInt(process.env.MCP_MEMORY_CHECK_MS || "60000", 10);
 const WEBKIT_MEMORY_LIMIT_MB = parseInt(process.env.MCP_WEBKIT_LIMIT_MB || "3000", 10);
 
-// Track tabs opened by THIS session (index → {url, openedAt})
-const _openedTabs = new Map();
-
-// ========== TAB OWNERSHIP: prevent operating on user's tabs ==========
-// Tracks URLs of tabs opened by this MCP session.
-// Any tool that modifies a tab (navigate, click, fill, etc.) is blocked
-// unless the current tab was opened via safari_tabs action=new.
-// Hydrated from ~/.safari-mcp/owned-tabs.json so ownership survives MCP restarts.
-const _ownedTabURLs = new Set(_loadOwnershipFile().map(e => e.url));
-
-function _isURLOwned(url) {
-  if (!url) return false;
-  if (_ownedTabURLs.has(url)) return true;
-  // Match ignoring query params / fragments / trailing slashes (URL may change slightly after load)
-  const normalize = (u) => u.split('?')[0].split('#')[0].replace(/\/+$/, '');
-  const urlBase = normalize(url);
-  for (const owned of _ownedTabURLs) {
-    const ownedBase = normalize(owned);
-    if (urlBase === ownedBase) return true;
-  }
-  // Same-origin redirect: if a tab navigated from an owned URL to a different path
-  // on the same origin (e.g. /login/device → /login/device/select_account), it's still ours
-  try {
-    const urlOrigin = new URL(url).origin;
-    for (const owned of _ownedTabURLs) {
-      try {
-        if (new URL(owned).origin === urlOrigin && urlBase.startsWith(normalize(owned))) return true;
-      } catch {}
-    }
-    // Broader same-origin check: if we own ANY URL on this origin, treat all same-origin URLs as owned.
-    // This handles redirects like /article/new → /article/edit/ID where path prefix doesn't match.
-    for (const owned of _ownedTabURLs) {
-      try {
-        if (new URL(owned).origin === urlOrigin) return true;
-      } catch {}
-    }
-  } catch {}
-  return false;
-}
-
-// Sentinel persisted when a blank tab (about:blank) is opened by this session.
-// A blank tab has no unique URL to own, but ownership must still survive an MCP
-// process restart (_openedTabs is in-memory only) — otherwise reopening blank
-// tabs falsely trips the "no tabs opened yet" guard. The sentinel is never a
-// real tab URL, so it cannot falsely match a user's page in _isURLOwned().
-const BLANK_TAB_SENTINEL = "__mcp-blank-tab__";
-
-function _markBlankTabOpened() {
-  if (!_ownedTabURLs.has(BLANK_TAB_SENTINEL)) {
-    _ownedTabURLs.add(BLANK_TAB_SENTINEL);
-    _saveOwnershipFile(_ownedTabURLs);
-  }
-}
-
-function _addOwnedURL(url) {
-  if (url && url !== 'about:blank' && url !== 'favorites://') {
-    _ownedTabURLs.add(url);
-    _saveOwnershipFile(_ownedTabURLs);
-  }
-}
-
-function _removeOwnedURL(url) {
-  if (url) {
-    _ownedTabURLs.delete(url);
-    _saveOwnershipFile(_ownedTabURLs);
-  }
-}
-
 function _updateOwnedURL(oldUrl, newUrl) {
   _removeOwnedURL(oldUrl);
   _addOwnedURL(newUrl);
-}
-
-function _trackTab(tabIndex, url) {
-  _openedTabs.set(tabIndex, { url: url || "", openedAt: Date.now() });
-  _addOwnedURL(url);
-}
-
-function _untrackTab(tabIndex) {
-  const info = _openedTabs.get(tabIndex);
-  if (info?.url) _removeOwnedURL(info.url);
-  _openedTabs.delete(tabIndex);
 }
 
 // Close all MCP-opened tabs on process exit
@@ -324,11 +227,13 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(sig, async () => {
     if (_cleaningUp) return; // Prevent double-exit on rapid signal repeat
     _cleaningUp = true;
+    safari.flushClipboardRestore?.();
     await _cleanupTabs();
     process.exit(0);
   });
 }
 process.on("exit", () => {
+  safari.flushClipboardRestore?.();
   if (_openedTabs.size > 0) {
     console.error(`[Safari MCP] Exit: ${_openedTabs.size} tabs were tracked for cleanup`);
   }
@@ -830,6 +735,7 @@ const _noOwnershipCheck = new Set([
   "get_cookies", "local_storage", "session_storage",
   "get_indexed_db", "list_indexed_dbs", "detect_forms",
   "save_pdf", "analyze_page",
+  "inspect_viewport", "safe_area_insets", "check_pwa", "webkit_compat", "doctor",
 ]);
 
 // Try extension first, fall back to AppleScript.
@@ -911,10 +817,8 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
     }
   } finally {
     safari.setFocusGuard(false);
+    await safari.restoreFocusIfStolen(savedApp);
   }
-
-  // Restore focus if Safari stole it
-  await safari.restoreFocusIfStolen(savedApp);
 
   return result;
 }
@@ -1545,7 +1449,7 @@ server.tool(
   "safari_browser",
   "Browser environment, files, clipboard, dialog, scroll, PDF, and extension maintenance.",
   {
-    action: z.enum(["scroll", "scroll_to", "scroll_to_element", "dialog", "resize", "emulate", "reset_emulation", "upload_file", "paste_image", "save_pdf", "clipboard_read", "clipboard_write", "geolocation", "reload_extension", "observe_layout", "layout_events", "clear_layout_events"]).describe("Browser action"),
+    action: z.enum(["scroll", "scroll_to", "scroll_to_element", "dialog", "resize", "emulate", "reset_emulation", "upload_file", "paste_image", "save_pdf", "clipboard_read", "clipboard_write", "geolocation", "reload_extension", "observe_layout", "layout_events", "clear_layout_events", "inspect_viewport", "safe_area_insets", "check_pwa", "webkit_compat", "doctor"]).describe("Browser action"),
     dialogAction: z.enum(["accept", "dismiss"]).optional().describe("Dialog action for action=dialog"),
     direction: z.enum(["up", "down"]).optional().describe("Scroll direction"),
     amount: z.coerce.number().optional().describe("Scroll amount"),
@@ -1586,6 +1490,11 @@ server.tool(
     if (args.action === "observe_layout") return textResult(await safari.observeLayout(args), { untrusted: true });
     if (args.action === "layout_events") return textResult(await safari.getLayoutEvents(args), { untrusted: true });
     if (args.action === "clear_layout_events") return textResult(await safari.clearLayoutEvents(), { untrusted: true });
+    if (args.action === "inspect_viewport") return textResult(await safari.inspectViewport(), { untrusted: true });
+    if (args.action === "safe_area_insets") return textResult(await safari.safeAreaInsets(), { untrusted: true });
+    if (args.action === "check_pwa") return textResult(await safari.checkPWA(), { untrusted: true });
+    if (args.action === "webkit_compat") return textResult(await safari.webkitCompat(), { untrusted: true });
+    if (args.action === "doctor") return textResult(await safari.doctor());
     return unknownAction("browser", args.action);
   }
 );
@@ -1608,7 +1517,7 @@ server.tool(
 // Stderr only (stdout is reserved for MCP protocol). Skipped if SAFARI_MCP_QUIET=1.
 try {
   if (process.env.SAFARI_MCP_QUIET !== "1") {
-    const bannerStateFile = join(homedir(), ".safari-mcp", "last-banner");
+    const bannerStateFile = join(OWNERSHIP_DIR, "last-banner");
     if (!existsSync(OWNERSHIP_DIR)) mkdirSync(OWNERSHIP_DIR, { recursive: true });
     let lastShown = 0;
     try { lastShown = parseInt(readFileSync(bannerStateFile, "utf8"), 10) || 0; } catch {}

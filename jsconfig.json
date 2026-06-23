@@ -1,0 +1,29 @@
+{
+  "//": "Editor-only type checking for extracted pure helper modules. The legacy runtime remains loose JS; broad checkJs produces noise until that code is annotated.",
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "noEmit": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "strict": false,
+    "noImplicitAny": false,
+    "maxNodeModuleJsDepth": 0,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "typeAcquisition": {
+    "enable": false
+  },
+  "include": [
+    "ownership-match.js",
+    "ownership-state.js",
+    "injected-escape.js",
+    "injected-validators.js",
+    "response.js"
+  ],
+  "exclude": ["node_modules", "extension"]
+}

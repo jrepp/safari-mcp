@@ -12,6 +12,11 @@
   },
   "scripts": {
     "start": "node index.js",
+    "test": "node --test --test-force-exit tests/*.test.js test/*.test.mjs",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc -p jsconfig.json",
     "onboard": "node scripts/onboarding-prompt.js",
     "postinstall": "node scripts/postinstall.cjs || true"
   },
@@ -61,8 +66,13 @@
   ],
   "files": [
     "index.js",
+    "response.js",
     "safari.js",
+    "ownership-match.js",
+    "ownership-state.js",
     "mcp-helpers.js",
+    "injected-validators.js",
+    "injected-escape.js",
     "safari-helper",
     "safari-helper.entitlements",
     "safari-helper.swift",
@@ -76,10 +86,19 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "ws": "^8.19.0"
+    "ws": "^8.21.0"
   },
   "overrides": {
-    "hono": "^4.12.14",
+    "hono": "^4.12.21",
     "@hono/node-server": "^1.19.13"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.9.3",
+    "eslint": "^10.5.0",
+    "globals": "^17.6.0",
+    "jsdom": "^29.1.1",
+    "prettier": "^3.8.4",
+    "typescript": "^6.0.3"
   }
 }
