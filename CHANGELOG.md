@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.0] - 2026-07-03
+
+### Added
+- **Shared HTTP transport (opt-in `SAFARI_MCP_HTTP`)** — run a single Safari MCP daemon that many Claude Code sessions share over StreamableHTTP, instead of a process per session (~17→1 in heavy use; lower memory and startup cost). The default transport stays **stdio**, so existing npm users see **zero behavior change** — this is fully opt-in. Set `SAFARI_MCP_HTTP=1` (and optional `SAFARI_MCP_HTTP_PORT`) to enable. Design notes in `docs/http-transport-design.md`.
+
 ### Changed
 - **`safari_doctor`** now reports the macOS version and flags macOS 26+ (Tahoe), where `CGEvent.postToPid` native clicks/keys can silently no-op even with Accessibility granted (issue #29). Bug reports now carry the single most relevant diagnostic fact, and users on the affected range are steered toward `safari_evaluate` / extension-based clicks for trust-gated forms.
+
+### Internal
+- Extracted the tab-ownership state machine into `ownership-state.js` with dedicated behavioral tests asserting cross-client isolation and TTL expiry (#39).
 
 ## [2.14.0] - 2026-06-18
 
