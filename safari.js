@@ -29,6 +29,7 @@ export { escJsSingleQuote, escAppleScriptString };
 let _helperProc = null;
 const _helperQueue = []; // callbacks waiting for responses
 let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — only kill after 3
+let _helperDisabled = false;
 
 // ── Helper request serialization ──────────────────────────────────────────
 // The Swift helper runs each request on its own background thread, so it can
@@ -54,6 +55,7 @@ function _drainHelperQueue(reason) {
 }
 
 function startHelper() {
+  if (_helperDisabled) return;
   if (_helperProc) return;
   const helperPath = join(__dirname, "safari-helper");
   try {
@@ -84,6 +86,7 @@ let _restartTimer = null;
 let _shuttingDown = false;
 
 function _scheduleRestart() {
+  if (_helperDisabled) return;
   if (_shuttingDown || _restartTimer) return;
   _restartCount++;
   // Exponential backoff: 500ms, 1s, 2s, 4s, max 10s
@@ -427,7 +430,14 @@ function _helperHideSafari(timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
-    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = _helperQueue.indexOf(cb);
+        if (idx >= 0) _helperQueue[idx] = () => {};
+        resolve();
+      }
+    }, timeout);
     function cb() {
       if (resolved) return;
       resolved = true;
@@ -436,7 +446,12 @@ function _helperHideSafari(timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"hideSafari":true}\n'); }
-    catch { clearTimeout(timer); resolve(); }
+    catch {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      resolve();
+    }
   }));
 }
 
@@ -444,7 +459,14 @@ function _helperActivateApp(bundleId, timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
-    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = _helperQueue.indexOf(cb);
+        if (idx >= 0) _helperQueue[idx] = () => {};
+        resolve();
+      }
+    }, timeout);
     function cb() {
       if (resolved) return;
       resolved = true;
@@ -453,7 +475,12 @@ function _helperActivateApp(bundleId, timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
-    catch { clearTimeout(timer); resolve(); }
+    catch {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      resolve();
+    }
   }));
 }
 
@@ -634,6 +661,13 @@ async function osascriptFast(script, { timeout = 10000 } = {}) {
           if (_helperProc) return await _osascriptFastHelper(retryScript, timeout);
           return await osascript(retryScript, { timeout });
         }
+      }
+      if (err?.message?.includes("safari-helper timeout") || err?.message?.includes("helper process")) {
+        _helperDisabled = true;
+        try { _helperProc?.kill(); } catch (_) {}
+        _helperProc = null;
+        _helperConsecutiveTimeouts = 0;
+        return osascript(script, { timeout });
       }
       throw err;
     }
@@ -851,7 +885,14 @@ function _helperGetFrontApp(timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(null); return; }
     let resolved = false;
-    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, timeout);
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        const idx = _helperQueue.indexOf(cb);
+        if (idx >= 0) _helperQueue[idx] = () => {};
+        resolve(null);
+      }
+    }, timeout);
     function cb(line) {
       if (resolved) return;
       resolved = true;
@@ -860,7 +901,12 @@ function _helperGetFrontApp(timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"getFrontApp":true}\n'); }
-    catch { clearTimeout(timer); resolve(null); }
+    catch {
+      const idx = _helperQueue.indexOf(cb);
+      if (idx >= 0) _helperQueue.splice(idx, 1);
+      clearTimeout(timer);
+      resolve(null);
+    }
   }));
 }
 
