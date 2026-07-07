@@ -10,7 +10,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { startTransport } from "./transport.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
-import { textResult, jsonResult, imageResult, errorResult } from "./response.js";
+import { textResult, jsonResult, imageResult, errorResult, diagnosticErrorResult } from "./response.js";
+import { addTraceEvent, currentTrace, runWithTrace, traceDependency } from "./trace.js";
 import {
   OWNERSHIP_DIR, BLANK_TAB_SENTINEL,
   _openedTabs, _ownedTabURLs,
@@ -537,16 +538,18 @@ async function _checkPrimaryExtension() {
 
 // Send command to primary instance's extension via proxy
 async function _proxyToExtension(type, payload, timeoutMs = 30000) {
-  const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-command`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-local-token": PROXY_TOKEN },
-    body: JSON.stringify({ type, payload }),
-    signal: AbortSignal.timeout(timeoutMs),
+  return traceDependency("extension.proxy", { command: type, timeoutMs }, async () => {
+    const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/proxy-command`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-local-token": PROXY_TOKEN },
+      body: JSON.stringify({ type, payload }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return data.result;
   });
-  if (!res.ok) throw new Error(`Proxy error: ${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return data.result;
 }
 
 let _extensionLastPollTime = 0;
@@ -602,7 +605,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
     return _proxyToExtension(type, payload, timeoutMs);
   }
 
-  return new Promise((resolve, reject) => {
+  return traceDependency("extension.bridge", { command: type, timeoutMs }, () => new Promise((resolve, reject) => {
     if (!_extensionConnected) {
       reject(new Error("Extension not connected"));
       return;
@@ -627,7 +630,7 @@ function sendToExtension(type, payload = {}, timeoutMs = 30000) {
       // Otherwise, queue for HTTP polling
       _commandQueue.push(command);
     }
-  });
+  }));
 }
 
 // Per-command timeouts — fast commands get short timeouts, nav/screenshot get longer ones
@@ -741,22 +744,26 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
         const isPermissionDenied = typeof result === 'string' && result.includes('__SCREENSHOT_PERMISSION_DENIED__');
         const isFailed = result === null || (typeof result === 'string' && result.startsWith('Element not found'));
         if (isPermissionDenied) {
+          addTraceEvent("extension.bridge", "semantic-failure", { command: extensionType, reason: "permission denied" });
           console.error(`[Safari MCP] ${extensionType} permission denied (${Date.now() - t0}ms) — falling back to AppleScript`);
         } else if (isCspError) {
+          addTraceEvent("extension.bridge", "semantic-failure", { command: extensionType, reason: "CSP blocked" });
           console.error(`[Safari MCP] ${extensionType} CSP blocked: ${result?.substring(0, 100)} (${Date.now() - t0}ms) — falling back to AppleScript`);
         } else if (isFailed && _nullMeansFailure.has(extensionType)) {
+          addTraceEvent("extension.bridge", "semantic-failure", { command: extensionType, reason: typeof result === "string" ? result.slice(0, 120) : "null result" });
           console.error(`[Safari MCP] ${extensionType} extension failed: ${result} (${Date.now() - t0}ms) — falling back to AppleScript`);
         } else {
           console.error(`[Safari MCP] ${extensionType} via extension (${Date.now() - t0}ms)`);
           usedExtension = true;
         }
       } catch (err) {
+        addTraceEvent("extension.bridge", "fallback-triggered", { command: extensionType, error: err.message });
         console.error(`[Safari MCP] ${extensionType} extension failed: ${err.message} — falling back to AppleScript`);
       }
     }
     if (!usedExtension) {
       const t0 = Date.now();
-      result = await fallbackFn();
+      result = await traceDependency("applescript.fallback", { command: extensionType }, fallbackFn);
       console.error(`[Safari MCP] ${extensionType} via AppleScript (${Date.now() - t0}ms)`);
     }
   } finally {
@@ -790,6 +797,24 @@ const server = new McpServer({
   version: _pkgVersion,
   description: "Safari browser automation - lightweight, keeps logins",
 });
+
+const _registerTool = server.tool.bind(server);
+server.tool = (...args) => {
+  const cb = args[args.length - 1];
+  if (typeof cb === "function") {
+    const toolName = args[0];
+    args[args.length - 1] = async (...cbArgs) => {
+      return runWithTrace(toolName, async () => {
+        try {
+          return await cb(...cbArgs);
+        } catch (err) {
+          return diagnosticErrorResult(err, { toolName, trace: currentTrace() });
+        }
+      });
+    };
+  }
+  return _registerTool(...args);
+};
 
 // ========== NAVIGATION ==========
 
@@ -2390,7 +2415,7 @@ try {
       let version = "?";
       try { version = JSON.parse(readFileSync(pkgPath, "utf8")).version; } catch {}
       console.error("");
-      console.error(`[Safari MCP] 🦁 v${version} ready — 96 tools, native WebKit, zero Chrome.`);
+      console.error(`[Safari MCP] 🦁 v${version} ready — 97 tools, native WebKit, zero Chrome.`);
       console.error(`[Safari MCP] ⭐ Like it? Star: https://github.com/achiya-automation/safari-mcp`);
       console.error("");
       try { writeFileSync(bannerStateFile, String(Date.now()), { mode: 0o600 }); } catch {}

@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } from "./injected-validators.js";
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
+import { addTraceEvent } from "./trace.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
@@ -47,8 +48,18 @@ let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — kill thres
 // silently return the wrong tab when the user was browsing concurrently.
 let _helperLock = Promise.resolve();
 function _withHelperLock(makePromise) {
-  const result = _helperLock.then(makePromise, makePromise);
-  _helperLock = result.then(() => {}, () => {});
+  return _withHelperLockUntil(() => {
+    const result = makePromise();
+    return { result, release: result };
+  });
+}
+
+function _withHelperLockUntil(makeOperation) {
+  const operation = _helperLock.then(makeOperation, makeOperation);
+  const result = operation.then(({ result }) => result);
+  _helperLock = operation
+    .then(({ release, result }) => release ?? result)
+    .then(() => {}, () => {});
   return result;
 }
 
@@ -749,62 +760,99 @@ async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } =
 }
 
 function _osascriptFastHelper(script, timeout) {
-  return _withHelperLock(() => new Promise((resolve, reject) => {
-    let resolved = false;
-    const timer = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      // DON'T remove from queue — replace with a proof-of-life consumer to maintain
-      // FIFO order. A heavy page (e.g. the Airtable SPA) makes `do JavaScript` legitimately
-      // slow: the call exceeds `timeout`ms, but the helper IS alive and emits its response a
-      // moment later. That late response proves liveness — so when it arrives we reset the
-      // consecutive-timeout counter instead of discarding the signal. Killing the daemon on a
-      // slow page is pointless (the fresh daemon hits the same slow page) and disruptive.
-      // Only a helper that NEVER replies (truly hung) accumulates timeouts with no late reply.
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => { _helperConsecutiveTimeouts = 0; }; // late reply ⇒ alive
-      _helperConsecutiveTimeouts++;
-      if (_helperConsecutiveTimeouts >= 5) {
-        console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts with no late replies — killing daemon`);
+  return _withHelperLockUntil(() => {
+    const startedAt = Date.now();
+    addTraceEvent("safari-helper", "start", { command: "AppleScript", timeoutMs: timeout, scriptBytes: script.length });
+    let releaseLock;
+    const release = new Promise((resolve) => { releaseLock = resolve; });
+    const result = new Promise((resolve, reject) => {
+      let callerSettled = false;
+      let lockReleased = false;
+      let timer = null;
+      let hardTimer = null;
+
+      function releaseOnce() {
+        if (lockReleased) return;
+        lockReleased = true;
+        if (timer) clearTimeout(timer);
+        if (hardTimer) clearTimeout(hardTimer);
+        releaseLock();
+      }
+
+      function settleCaller(fn, value) {
+        if (callerSettled) return;
+        callerSettled = true;
+        fn(value);
+      }
+
+      timer = setTimeout(() => {
+        _helperConsecutiveTimeouts++;
+        addTraceEvent("safari-helper", "timeout", {
+          command: "AppleScript",
+          timeoutMs: timeout,
+          durationMs: Date.now() - startedAt,
+          consecutiveTimeouts: _helperConsecutiveTimeouts,
+        });
+        // Keep the real callback in the FIFO queue. The Swift helper may still emit
+        // its 30s timeout response later; holding the mutex until that line arrives
+        // prevents the next AppleScript command from stacking another blocked GCD task.
+        settleCaller(reject, new Error("safari-helper timeout"));
+      }, timeout);
+
+      hardTimer = setTimeout(() => {
+        if (lockReleased) return;
+        addTraceEvent("safari-helper", "hard-timeout-kill", {
+          command: "AppleScript",
+          durationMs: Date.now() - startedAt,
+          timeoutMs: Math.max(timeout, 30000) + 2000,
+        });
+        console.error("[Safari MCP] safari-helper did not reply after its hard AppleScript timeout — killing daemon");
         _helperProc?.kill();
         _helperProc = null;
         _helperConsecutiveTimeouts = 0;
-        // The killed proc's 'exit' handler also schedules a restart; guard the timer so only
-        // one respawn wins (startHelper is now idempotent too) — no second, orphaned daemon.
+        releaseOnce();
         setTimeout(() => { if (!_shuttingDown && !_helperProc) startHelper(); }, 100);
-      }
-      reject(new Error("safari-helper timeout"));
-    }, timeout);
+      }, Math.max(timeout, 30000) + 2000);
 
-    function cb(line) {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      _helperConsecutiveTimeouts = 0;
+      function cb(line) {
+        _helperConsecutiveTimeouts = 0;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.error) {
+            addTraceEvent("safari-helper", "failed", { command: "AppleScript", durationMs: Date.now() - startedAt, error: parsed.error });
+            settleCaller(reject, new Error(parsed.error));
+          } else {
+            addTraceEvent("safari-helper", "ok", { command: "AppleScript", durationMs: Date.now() - startedAt });
+            settleCaller(resolve, parsed.result ?? "");
+          }
+        } catch {
+          addTraceEvent("safari-helper", "ok", { command: "AppleScript", durationMs: Date.now() - startedAt, unparseableJson: true });
+          settleCaller(resolve, line);
+        } finally {
+          releaseOnce();
+        }
+      }
+
+      if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
+        addTraceEvent("safari-helper", "failed", { command: "AppleScript", durationMs: Date.now() - startedAt, error: "safari-helper not available" });
+        settleCaller(reject, new Error("safari-helper not available"));
+        releaseOnce();
+        return;
+      }
+      _helperQueue.push(cb);
       try {
-        const parsed = JSON.parse(line);
-        if (parsed.error) reject(new Error(parsed.error));
-        else resolve(parsed.result ?? "");
-      } catch {
-        resolve(line);
+        _helperProc.stdin.write(JSON.stringify({ script }) + "\n");
+      } catch (writeErr) {
+        const idx = _helperQueue.indexOf(cb);
+        if (idx >= 0) _helperQueue.splice(idx, 1);
+        addTraceEvent("safari-helper", "failed", { command: "AppleScript", durationMs: Date.now() - startedAt, error: "write failed: " + writeErr.message });
+        settleCaller(reject, new Error("safari-helper write failed: " + writeErr.message));
+        releaseOnce();
       }
-    }
+    });
 
-    if (!_helperProc || !_helperProc.stdin || !_helperProc.stdin.writable) {
-      clearTimeout(timer);
-      reject(new Error("safari-helper not available"));
-      return;
-    }
-    _helperQueue.push(cb);
-    try {
-      _helperProc.stdin.write(JSON.stringify({ script }) + "\n");
-    } catch (writeErr) {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
-      clearTimeout(timer);
-      reject(new Error("safari-helper write failed: " + writeErr.message));
-    }
-  }));
+    return { result, release };
+  });
 }
 
 // Ask the helper for its permission state (CGEvent posting + screen capture) without

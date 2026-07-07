@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.3] - 2026-07-07
+
+### Changed
+- Refreshed local development tooling and registry metadata for the 97-tool package surface.
+
 ## [2.15.2] - 2026-07-05
 
 ### Fixed
