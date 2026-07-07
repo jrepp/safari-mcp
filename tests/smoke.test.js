@@ -42,7 +42,7 @@ test("server starts and lists all registered tools", async () => {
   const expectedToolCount = await getExpectedToolCount();
   const { tools } = await listRegisteredTools();
 
-  assert.ok(expectedToolCount >= 19, "index.js should define the compact grouped tool surface");
+  assert.ok(expectedToolCount >= 80, "index.js should define at least 80 tools");
   assert.equal(tools.length, expectedToolCount);
 });
 

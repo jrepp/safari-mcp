@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="social-preview.png" alt="Safari MCP Server — native browser automation tools for AI agents on macOS" width="100%">
+<img src="social-preview.png" alt="Safari MCP Server — 97 native browser automation tools for AI agents on macOS" width="100%">
 
 <br/>
 
@@ -24,9 +24,9 @@
 <a href="https://insiders.vscode.dev/redirect?url=vscode-insiders:mcp/install?%7B%22safari-mcp%22%3A%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D%7D"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?logo=visual-studio-code&logoColor=white" alt="Install in VS Code Insiders"></a>
 <a href="cursor://anysphere.cursor-deeplink/mcp/install?name=safari-mcp&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22safari-mcp%22%5D%7D"><img src="https://img.shields.io/badge/Cursor-Install_Server-f97316?logo=cursor&logoColor=white" alt="Install in Cursor"></a>
 
-**19 compact tools** · **No Chrome/Puppeteer/Playwright needed** · **~5ms per command** · **60% less CPU than Chrome**
+**97 tools** · **No Chrome/Puppeteer/Playwright needed** · **~5ms per command** · **60% less CPU than Chrome**
 
-[Quick Start](#quick-start) · [Tools](#tools-19) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
+[Quick Start](#quick-start) · [All 97 Tools](#tools-97) · [Examples](examples/) · [Why Safari MCP?](#safari-mcp-vs-alternatives) · [Architecture](#architecture) · [Changelog](CHANGELOG.md)
 
 ![Safari MCP Demo](https://github.com/achiya-automation/safari-mcp/raw/main/assets/safari-mcp-promo.gif)
 
@@ -44,15 +44,17 @@ Your AI agent needs to browse. So it either:
 
 Your AI drives the **Safari you're already logged into** — Gmail, GitHub, Ahrefs, Slack, banking.
 
-Native WebKit. ~60% less CPU. Background operation. Compact tool surface. One `npx` command. macOS only.
+Native WebKit. ~60% less CPU. Background operation. 97 tools. One `npx` command. macOS only.
 
-> 📰 **Featured on HackerNoon:** [I Had to Reverse-Engineer React, Shadow DOM, and CSP to Automate Safari Without Chrome](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
+> 📰 **Featured on freeCodeCamp:** [How to Connect Your AI Coding Agent to a Browser on macOS](https://www.freecodecamp.org/news/how-to-connect-your-ai-coding-agent-to-a-browser-on-macos/) · [HackerNoon: Reverse-Engineering React, Shadow DOM, and CSP](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
+
+> 🍎 **Apple shipped an official Safari MCP** (Safari Technology Preview 247, July 2026). It's built on `safaridriver` for isolated debugging sessions. safari-mcp drives the **real Safari you're already logged into** — on stable Safari, with 97 tools. See the full comparison below.
 
 ---
 
 ## Highlights
 
-- **19 compact tools** — navigation, clicks, forms, screenshots, network, storage, accessibility, and more
+- **97 tools** — navigation, clicks, forms, screenshots, network, storage, accessibility, and more
 - **Zero heat** — native WebKit on Apple Silicon, ~60% less CPU than Chrome
 - **Your real browser** — keeps all logins, cookies, sessions (Gmail, GitHub, Ahrefs, etc.)
 - **Background operation** — Safari stays in the background, no window stealing
@@ -302,78 +304,209 @@ The recommended pattern for AI agents using Safari MCP:
 
 ---
 
-## Tools (20)
+## Tools (97)
 
 <details>
-<summary><b>Click to expand the compact tool list</b></summary>
+<summary><b>Click to expand the full tool list — organized by category</b></summary>
 
+### Navigation (4)
 | Tool | Description |
 |------|-------------|
-| `safari_navigate` | Navigate the active MCP-owned tab |
-| `safari_read_page` | Read text or HTML source (`format: "source"`) |
-| `safari_snapshot` | Structured page state with refs for interaction |
-| `safari_click` | Click by ref, selector, text, or coordinates; supports native/double/right/wait/read options |
-| `safari_fill` | Fill text directly or through native paste; optional state verification |
-| `safari_screenshot` | Viewport/full-page screenshot, or element screenshot with `selector`; optional `overlay` diagnostics |
-| `safari_wait` | Wait for selector/text or fixed milliseconds |
-| `safari_evaluate` | Execute JavaScript in the current page |
-| `safari_tabs` | `list`, `search`, `new`, `switch`, `close`, `wait_for_new`; prefer `search` with `activate: true` before opening a new tab |
-| `safari_history` | `back`, `forward`, `reload` |
-| `safari_pointer` | `hover`, `drag`, and `hit_test`, with native hover support |
-| `safari_keyboard` | `press`, `type`, `replace_editor`, with native support |
-| `safari_form` | `clear`, `select`, `fill_all`, `submit`, `verify`, `detect`, react-select helpers |
-| `safari_extract` | Element/query/style/layout/dom_tree/canvas/visual/a11y/tables/meta/images/links/analyze/performance/CSS coverage |
-| `safari_storage` | Cookies, localStorage, sessionStorage, IndexedDB, export/import |
-| `safari_network` | Overview, capture, details, clear, mock, clear mocks, throttle |
-| `safari_console` | Start, get, filter by level, clear console capture |
-| `safari_site` | Discover and call optional site-provided hooks for app-state inspection and native workflows |
-| `safari_browser` | Scroll, dialog, resize, layout observation, emulation, files, PDF, clipboard, geolocation, extension reload |
-| `safari_run_script` | Batch multiple lower-level `safari.js` actions in one call |
+| `safari_navigate` | Navigate to URL (auto HTTPS, wait for load) |
+| `safari_go_back` | Go back in history |
+| `safari_go_forward` | Go forward in history |
+| `safari_reload` | Reload page (optional hard reload) |
+
+### Page Reading (3)
+| Tool | Description |
+|------|-------------|
+| `safari_read_page` | Get title, URL, and text content |
+| `safari_get_source` | Get full HTML source |
+| `safari_navigate_and_read` | Navigate + read in one call |
+
+### Click & Interaction (6)
+| Tool | Description |
+|------|-------------|
+| `safari_click` | Click by CSS selector, visible text, or coordinates |
+| `safari_double_click` | Double-click (select word, etc.) |
+| `safari_right_click` | Right-click (context menu) |
+| `safari_hover` | Hover over element |
+| `safari_click_and_wait` | Click + wait for navigation |
+| `safari_click_and_read` | Click then return the updated page — saves a round-trip (React Router + full loads) |
+
+### Form Input (11)
+| Tool | Description |
+|------|-------------|
+| `safari_fill` | Fill input (React/Vue/Angular compatible) |
+| `safari_clear_field` | Clear input field |
+| `safari_select_option` | Select dropdown option |
+| `safari_fill_form` | Batch fill multiple fields |
+| `safari_fill_and_submit` | Fill form + submit in one call |
+| `safari_type_text` | Type real keystrokes (JS-based, no System Events) |
+| `safari_press_key` | Press key with modifiers |
+| `safari_react_select_set` | Set a react-select v5 value via React fiber — bypasses the menu UI |
+| `safari_react_select_list_options` | List a react-select v5 dropdown's options without opening it |
+| `safari_replace_editor` | Replace all content in a code editor (Monaco, CodeMirror, Ace, ProseMirror) |
+| `safari_verify_state` | Verify an editor's framework-level state matches expected — catch stale DOM before Submit |
+
+### Screenshots & PDF (3)
+| Tool | Description |
+|------|-------------|
+| `safari_screenshot` | Screenshot as PNG (viewport or full page) |
+| `safari_screenshot_element` | Screenshot a specific element |
+| `safari_save_pdf` | Export page as PDF |
+
+### Scroll (3)
+| Tool | Description |
+|------|-------------|
+| `safari_scroll` | Scroll up/down by pixels |
+| `safari_scroll_to` | Scroll to exact position |
+| `safari_scroll_to_element` | Smooth scroll to element |
+
+### Tab Management (5)
+| Tool | Description |
+|------|-------------|
+| `safari_list_tabs` | List all tabs (index, title, URL) |
+| `safari_new_tab` | Open new tab (background, no focus steal) |
+| `safari_close_tab` | Close tab |
+| `safari_switch_tab` | Switch to tab by index |
+| `safari_wait_for_new_tab` | Wait for a new tab (e.g. OAuth popup) and auto-switch to it |
+
+### Wait (2)
+| Tool | Description |
+|------|-------------|
+| `safari_wait_for` | Wait for element, text, or URL change |
+| `safari_wait` | Wait for specified milliseconds |
+
+### JavaScript (1)
+| Tool | Description |
+|------|-------------|
+| `safari_evaluate` | Execute arbitrary JavaScript, return result |
+| `safari_eval_file` | Execute JavaScript read from a file path (avoids huge inline scripts) |
+
+### Element Inspection (4)
+| Tool | Description |
+|------|-------------|
+| `safari_get_element` | Element details (tag, rect, attrs, visibility) |
+| `safari_query_all` | Find all matching elements |
+| `safari_get_computed_style` | Computed CSS styles |
+| `safari_detect_forms` | Auto-detect all forms with field selectors |
+
+### Accessibility (2)
+| Tool | Description |
+|------|-------------|
+| `safari_accessibility_snapshot` | Full a11y tree: roles, ARIA, focusable elements |
+| `safari_snapshot` | Accessibility tree with ref IDs for every interactive element — preferred way to see page state |
+
+### Drag & Drop (1)
+| Tool | Description |
+|------|-------------|
+| `safari_drag` | Drag between elements or coordinates |
+
+### File Operations (2)
+| Tool | Description |
+|------|-------------|
+| `safari_upload_file` | Upload file via JS DataTransfer (no file dialog!) |
+| `safari_paste_image` | Paste image into editor (no clipboard touch!) |
+
+### Dialog & Window (2)
+| Tool | Description |
+|------|-------------|
+| `safari_handle_dialog` | Handle alert/confirm/prompt |
+| `safari_resize` | Resize browser window |
+
+### Device Emulation (2)
+| Tool | Description |
+|------|-------------|
+| `safari_emulate` | Emulate device (iPhone, iPad, Pixel, Galaxy) |
+| `safari_reset_emulation` | Reset to desktop |
+
+### Cookies & Storage (11)
+| Tool | Description |
+|------|-------------|
+| `safari_get_cookies` | Get all cookies |
+| `safari_set_cookie` | Set cookie with all options |
+| `safari_delete_cookies` | Delete one or all cookies |
+| `safari_local_storage` | Read localStorage |
+| `safari_set_local_storage` | Write localStorage |
+| `safari_delete_local_storage` | Delete/clear localStorage |
+| `safari_session_storage` | Read sessionStorage |
+| `safari_set_session_storage` | Write sessionStorage |
+| `safari_delete_session_storage` | Delete/clear sessionStorage |
+| `safari_export_storage` | Export all storage as JSON (backup/restore sessions) |
+| `safari_import_storage` | Import storage state from JSON |
+
+### Clipboard (2)
+| Tool | Description |
+|------|-------------|
+| `safari_clipboard_read` | Read clipboard text |
+| `safari_clipboard_write` | Write text to clipboard |
+
+### Network (6)
+| Tool | Description |
+|------|-------------|
+| `safari_network` | Quick network requests via Performance API |
+| `safari_start_network_capture` | Start detailed capture (fetch + XHR) |
+| `safari_network_details` | Get captured requests with headers/timing |
+| `safari_clear_network` | Clear captured requests |
+| `safari_mock_route` | Mock network responses (intercept fetch/XHR) |
+| `safari_clear_mocks` | Remove all network mocks |
+
+### Console (4)
+| Tool | Description |
+|------|-------------|
+| `safari_start_console` | Start capturing console messages |
+| `safari_get_console` | Get all captured messages |
+| `safari_clear_console` | Clear captured messages |
+| `safari_console_filter` | Filter by level (log/warn/error) |
+
+### Performance (2)
+| Tool | Description |
+|------|-------------|
+| `safari_performance_metrics` | Navigation timing, Web Vitals, memory |
+| `safari_throttle_network` | Simulate slow-3g/fast-3g/4g/offline |
+
+### Data Extraction (4)
+| Tool | Description |
+|------|-------------|
+| `safari_extract_tables` | Tables as structured JSON |
+| `safari_extract_meta` | All meta: OG, Twitter, JSON-LD, canonical |
+| `safari_extract_images` | Images with dimensions and loading info |
+| `safari_extract_links` | Links with rel, external/nofollow detection |
+
+### Advanced (7)
+| Tool | Description |
+|------|-------------|
+| `safari_override_geolocation` | Override browser geolocation |
+| `safari_list_indexed_dbs` | List IndexedDB databases |
+| `safari_get_indexed_db` | Read IndexedDB records |
+| `safari_css_coverage` | Find unused CSS rules |
+| `safari_analyze_page` | Full page analysis in one call |
+| `safari_doctor` | Diagnose the macOS permission + daemon chain (Apple Events, Accessibility, Screen Recording, codesign) with per-failure fixes |
+| `safari_reload_extension` | Hot-reload the Safari MCP Bridge extension without a manual toggle |
+
+### Automation (1)
+| Tool | Description |
+|------|-------------|
+| `safari_run_script` | Run multiple actions in a single call (batch) |
+
+### Native Input — CGEvent (4)
+| Tool | Description |
+|------|-------------|
+| `safari_native_click` | OS-level mouse click (CGEvent, `isTrusted: true`) — bypasses WAF/bot detection when `safari_click` is blocked (405/403) |
+| `safari_native_hover` | OS-level cursor hover — triggers real `:hover`/`mouseenter` for tooltips and obfuscated UIs |
+| `safari_native_type` | Insert text via the real paste pipeline — ProseMirror/Slate/Draft.js process it natively so Submit sends real data |
+| `safari_native_keyboard` | OS-level keypress + modifiers to Safari, no focus steal — reaches React trust-gated handlers (Discord/Slack send) |
+
+### iOS & WebKit Validation (4)
+| Tool | Description |
+|------|-------------|
+| `safari_inspect_viewport` | Validate the `<meta name=viewport>` tag for iOS Safari (device-width, zoom/WCAG, viewport-fit) |
+| `safari_safe_area_insets` | Read live safe-area-inset values + viewport-fit / `env()` usage (notch / Dynamic Island) |
+| `safari_check_pwa` | Audit iOS "Add to Home Screen" / PWA readiness (apple-touch-icon, manifest, theme-color, splash) |
+| `safari_webkit_compat` | Check page CSS against this Safari via `CSS.supports()` — unsupported props, missing `-webkit-` prefixes, known quirks |
 
 </details>
-
-### Site-Provided Hooks
-
-Sites can expose app-aware inspection and workflow hooks to Safari MCP:
-
-```js
-window.__safariMcp = {
-  name: "Example App",
-  version: "1.0.0",
-  getState() {
-    return { route: app.router.currentRoute, selectedIds: app.store.selectedIds };
-  },
-  hooks: {
-    inspectSelection: {
-      readOnly: true,
-      description: "Return selected domain objects",
-      run(args, context) {
-        return app.store.getSelectedObjects();
-      }
-    },
-    applyBulkLabel: {
-      readOnly: false,
-      description: "Apply a label through the app state model",
-      inputSchema: { type: "object", properties: { label: { type: "string" } } },
-      run(args) {
-        return app.actions.applyLabel(args.label);
-      }
-    }
-  }
-};
-```
-
-Use `safari_site action=list` to discover hooks, `action=state` for app state, and `action=call` to invoke one. Hooks marked `readOnly:false` require `allowWrite:true` and an MCP-owned tab.
-
-To generate a site-onboarding prompt for a coding agent:
-
-```bash
-safari-mcp --prompt --site-name "Example App" | codex
-# or
-npx safari-mcp -- --prompt --site-name "Example App" | claude
-```
-
-The prompt asks the site owner which behaviors should be exposed, explains the hook model, and asks the agent to produce a steering prompt before implementation.
 
 ---
 
@@ -399,7 +532,7 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 | Your logins | ✅ Yes | ✅ Yes | ❌ No |
 | macOS native | ✅ WebKit | ❌ Chromium | ❌ Chromium/WebKit |
 | Browser dependencies | None | Chrome + debug port | Playwright runtime |
-| Tools | 80 | ~30 | ~25 |
+| Tools | 97 | ~30 | ~25 |
 | File upload | JS (no dialog) | CDP | Playwright API |
 | Image paste | JS (no clipboard) | CDP | Playwright API |
 | Focus steal | ❌ Background | ❌ Background | ❌ Headless |
@@ -409,13 +542,31 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 
 > **Tip:** Use Safari MCP for daily browsing tasks (95% of work) and Chrome DevTools MCP only for Lighthouse/Performance audits.
 
+### vs Apple's Official Safari MCP (safaridriver)
+
+In Safari Technology Preview 247 (July 2026), Apple shipped an **official** Safari MCP server built on `safaridriver`. That's great validation for the category — and it's built for a different job. Apple's server drives an **isolated WebDriver automation session** for debugging; safari-mcp drives the **real Safari you're already logged into**.
+
+| | 🦁 safari-mcp *(this repo)* | Apple `safaridriver --mcp` |
+|---|:---:|:---:|
+| **Your real logins / cookies** | ✅ Your actual Safari | ⚠️ Isolated automation session — no access to AutoFill or browsing activity |
+| **Runs on** | ✅ Stable Safari, every Mac | ❌ Safari Technology Preview 247 only |
+| **Background (no focus steal)** | ✅ Yes | ❌ Dedicated window with a "controlled by automation" banner |
+| **Tools** | **97** | ~17 |
+| **Storage** (cookies, localStorage, IndexedDB) | ✅ 10 tools | ❌ |
+| **Network mocking + throttling** | ✅ Yes | ❌ Read-only network inspection |
+| **Device emulation** (iPhone, iPad) | ✅ Yes | ⚠️ Viewport + media type only |
+| **Setup** | `npx safari-mcp` | Enable "remote automation and external agents" in STP |
+| **Official Apple support** | ❌ Community (MIT) | ✅ Apple, WebDriver-standard |
+
+> **When Apple's server is the right pick:** you specifically want a clean-room, WebDriver-standard session for compatibility debugging and you already run STP. **For everything else — daily automation on the browser you're already signed into, on stable Safari — safari-mcp is built for exactly that.**
+
 ### Why Safari MCP and Not the Other Safari MCP Projects?
 
 There are several "safari-mcp" projects floating around. Here's how they compare:
 
 | Feature | **🦁 safari-mcp** *(this repo)* | [lxman/safari-mcp-server](https://github.com/lxman/safari-mcp-server) | [Epistates/MCPSafari](https://github.com/Epistates/MCPSafari) | [HayoDev/safari-devtools-mcp](https://github.com/HayoDev/safari-devtools-mcp) |
 |---------|:------------------------------:|:----------------------:|:------------:|:----------------------:|
-| **Tools** | **80** | ~10 | 23 | ~15 |
+| **Tools** | **97** | ~10 | 23 | ~15 |
 | **Install** | `npx safari-mcp` | Manual | Binary | `npx` |
 | **Engine** | **Dual** (Extension + AppleScript) | WebDriver | Extension only | DevTools Protocol |
 | **Keeps your real Safari logins** | ✅ Yes | ⚠️ Limited | ✅ Yes | ❌ Debug session |
@@ -540,11 +691,11 @@ Safari MCP needs these one-time permissions:
 | JavaScript from Apple Events | Safari → Develop menu | Required for `do JavaScript` |
 | Automation → Safari | System Settings → Privacy & Security → Automation | Required for all AppleScript-backed tools |
 | Screen Recording | System Settings → Privacy & Security → Screen Recording | Required for `safari_screenshot` |
-| Accessibility (safari-helper) | System Settings → Privacy & Security → Accessibility | Required for `safari_click` with `native: true`, `safari_keyboard` with `native: true`, `safari_pointer` native hover, and `safari_browser` `save_pdf` |
+| Accessibility (safari-helper) | System Settings → Privacy & Security → Accessibility | Required for `safari_native_click`, `safari_native_keyboard`, `safari_native_hover` and `safari_save_pdf` |
 
-### Granting Accessibility to safari-helper
+### Granting Accessibility to safari-helper (required for `safari_native_*`)
 
-Native click, keyboard, hover, and PDF actions inject OS-level `CGEvent` events into Safari without stealing focus. macOS requires the underlying helper binary to be approved in **Accessibility** before those events can reach a non-frontmost window.
+The `safari_native_click`, `safari_native_keyboard` and `safari_native_hover` tools inject OS-level `CGEvent` events into Safari without stealing focus. macOS requires the underlying helper binary to be approved in **Accessibility** before those events can reach a non-frontmost window.
 
 1. Open **System Settings → Privacy & Security → Accessibility**.
 2. Click `+` (unlock with your password if needed).
@@ -556,7 +707,7 @@ Native click, keyboard, hover, and PDF actions inject OS-level `CGEvent` events 
 
 The postinstall script re-signs the helper with a stable identifier (`com.achiya-automation.safari-mcp`) so this permission survives future upgrades — without that step, every `npm update` would silently revoke approval because the binary's adhoc-signed identifier changes per build.
 
-If `safari_click` with `native: true` reports success but the page doesn't react (no `isTrusted: true` click events fire), the helper is most likely missing this approval. Non-native actions don't need it.
+If `safari_native_click` reports success but the page doesn't react (no `isTrusted: true` click events fire), the helper is most likely missing this approval. The `safari_*` (non-`native_`) tools don't need it.
 
 ### Granting Automation → Safari (important for IDE users)
 
@@ -579,9 +730,9 @@ That call registers the Terminal app in the Automation database and then trigger
 | "AppleScript error" | Enable "Allow JavaScript from Apple Events" in Safari → Develop |
 | "Not authorized to send Apple events to Safari" | Grant Automation → Safari to your IDE (see above) |
 | "Not authorized" after `npm update` | Updating changes the binary's cdhash — macOS silently revokes Automation permission. Re-run the `osascript` one-liner above to re-grant it |
-| Native click reports success but page doesn't react | Add `safari-helper` to **System Settings → Privacy & Security → Accessibility** (see [Granting Accessibility](#granting-accessibility-to-safari-helper) above). Confirm by attaching a `click` listener with `{capture:true}` in the page console — without the grant, no `isTrusted: true` event fires |
+| `safari_native_click` reports success but page doesn't react | Add `safari-helper` to **System Settings → Privacy & Security → Accessibility** (see [Granting Accessibility](#granting-accessibility-to-safari-helper-required-for-safari_native_) above). Confirm by attaching a `click` listener with `{capture:true}` in the page console — without the grant, no `isTrusted: true` event fires |
 | Screenshots empty | Grant Screen Recording permission to Terminal/VS Code |
-| Tab not found | Call `safari_tabs` with `action: "list"` to refresh tab indices |
+| Tab not found | Call `safari_list_tabs` to refresh tab indices |
 | Hebrew keyboard issues | All typing uses JS events — immune to keyboard layout |
 | HTTPS blocked | `safari_navigate` auto-tries HTTPS first, falls back to HTTP |
 | Safari steals focus | Ensure you're on latest version — `newTab` restores your active tab |
@@ -645,7 +796,7 @@ Built by the author of Safari MCP. [Start a conversation →](https://achiya-aut
 When an AI agent drives Safari MCP, it gets things a headless browser can't:
 
 - **Real authenticated sessions** — Gmail, GitHub, Ahrefs, Slack, banking dashboards are all already logged in
-- **Framework-aware form filling** — `safari_form` with `action: "submit"` calls React/Vue/Angular setters natively, no guessing whether `input` events fired
+- **Framework-aware form filling** — `safari_fill_and_submit` calls React/Vue/Angular setters natively, no guessing whether `input` events fired
 - **Background operation** — the agent works in parallel while you keep using your Mac
 - **One MCP call per workflow** — `safari_run_script` batches navigation + clicks + extraction into a single roundtrip
 
@@ -682,7 +833,7 @@ If Safari MCP saves you from Chrome overhead, **a star helps others discover it:
 
 [![Star this repo](https://img.shields.io/github/stars/achiya-automation/safari-mcp?style=social)](https://github.com/achiya-automation/safari-mcp)
 
-[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2080%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
+[Share on Twitter/X](https://twitter.com/intent/tweet?text=Safari%20MCP%20%E2%80%94%20Stop%20running%20Chrome%20just%20so%20your%20AI%20agent%20can%20browse.%2096%20tools%2C%20native%20Safari%2C%2060%25%20less%20CPU.&url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Share on LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fgithub.com%2Fachiya-automation%2Fsafari-mcp) · [Write about it](https://dev.to/)
 
 [![Star History Chart](https://api.star-history.com/svg?repos=achiya-automation/safari-mcp&type=Date)](https://star-history.com/#achiya-automation/safari-mcp&Date)
 

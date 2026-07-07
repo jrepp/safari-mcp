@@ -6,20 +6,6 @@ import js from "@eslint/js";
 import globals from "globals";
 
 export default [
-  {
-    ignores: [
-      "node_modules/**",
-      "extension/**",
-      "xcode/**",
-      "*.swift",
-      "safari-helper",
-      "index.js",
-      "safari.js",
-      "mcp-helpers.js",
-      "scripts/test-*.js",
-      "scripts/postinstall.cjs",
-    ],
-  },
   js.configs.recommended,
   {
     files: ["**/*.js", "**/*.mjs"],
@@ -36,7 +22,15 @@ export default [
     },
   },
   {
+    // mcp-helpers.js is browser-context DOM code (injected as a string).
+    files: ["mcp-helpers.js"],
+    languageOptions: { globals: { ...globals.browser } },
+  },
+  {
     files: ["**/*.cjs"],
     languageOptions: { sourceType: "commonjs", globals: { ...globals.node } },
+  },
+  {
+    ignores: ["node_modules/**", "extension/**", "*.swift", "safari-helper"],
   },
 ];

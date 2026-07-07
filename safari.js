@@ -7,8 +7,8 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve as resolvePath } from "node:path";
-import { readFile, writeFile, unlink, appendFile, realpath, lstat } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFile, writeFile, unlink, appendFile } from "node:fs/promises";
+import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } from "./injected-validators.js";
@@ -17,19 +17,25 @@ import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const LOCAL_FILE_MAX_BYTES = parseInt(process.env.SAFARI_MCP_MAX_FILE_BYTES || String(100 * 1024 * 1024), 10);
 // Local session ID — kept in sync with index.js SESSION_ID for tab marker generation
 // Both files need their own const because they're separate ES modules; the marker only needs to be unique per process
 const SESSION_ID = randomUUID().slice(0, 8);
 
+// ========== STRING ESCAPING (single source of truth) ==========
+// Escaping ORDER is security-relevant: the backslash MUST be escaped before the quote, or the
+// backslash inserted in front of the quote gets doubled and the string breaks out. These helpers
+// replace ~70 hand-inlined copies of the same recipe — fix the escaping once here, not at every
+// call site. Verified equivalent to the inline pattern by test/escaping.test.mjs.
+
+// Escaping helpers now live in ./injected-escape.js (pure + test-locked). Imported above
+// for internal use; re-exported here so existing `from "./safari.js"` imports keep working.
 export { escJsSingleQuote, escAppleScriptString };
 
 // ========== SWIFT HELPER DAEMON ==========
 // Persistent process — no subprocess spawn overhead (~5ms vs ~90ms)
 let _helperProc = null;
 const _helperQueue = []; // callbacks waiting for responses
-let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — only kill after 3
-let _helperDisabled = false;
+let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — kill threshold lives where it's checked (currently 5)
 
 // ── Helper request serialization ──────────────────────────────────────────
 // The Swift helper runs each request on its own background thread, so it can
@@ -55,8 +61,7 @@ function _drainHelperQueue(reason) {
 }
 
 function startHelper() {
-  if (_helperDisabled) return;
-  if (_helperProc) return;
+  if (_helperProc) return; // idempotent — a respawn already won the race; don't orphan a daemon
   const helperPath = join(__dirname, "safari-helper");
   try {
     _helperProc = spawn(helperPath, [], { stdio: ["pipe", "pipe", "ignore"] });
@@ -86,7 +91,6 @@ let _restartTimer = null;
 let _shuttingDown = false;
 
 function _scheduleRestart() {
-  if (_helperDisabled) return;
   if (_shuttingDown || _restartTimer) return;
   _restartCount++;
   // Exponential backoff: 500ms, 1s, 2s, 4s, max 10s
@@ -146,7 +150,7 @@ function safariNotRunningError() {
 // While locked, any new clipboard operation waits until the current one completes.
 let _clipboardLocked = false;
 let _clipboardRestoreTimer = null;
-let _pendingClipboardRestore;
+let _pendingClipboardRestore; // content stashed for a synchronous flush on shutdown (see flushClipboardRestore)
 
 async function _acquireClipboardLock(timeoutMs = 10000) {
   const start = Date.now();
@@ -171,6 +175,9 @@ async function _saveClipboard() {
   } catch { return null; }
 }
 
+// Write text to the macOS clipboard via pbcopy. Single place that handles EPIPE on the stdin
+// stream (pbcopy exiting before it reads) — an unhandled 'error' there would otherwise reach
+// uncaughtException and kill the whole server.
 function _pbcopy(text) {
   return new Promise((resolve, reject) => {
     const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
@@ -203,9 +210,7 @@ let _activeTabURL = null;   // URL-based tracking (stable even when tabs shift)
 // and the URL-based marker resolution can fail until the page actually loads.
 // During the grace window, navigate/click/fill operations either use the cached
 // _activeTabIndex or fail loudly — never silently target the user's tab.
-let _lastNewTabAt = 0;
-const NEW_TAB_GRACE_MS = 30000;
-// Becomes true once safari_tabs action=new is called for the first time in this session.
+// Becomes true once safari_new_tab is called for the first time in this session.
 // Once true, write operations (navigate/click/fill) MUST NOT fall back to
 // "current tab of window" — that targets the USER'S active tab. The 30s grace
 // window was insufficient: tab tracking can be lost much later in a session
@@ -294,8 +299,11 @@ if (SAFARI_PROFILE) {
       return;
     }
     try {
+      // Read-only window-name query — opt out of focus-guard so a rare
+      // user-app-switch race never triggers the hide-fallback against them.
       const name = await osascriptFast(
-        `tell application "Safari" to return name of ${_targetWindowRef}`
+        `tell application "Safari" to return name of ${_targetWindowRef}`,
+        { noFocusGuard: true }
       ).catch(() => '');
       if (name && !name.startsWith(`${SAFARI_PROFILE} \u2014`)) {
         // Window ID no longer belongs to profile — invalidate cache immediately
@@ -317,14 +325,21 @@ if (SAFARI_PROFILE) {
   }, 3000); // Check every 3 seconds
 }
 
-// Initialize profile window in the background so MCP initialize never blocks on
-// profile-window detection.
+// Initialize profile window at startup (ES module top-level await)
 if (SAFARI_PROFILE) {
+  // Run profile-window detection off the critical path so module init — and
+  // therefore the MCP initialize handshake — completes immediately. Tool calls
+  // that arrive before this finishes already trigger lazy refresh via
+  // getTargetWindowRef(), so correctness is preserved.
+  // Why this matters: a blocking `await refreshTargetWindow(true)` here could
+  // run >30s when Safari was busy or AppleScript was stalled, tripping Claude
+  // Code's 30s MCP timeout and leaving the conversation's tool catalog without
+  // safari tools until a new conversation is started.
   (async () => {
-    await new Promise(r => setTimeout(r, 50));
-    await refreshTargetWindow(true).catch(() => {});
+    await new Promise(r => setTimeout(r, 50)); // Let helper process initialize
+    await refreshTargetWindow(true);
     if (_targetWindowRef) {
-      _logProfile(`Startup: Profile "${SAFARI_PROFILE}" -> targeting ${_targetWindowRef}`);
+      _logProfile(`Startup: Profile "${SAFARI_PROFILE}" → targeting ${_targetWindowRef}`);
     } else {
       _logProfile(`WARNING: Profile "${SAFARI_PROFILE}" window NOT found at startup`);
     }
@@ -352,7 +367,7 @@ function _assertNotFallingBackToUserTab(opName) {
   if (_hasOwnedTab) {
     throw new Error(
       `Tab tracking lost — refusing to ${opName} via fallback to "current tab of window" (would target the user's active tab). ` +
-      `This session previously opened its own tab via safari_tabs action=new; re-run safari_tabs action=new to recover, or call safari_tabs action=list and safari_tabs action=switch to re-anchor to a known tab.`
+      `This session previously opened its own tab via safari_new_tab; re-run safari_new_tab to recover, or call safari_list_tabs and safari_switch_tab to re-anchor to a known tab.`
     );
   }
   // No tab ever owned by this session — fallback to front document is intentional.
@@ -411,33 +426,103 @@ async function _stampTab(idx) {
 // Quick JS execution — exposed for smart-wait checks in index.js
 export async function runJSQuick(js) { return runJS(js); }
 
+// Run a SYNCHRONOUS function body in the page and return its raw result string. The body
+// must `return JSON.stringify(...)` (AppleScript `do JavaScript` can't await). This is the
+// single home for the `(function(){ … })()` wrapper that ~50 extractors hand-write; output
+// is byte-identical to `runJS(\`(function(){BODY})()\`)` — it only removes the boilerplate.
+function evalReturningJSON(body, opts) {
+  return runJS(`(function(){${body}})()`, opts);
+}
+
 // ========== FOCUS PRESERVATION ==========
-// Safari AppleScript can steal focus (bring Safari window to front).
-// We hide Safari instead of activating the previous app — prevents ANY Safari window from flashing.
+// Safari AppleScript can steal focus (bring Safari window to front), especially
+// on macOS Tahoe where window-mutation commands trigger an implicit activate.
+// Strategy: 1) read frontmost from daemon (~0.1ms), 2) try to re-activate previous
+// app, 3) settle 5ms (Tahoe needs time to honor the activate), 4) verify, and
+// 5) fall back to hiding Safari if activate didn't take.
 export async function saveFrontmostApp() {
   const app = await _helperGetFrontApp();
   return app?.bundleId || null;
 }
 export async function restoreFocusIfStolen(savedBundleId) {
   if (!savedBundleId || savedBundleId === "com.apple.Safari") return;
-  const current = await _helperGetFrontApp();
+  let current = await _helperGetFrontApp();
+  if (current?.bundleId !== "com.apple.Safari") return;
+
+  // GUARD FIRST — check the user BEFORE any activate. If they interacted within
+  // the last couple seconds, Safari is frontmost because THEY are working in it
+  // (or just switched to it while a background instance's op was mid-flight), and
+  // restoring the previous app rips Safari out from under them — the "VS Code
+  // keeps jumping in front every few seconds" bug. The OLD code ran this guard
+  // only AFTER the first activate below, so that activate already stole focus
+  // before the guard could veto. With ~5 safari-mcp instances sharing one Safari
+  // window, every background op fired this steal. Bias HARD toward not stealing:
+  // a stale Safari-frontmost (user clicks back once) beats repeatedly yanking
+  // focus away from an active user.
+  if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active"); return; }
+
+  _traceRestore(savedBundleId, "restore");
+  // Bring previous app back. Await so the caller doesn't hand control back to
+  // user-space while Safari is still frontmost.
+  await _helperActivateApp(savedBundleId).catch(() => {});
+
+  // Settle window — NSRunningApplication.activate() is async at the OS level and
+  // reliably takes tens of ms to take effect. The old 5ms was far too short: the
+  // verify below almost always still saw Safari frontmost and wrongly fired the
+  // hide fallback, even though activate() was about to land. Give it a real
+  // chance before deciding activate "failed".
+  await new Promise(r => setTimeout(r, 120));
+
+  current = await _helperGetFrontApp();
   if (current?.bundleId === "com.apple.Safari") {
-    await _helperActivateApp(savedBundleId);
+    // Safari still frontmost after activate. The OLD code HID Safari here — but
+    // hiding is destructive: it pulls the WHOLE app off-screen. It fired whenever
+    // the user had switched into Safari themselves while a background agent's op
+    // was in flight, and recurred even with an idle-guard because a user passively
+    // VIEWING Safari exceeds the idle threshold. Several autonomous background
+    // instances (Daily-RC → codex computer-use) share this one profile window, so
+    // the race was constant. NEVER hide. Non-destructive only: if the user is
+    // interacting, they own the foreground — leave it. Otherwise one more activate
+    // attempt, then give up and leave Safari frontmost (the user clicks back —
+    // vastly better than Safari vanishing).
+    if (await _userIsActive()) { _traceRestore(savedBundleId, "skip-user-active-late"); return; }
+    await _helperActivateApp(savedBundleId).catch(() => {});
   }
+}
+
+// Seconds since the user's last HID input (keyboard or mouse), via IOKit.
+// `-r -d 1` roots the dump at IOHIDSystem and keeps it shallow (~13ms, ~4KB) —
+// note: a plain `-d 1` measures depth from the registry root and never reaches
+// IOHIDSystem, returning no HIDIdleTime. Returns Infinity on any failure so
+// callers fail toward "user is idle" (preserving the pre-existing hide behavior).
+async function _userIdleSeconds() {
+  try {
+    const { stdout } = await execFileAsync("ioreg", ["-c", "IOHIDSystem", "-r", "-d", "1"], { timeout: 1500 });
+    const m = stdout.match(/"HIDIdleTime"\s*=\s*(\d+)/);
+    if (!m) return Infinity;
+    return parseInt(m[1], 10) / 1e9; // nanoseconds → seconds
+  } catch { return Infinity; }
+}
+
+// True when the user interacted within the last ~2.5s — used to avoid hiding
+// Safari out from under a user who just brought it to the front themselves.
+async function _userIsActive() {
+  return (await _userIdleSeconds()) < 2.5;
+}
+
+// Lightweight trace of every restore decision — confirms WHICH instance (pid)
+// restored focus and whether the user-active guard vetoed it. Best-effort; never
+// throws into the hot path. Tail ~/safari-mcp/restore-trace.log to watch live.
+const _RESTORE_TRACE = join(__dirname, "restore-trace.log");
+function _traceRestore(savedBundleId, decision) {
+  appendFile(_RESTORE_TRACE, `${new Date().toISOString()} pid=${process.pid} saved=${savedBundleId} -> ${decision}\n`).catch(() => {});
 }
 
 function _helperHideSafari(timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
-    const timer = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        const idx = _helperQueue.indexOf(cb);
-        if (idx >= 0) _helperQueue[idx] = () => {};
-        resolve();
-      }
-    }, timeout);
+    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
     function cb() {
       if (resolved) return;
       resolved = true;
@@ -446,12 +531,7 @@ function _helperHideSafari(timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"hideSafari":true}\n'); }
-    catch {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
-      clearTimeout(timer);
-      resolve();
-    }
+    catch { clearTimeout(timer); resolve(); }
   }));
 }
 
@@ -459,14 +539,7 @@ function _helperActivateApp(bundleId, timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(); return; }
     let resolved = false;
-    const timer = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        const idx = _helperQueue.indexOf(cb);
-        if (idx >= 0) _helperQueue[idx] = () => {};
-        resolve();
-      }
-    }, timeout);
+    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(); } }, timeout);
     function cb() {
       if (resolved) return;
       resolved = true;
@@ -475,12 +548,7 @@ function _helperActivateApp(bundleId, timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write(JSON.stringify({ activateApp: bundleId }) + '\n'); }
-    catch {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
-      clearTimeout(timer);
-      resolve();
-    }
+    catch { clearTimeout(timer); resolve(); }
   }));
 }
 
@@ -632,47 +700,52 @@ async function osascript(script, { timeout = 10000 } = {}) {
     }
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
   } finally {
-    // Re-activate previous app if Safari stole focus (~1ms)
+    // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      const current = await _helperGetFrontApp();
-      if (current?.bundleId === 'com.apple.Safari') {
-        _helperActivateApp(frontApp.bundleId).catch(() => {});
-      }
+      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
     }
   }
 }
 
 // osascriptFast: uses persistent Swift daemon (~5ms) — 18x faster than subprocess (~90ms)
-async function osascriptFast(script, { timeout = 10000 } = {}) {
+async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } = {}) {
   if (!(await isSafariRunning())) throw safariNotRunningError();
   if (!_helperProc) startHelper();
-  if (_helperProc) {
-    try {
-      return await _osascriptFastHelper(script, timeout);
-    } catch (err) {
-      // Retry once if the window ID became stale
-      if (isStaleWindowError(err) && SAFARI_PROFILE) {
-        const oldRef = _targetWindowRef;
-        await refreshTargetWindow(true);
-        if (_targetWindowRef !== oldRef) {
-          const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
-          // Guard: helper may have died during the stale-window retry
-          if (!_helperProc) startHelper();
-          if (_helperProc) return await _osascriptFastHelper(retryScript, timeout);
-          return await osascript(retryScript, { timeout });
+
+  // Focus guard — Tahoe AppleScript can implicitly activate Safari (especially
+  // on window-mutating commands: set URL / set bounds / set current tab).
+  // Skip if an outer caller (extensionOrFallback / runJSLarge / osascript)
+  // already handles focus, or if the caller knows the script is read-only and
+  // not worth the round-trip overhead (e.g. background polling every 3s).
+  const shouldGuardFocus = !_focusGuardActive && !noFocusGuard;
+  const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
+
+  try {
+    if (_helperProc) {
+      try {
+        return await _osascriptFastHelper(script, timeout);
+      } catch (err) {
+        // Retry once if the window ID became stale
+        if (isStaleWindowError(err) && SAFARI_PROFILE) {
+          const oldRef = _targetWindowRef;
+          await refreshTargetWindow(true);
+          if (_targetWindowRef !== oldRef) {
+            const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
+            // Guard: helper may have died during the stale-window retry
+            if (!_helperProc) startHelper();
+            if (_helperProc) return await _osascriptFastHelper(retryScript, timeout);
+            return await osascript(retryScript, { timeout });
+          }
         }
+        throw err;
       }
-      if (err?.message?.includes("safari-helper timeout") || err?.message?.includes("helper process")) {
-        _helperDisabled = true;
-        try { _helperProc?.kill(); } catch (_) {}
-        _helperProc = null;
-        _helperConsecutiveTimeouts = 0;
-        return osascript(script, { timeout });
-      }
-      throw err;
+    }
+    return await osascript(script, { timeout });
+  } finally {
+    if (shouldGuardFocus && frontApp?.bundleId && frontApp.bundleId !== "com.apple.Safari") {
+      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
     }
   }
-  return osascript(script, { timeout });
 }
 
 function _osascriptFastHelper(script, timeout) {
@@ -681,17 +754,24 @@ function _osascriptFastHelper(script, timeout) {
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      // DON'T remove from queue — replace with no-op consumer to maintain FIFO order.
-      // Without this, the late response would be consumed by the NEXT callback in the queue.
+      // DON'T remove from queue — replace with a proof-of-life consumer to maintain
+      // FIFO order. A heavy page (e.g. the Airtable SPA) makes `do JavaScript` legitimately
+      // slow: the call exceeds `timeout`ms, but the helper IS alive and emits its response a
+      // moment later. That late response proves liveness — so when it arrives we reset the
+      // consecutive-timeout counter instead of discarding the signal. Killing the daemon on a
+      // slow page is pointless (the fresh daemon hits the same slow page) and disruptive.
+      // Only a helper that NEVER replies (truly hung) accumulates timeouts with no late reply.
       const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => {}; // Consume and discard late response
+      if (idx >= 0) _helperQueue[idx] = () => { _helperConsecutiveTimeouts = 0; }; // late reply ⇒ alive
       _helperConsecutiveTimeouts++;
-      if (_helperConsecutiveTimeouts >= 3) {
-        console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts — killing daemon`);
+      if (_helperConsecutiveTimeouts >= 5) {
+        console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts with no late replies — killing daemon`);
         _helperProc?.kill();
         _helperProc = null;
         _helperConsecutiveTimeouts = 0;
-        setTimeout(startHelper, 100);
+        // The killed proc's 'exit' handler also schedules a restart; guard the timer so only
+        // one respawn wins (startHelper is now idempotent too) — no second, orphaned daemon.
+        setTimeout(() => { if (!_shuttingDown && !_helperProc) startHelper(); }, 100);
       }
       reject(new Error("safari-helper timeout"));
     }, timeout);
@@ -727,6 +807,9 @@ function _osascriptFastHelper(script, timeout) {
   }));
 }
 
+// Ask the helper for its permission state (CGEvent posting + screen capture) without
+// acting. Resolves the FULL parsed object ({accessibility, screenRecording}); doubles as
+// a daemon liveness probe. Used by doctor() (issue #29/#14/#15).
 function _helperPreflight(timeout = 3000) {
   return _withHelperLock(() => new Promise((resolve, reject) => {
     if (!_helperProc) startHelper();
@@ -739,7 +822,7 @@ function _helperPreflight(timeout = 3000) {
       if (resolved) return;
       resolved = true;
       const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => {};
+      if (idx >= 0) _helperQueue[idx] = () => {}; // no-op consumer for a late reply
       reject(new Error("preflight timeout"));
     }, timeout);
     function cb(line) {
@@ -798,7 +881,17 @@ function _helperNativeClick(x, y, doubleClick = false, windowId = 0, timeout = 5
     const cmd = { click: { x, y } };
     if (doubleClick) cmd.click.double = true;
     if (windowId) cmd.click.windowId = windowId;
-    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    try {
+      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    } catch (e) {
+      // EPIPE if the daemon died in the gap after the writable check — splice our callback
+      // out so it can't consume the NEXT command's response (FIFO desync), then reject.
+      const i = _helperQueue.indexOf(cb);
+      if (i >= 0) _helperQueue.splice(i, 1);
+      clearTimeout(timer);
+      resolved = true;
+      reject(e);
+    }
   }));
 }
 
@@ -836,7 +929,17 @@ function _helperNativeHover(x, y, windowId = 0, dwellMs = 500, restoreMouse = tr
     _helperQueue.push(cb);
     const cmd = { hover: { x, y, dwellMs, restoreMouse } };
     if (windowId) cmd.hover.windowId = windowId;
-    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    try {
+      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    } catch (e) {
+      // EPIPE if the daemon died in the gap after the writable check — splice our callback
+      // out so it can't consume the NEXT command's response (FIFO desync), then reject.
+      const i = _helperQueue.indexOf(cb);
+      if (i >= 0) _helperQueue.splice(i, 1);
+      clearTimeout(timer);
+      resolved = true;
+      reject(e);
+    }
   }));
 }
 
@@ -874,7 +977,17 @@ function _helperNativeKeyboard(keyCode, flags = [], windowId = 0, timeout = 5000
     _helperQueue.push(cb);
     const cmd = { keyboard: { keyCode, flags } };
     if (windowId) cmd.keyboard.windowId = windowId;
-    _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    try {
+      _helperProc.stdin.write(JSON.stringify(cmd) + "\n");
+    } catch (e) {
+      // EPIPE if the daemon died in the gap after the writable check — splice our callback
+      // out so it can't consume the NEXT command's response (FIFO desync), then reject.
+      const i = _helperQueue.indexOf(cb);
+      if (i >= 0) _helperQueue.splice(i, 1);
+      clearTimeout(timer);
+      resolved = true;
+      reject(e);
+    }
   }));
 }
 
@@ -885,14 +998,7 @@ function _helperGetFrontApp(timeout = 2000) {
   return _withHelperLock(() => new Promise((resolve) => {
     if (!_helperProc || !_helperProc.stdin?.writable) { resolve(null); return; }
     let resolved = false;
-    const timer = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        const idx = _helperQueue.indexOf(cb);
-        if (idx >= 0) _helperQueue[idx] = () => {};
-        resolve(null);
-      }
-    }, timeout);
+    const timer = setTimeout(() => { if (!resolved) { resolved = true; resolve(null); } }, timeout);
     function cb(line) {
       if (resolved) return;
       resolved = true;
@@ -901,12 +1007,7 @@ function _helperGetFrontApp(timeout = 2000) {
     }
     _helperQueue.push(cb);
     try { _helperProc.stdin.write('{"getFrontApp":true}\n'); }
-    catch {
-      const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue.splice(idx, 1);
-      clearTimeout(timer);
-      resolve(null);
-    }
+    catch { clearTimeout(timer); resolve(null); }
   }));
 }
 
@@ -914,8 +1015,13 @@ function _helperGetFrontApp(timeout = 2000) {
 async function _getSafariWindowGeometry() {
   await refreshTargetWindow();
   const windowRef = getTargetWindowRef();
-  // Get window bounds + window ID — always use direct osascript (daemon returns empty for this)
-  const boundsResult = await osascript(
+  // Get window bounds + window ID via the helper daemon. The daemon is TCC-granted
+  // under safari-helper's STABLE path, so this never falls back to osascript-under-claude
+  // — which re-prompts for Apple Events on every claude version bump (the binary lives in
+  // a version-numbered folder). The script returns a plain comma-joined string (not a list),
+  // which the daemon's stringValue handles fine. osascriptFast itself falls back to a fresh
+  // osascript subprocess only if the daemon is dead — a rare hiccup, not the steady state.
+  const boundsResult = await osascriptFast(
     `tell application "Safari"\n  set b to bounds of ${windowRef}\n  set wid to id of ${windowRef}\n  return (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text) & "," & (wid as text)\nend tell`
   );
   // boundsResult = "x1, y1, x2, y2, windowId"
@@ -968,13 +1074,20 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   }
   // ALWAYS fall back to _activeTabIndex — never clear it from resolve failures
   if (!idx) idx = _activeTabIndex;
-  // Once this session owns a tab, never silently run on the user's current tab.
-  if (!idx && _hasOwnedTab && SAFARI_PROFILE) {
-    throw new Error('Tab tracking lost during runJS — refusing to target the user\'s current tab. Call safari_tabs action=new to reopen.');
+  // Once this session owns a tab, never silently run on the user's current tab —
+  // regardless of SAFARI_PROFILE. Without a profile getFallbackTarget() returns
+  // "front document" (the user's active tab), so the guard matters MOST there.
+  // Mirrors runJSLarge and the ghost-recovery guard below, which key on _hasOwnedTab alone.
+  if (!idx && _hasOwnedTab) {
+    throw new Error('Tab tracking lost during runJS — refusing to target the user\'s current tab. Call safari_new_tab to reopen.');
   }
   const target = idx
     ? `tab ${idx} of ${getTargetWindowRef()}`
     : getFallbackTarget();
+  // NEVER activate or raise Safari — that steals the user's foreground. JS runs in the
+  // target tab in the background regardless of window stacking. (rAF/timers stay frozen
+  // while the window is occluded by macOS; that is a deliberate trade-off — measuring an
+  // occluded window's frame rate is not worth stealing focus. Measure when it's visible.)
   const script = `tell application "Safari" to do JavaScript "${escaped}" in ${target}`;
   try {
     if (script.length < 50000) {
@@ -1009,7 +1122,7 @@ async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
         throw new Error(
           `Tab tracking lost during runJS — original tab ${idx} no longer exists, and URL-based resolution failed. ` +
           `Refusing to fall back to "current tab of window" (would target user's active tab). ` +
-          `Call safari_tabs action=new to open a fresh tab and retry.`
+          `Call safari_new_tab to open a fresh tab and retry.`
         );
       }
       // No owned tab in this session — front-document fallback is intentional.
@@ -1028,7 +1141,10 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   await refreshTargetWindow();
   // Resolve tab the same way runJS does — verify cached index via URL
   let idx = tabIndex;
-  if (!idx && _activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') {
+  // Match runJS: resolve when EITHER the URL or the tab marker is tracked — after a
+  // redirect clears _activeTabURL the marker is still authoritative; skipping the
+  // scan meant large-payload ops (upload/paste) could target a stale index.
+  if (!idx && ((_activeTabURL && _activeTabURL !== 'about:blank' && _activeTabURL !== '') || _activeTabMarker)) {
     const resolved = await resolveActiveTab();
     if (resolved) { idx = resolved; _lastResolveTime = Date.now(); }
   }
@@ -1038,7 +1154,7 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
   if (!idx && _hasOwnedTab) {
     throw new Error(
       `Tab tracking lost during runJSLarge — refusing to fall back to "current tab of window" (would target user's active tab). ` +
-      `Call safari_tabs action=new to open a fresh tab and retry.`
+      `Call safari_new_tab to open a fresh tab and retry.`
     );
   }
   const target = idx
@@ -1067,12 +1183,9 @@ async function runJSLarge(js, { tabIndex, timeout = 30000 } = {}) {
     return stdout.trim();
   } finally {
     unlink(tmpFile).catch(() => {});
-    // Re-activate previous app if Safari stole focus (~1ms)
+    // Awaited restore — caller must not return to user-space while Safari is still frontmost.
     if (shouldGuard && frontApp?.bundleId && frontApp.bundleId !== 'com.apple.Safari') {
-      const current = await _helperGetFrontApp();
-      if (current?.bundleId === 'com.apple.Safari') {
-        _helperActivateApp(frontApp.bundleId).catch(() => {});
-      }
+      await restoreFocusIfStolen(frontApp.bundleId).catch(() => {});
     }
   }
 }
@@ -1086,7 +1199,9 @@ export async function navigate(url) {
     targetUrl = "https://" + targetUrl;
   }
 
-  const safeUrl = targetUrl.replace(/"/g, '\\"');
+  // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
+  // the AppleScript string literal and allow AppleScript injection.
+  const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
     // Resolve tab by URL first (in case indices shifted)
     if (_activeTabURL) await resolveActiveTab();
     _assertNotFallingBackToUserTab('navigate');
@@ -1106,13 +1221,34 @@ export async function navigate(url) {
     // detect a `set URL` that silently no-ops (a cold or crashed Swift daemon):
     // the readyState poll would otherwise just see the OLD page still loaded.
     const preNavUrl = await runJS('location.href', { tabIndex: navIndex, timeout: 3000 }).catch(() => '');
-    const preNavTimeOrigin = await runJS('String(performance.timeOrigin||0)', { tabIndex: navIndex, timeout: 3000 }).catch(() => '');
 
     // Step 1: Set URL via fast daemon (~5ms) — don't block daemon with polling
     await osascriptFast(
       `tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`,
       { timeout: 10000 }
     );
+
+    // Optimistically track the destination NOW. The async load below can take seconds
+    // on a heavy SPA; if any step throws mid-load, resolveActiveTab() can still re-find
+    // this tab by URL instead of clearing the index and locking the session out of its
+    // own tab. Corrected to the real landed URL once the page settles (below).
+    _activeTabURL = targetUrl;
+    _activeTabIndex = navIndex;
+    _lastResolveTime = Date.now();
+
+    // about:blank and any already-loaded page report readyState 'complete' the instant
+    // we poll, BEFORE the async set-URL takes effect — so breaking on readyState alone
+    // mistakes the stale/blank page for a finished navigation (root cause of false
+    // "set URL had no effect" failures navigating a fresh tab to an SPA). Only settle
+    // once the URL has actually LEFT preNavUrl (a same-URL reload is exempt).
+    const _isReload = !!preNavUrl && preNavUrl === targetUrl;
+    const _settled = (state, landed) => {
+      if (state !== 'complete' && state !== 'interactive') return false;
+      if (_isReload) return true;
+      if (!landed || landed === 'about:blank') return false;
+      return landed !== preNavUrl;
+    };
+    const _probeUrl = (json) => { try { return JSON.parse(json).url || ''; } catch { return ''; } };
 
     // Step 2: Poll readyState synchronously from Node.js side
     // (AppleScript do JavaScript doesn't await async Promises — returns immediately)
@@ -1123,12 +1259,15 @@ export async function navigate(url) {
         const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
         if (state === 'complete' || state === 'interactive') {
           result = await runJS(
-            `JSON.stringify({title:document.title,url:location.href,timeOrigin:String(performance.timeOrigin||0),blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
+            `JSON.stringify({title:document.title,url:location.href,blocked:document.title.includes('cannot open')||document.title.includes('\u05D0\u05D9\u05DF \u05D0\u05E4\u05E9\u05E8\u05D5\u05EA')})`,
             { tabIndex: navIndex, timeout: 5000 }
           );
-          if (state === 'complete') break;
-          // interactive = DOM ready but resources still loading — wait a bit more
-          if (poll > 10) break; // Don't wait forever for 'complete' if interactive after 2s
+          if (_settled(state, _probeUrl(result))) {
+            if (state === 'complete') break;
+            // interactive = DOM ready but resources still loading — wait a bit more
+            if (poll > 10) break; // Don't wait forever for 'complete' if interactive after 2s
+          }
+          // else: new URL not in effect yet (stale/blank page) — keep polling
         }
       } catch { /* page still loading, retry */ }
     }
@@ -1136,15 +1275,8 @@ export async function navigate(url) {
     // If the fast `set URL` above silently no-opped (cold/crashed daemon), the poll
     // just saw the OLD page already loaded. Detect that — the URL never left
     // preNavUrl — and retry once through the daemon-independent osascript path.
-    let landedUrl = '';
-    let landedTimeOrigin = '';
-    try {
-      const landed = JSON.parse(result);
-      landedUrl = landed.url || '';
-      landedTimeOrigin = landed.timeOrigin || '';
-    } catch { /* result not JSON */ }
-    const sameDocumentAfterSetUrl = preNavTimeOrigin && landedTimeOrigin && landedTimeOrigin === preNavTimeOrigin;
-    if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || (landedUrl === preNavUrl && sameDocumentAfterSetUrl))) {
+    let landedUrl = _probeUrl(result);
+    if (preNavUrl && preNavUrl !== targetUrl && (!landedUrl || landedUrl === preNavUrl || landedUrl === 'about:blank')) {
       console.error('[Safari MCP] navigate: fast set-URL did not take effect — retrying via osascript subprocess');
       await osascript(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`, { timeout: 12000 });
       for (let rpoll = 0; rpoll < 80; rpoll++) {
@@ -1152,34 +1284,44 @@ export async function navigate(url) {
         try {
           const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
           if (state === 'complete' || state === 'interactive') {
-            result = await runJS('JSON.stringify({title:document.title,url:location.href,timeOrigin:String(performance.timeOrigin||0)})', { tabIndex: navIndex, timeout: 5000 });
-            if (state === 'complete') break;
-            if (rpoll > 10) break;
+            const probe = await runJS('JSON.stringify({title:document.title,url:location.href})', { tabIndex: navIndex, timeout: 5000 });
+            if (_settled(state, _probeUrl(probe))) {
+              result = probe;
+              if (state === 'complete') break;
+              if (rpoll > 10) break;
+            }
           }
         } catch { /* page still loading, retry */ }
       }
+      // Last chance: the daemon may have applied the set URL only AFTER our polls ran.
+      // Re-read the live URL directly before declaring failure.
+      let retryUrl = _probeUrl(result);
+      if (!retryUrl || retryUrl === preNavUrl || retryUrl === 'about:blank') {
+        const liveUrl = await runJS('location.href', { tabIndex: navIndex, timeout: 5000 }).catch(() => '');
+        if (liveUrl && liveUrl !== preNavUrl && liveUrl !== 'about:blank') {
+          result = JSON.stringify({ title: '', url: liveUrl });
+          retryUrl = liveUrl;
+        }
+      }
       // Still stuck on the pre-navigation URL → the navigation genuinely failed.
-      // Throw rather than returning the stale page as a successful navigation.
-      let retryUrl = '';
-      let retryTimeOrigin = '';
-      try {
-        const retryParsed = JSON.parse(result);
-        retryUrl = retryParsed.url || '';
-        retryTimeOrigin = retryParsed.timeOrigin || '';
-      } catch { /* result not JSON */ }
-      if (retryUrl && retryUrl === preNavUrl && preNavTimeOrigin && retryTimeOrigin === preNavTimeOrigin) {
+      if (retryUrl && retryUrl === preNavUrl) {
+        // Preserve tab tracking (index + the page actually showing) so the session can
+        // recover via switch_tab / re-navigate instead of being locked out of its tab.
+        _activeTabURL = preNavUrl;
+        _activeTabIndex = navIndex;
+        _lastResolveTime = Date.now();
         throw new Error(`navigate failed: page stayed on ${preNavUrl} — Safari "set URL" to ${targetUrl} had no effect (Safari automation/daemon issue, retry exhausted)`);
       }
     }
 
     // Inject click helpers in background (non-blocking, for subsequent clicks)
-    _injectHelpersfast().catch(() => {});
+    _injectHelpersfast().catch((err) => console.error(`[Safari MCP] background helper injection skipped: ${err.message}`));
 
     // If HTTPS failed and original was HTTP, try original HTTP URL
     try {
       const parsed = JSON.parse(result);
       if (parsed.blocked && url.startsWith("http://")) {
-        const httpUrl = url.replace(/"/g, '\\"');
+        const httpUrl = url.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
         await osascriptFast(
           `tell application "Safari" to set URL of ${navTarget} to "${httpUrl}"`
         );
@@ -1228,37 +1370,58 @@ export async function navigate(url) {
     return result;
 }
 
+// Poll document.readyState from the Node side and return {title,url[,text]} once the
+// page settles. `do JavaScript` returns immediately and never awaits an async IIFE
+// (see _evaluateAsync), so any in-page `await` loop is fire-and-forget — page-load
+// waits MUST be driven from Node. Shared by goBack/goForward/reload/navigateAndRead.
+async function _pollReadyAndRead(navIndex, { maxLength } = {}) {
+  const readExpr = maxLength != null
+    ? `JSON.stringify({title:document.title,url:location.href,text:document.body?document.body.innerText.substring(0,${Number(maxLength)}):''})`
+    : `JSON.stringify({title:document.title,url:location.href})`;
+  let result = '{}';
+  for (let poll = 0; poll < 60; poll++) {
+    await new Promise(r => setTimeout(r, poll < 10 ? 200 : 500));
+    try {
+      const state = await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 });
+      if (state === 'complete' || state === 'interactive') {
+        result = await runJS(readExpr, { tabIndex: navIndex, timeout: 5000 });
+        if (state === 'complete') break;
+        if (poll > 10) break; // interactive after ~2s is good enough
+      }
+    } catch { /* page still loading, retry */ }
+  }
+  return result;
+}
+
 export async function goBack() {
-  // Navigate back + smart wait: check immediately, then poll only if loading
-  const result = await runJS(
-    `(async function(){history.back();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
-    { timeout: 10000 }
-  );
+  await refreshTargetWindow();
+  const navIndex = _activeTabIndex;
+  // history.back() is synchronous; the page-load wait is polled from Node (see _pollReadyAndRead).
+  await runJS("history.back()", { tabIndex: navIndex, timeout: 5000 });
+  const result = await _pollReadyAndRead(navIndex);
   try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
   return result;
 }
 
 export async function goForward() {
-  const result = await runJS(
-    `(async function(){history.forward();await new Promise(function(r){setTimeout(r,50)});if(document.readyState!=='complete'){for(var i=0;i<30;i++){await new Promise(function(r){setTimeout(r,150)});if(document.readyState==='complete')break;}}return JSON.stringify({title:document.title,url:location.href});})()`,
-    { timeout: 10000 }
-  );
+  await refreshTargetWindow();
+  const navIndex = _activeTabIndex;
+  await runJS("history.forward()", { tabIndex: navIndex, timeout: 5000 });
+  const result = await _pollReadyAndRead(navIndex);
   try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
   return result;
 }
 
 export async function reload(hardReload = false) {
-  // Reload destroys JS context — must wait separately then re-query
-  await runJS(hardReload ? "location.reload(true)" : "location.reload()");
-  await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start (was 500ms)
-  // Poll readyState in a single call
-  const result = await runJS(
-    `(async function(){for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return JSON.stringify({title:document.title,url:location.href});})()`,
-    { timeout: 10000 }
-  );
+  await refreshTargetWindow();
+  const navIndex = _activeTabIndex;
+  // Reload destroys JS context — fire it, then poll readyState from Node.
+  await runJS(hardReload ? "location.reload(true)" : "location.reload()", { tabIndex: navIndex });
+  await new Promise((r) => setTimeout(r, 100)); // Brief wait for reload to start
+  const result = await _pollReadyAndRead(navIndex);
   try { const p = JSON.parse(result); if (p.url) _activeTabURL = p.url; } catch {}
   // A reload destroys the JS context — re-stamp marker + visibility spoof.
-  await _stampTab(_activeTabIndex);
+  await _stampTab(navIndex);
   return result;
 }
 
@@ -1266,7 +1429,7 @@ export async function reload(hardReload = false) {
 
 export async function readPage({ selector, maxLength = 50000 } = {}) {
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){
         var el = document.querySelector('${sel}');
@@ -1330,6 +1493,12 @@ const _HELPERS_ESCAPED = INJECT_MCP_HELPERS
 async function _injectHelpersfast() {
   await refreshTargetWindow();
   let idx = _activeTabIndex;
+  // Same guard as runJS: once this session has owned a tab, NEVER fall back to
+  // "front document" — that's the user's active tab, and injecting the helpers
+  // there is script injection into a page the user is working in.
+  if (!idx && _hasOwnedTab) {
+    throw new Error("Tab tracking lost — refusing to inject helpers into the front (user) tab.");
+  }
   const target = idx
     ? `tab ${idx} of ${getTargetWindowRef()}`
     : getFallbackTarget();
@@ -1411,10 +1580,10 @@ export async function click({ selector, text, x, y, ref }) {
   if (ref) {
     result = await clickWithRetry(coreJS(`mcpFindRef('${ref}')`, `Element not found: ref=${ref}`));
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     result = await clickWithRetry(coreJS(`mcpQuerySelectorDeep('${sel}')`, `Element not found: ${selector}`));
   } else if (text) {
-    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeText = escJsSingleQuote(text);
     result = await clickWithRetry(coreJS(`mcpFindText('${safeText}',true)||mcpFindText('${safeText}',false)`, `Element not found with text: ${text}`));
   } else if (x !== undefined && y !== undefined) {
     result = await clickWithRetry(coreJS(`mcpElementFromPoint(${Number(x)},${Number(y)})`, `No element at (${Number(x)},${Number(y)})`));
@@ -1424,7 +1593,7 @@ export async function click({ selector, text, x, y, ref }) {
 
   if (typeof result === 'string' && result.startsWith('__SELECT_GUARD__:')) {
     const detail = result.substring('__SELECT_GUARD__:'.length);
-    throw new Error(`Target is a native <select> (${detail}). Use safari_form with action "select" and a matching value instead — clicking it would open the OS picker and block.`);
+    throw new Error(`Target is a native <select> (${detail}). Use safari_select_option with a value matching one of the options instead — clicking it would open the OS picker and block.`);
   }
 
   // Structured result from coreJS. Fall back to the raw string for forward-compat.
@@ -1450,14 +1619,14 @@ export async function click({ selector, text, x, y, ref }) {
     await nativeClick({ selector, text, x, y, ref });
     return 'Clicked (native fallback — synthetic click had no effect): ' + label;
   } catch (e) {
-    return 'Clicked: ' + label + ' — synthetic click produced no detectable effect and the native fallback is unavailable (' + ((e && e.message) || e) + '). Retry with safari_click using native:true.';
+    return 'Clicked: ' + label + ' — ⚠️ synthetic click produced no detectable effect and the native fallback is unavailable (' + ((e && e.message) || e) + '). Retry with safari_native_click.';
   }
 }
 
 export async function doubleClick({ selector, x, y, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true}));return 'Double-clicked: '+el.tagName;})()`
     );
@@ -1472,7 +1641,7 @@ export async function doubleClick({ selector, x, y, ref }) {
 
 export async function rightClick({ selector, x, y }) {
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2}));return 'Right-clicked: '+el.tagName;})()`
     );
@@ -1511,7 +1680,7 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
         });
       })()`;
     } else if (selector) {
-      const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const sel = escJsSingleQuote(selector);
       jsExpr = `(function(){
         var el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
@@ -1525,7 +1694,7 @@ export async function nativeClick({ selector, text, x, y, ref, doubleClick = fal
         });
       })()`;
     } else {
-      const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const safeText = escJsSingleQuote(text);
       jsExpr = `(function(){
         var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
         if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
@@ -1608,7 +1777,7 @@ export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, re
         });
       })()`;
     } else if (selector) {
-      const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const sel = escJsSingleQuote(selector);
       jsExpr = `(function(){
         var el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({error: 'Element not found: ${sel}'});
@@ -1622,7 +1791,7 @@ export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, re
         });
       })()`;
     } else {
-      const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      const safeText = escJsSingleQuote(text);
       jsExpr = `(function(){
         var el = mcpFindText('${safeText}', true) || mcpFindText('${safeText}', false);
         if (!el) return JSON.stringify({error: 'Element not found with text: ${safeText}'});
@@ -1668,9 +1837,14 @@ export async function nativeHover({ selector, text, x, y, ref, dwellMs = 500, re
 export async function fill({ selector, value, ref }) {
   if (ref) selector = refSelector(ref);
   if (!selector) throw new Error("fill requires selector or ref");
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   // Proper escaping order: backslashes first, then quotes
   const val = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
+  // Same value encoded for the Lexical JSON literal (Strategy 2): JSON-escape first
+  // (quotes/newlines/backslashes), then escape for the surrounding single-quoted JS
+  // string. `val` alone broke the JSON on any double-quote, and parseEditorState's
+  // silent catch made the whole strategy vanish without a trace.
+  const lexVal = JSON.stringify(String(value)).slice(1, -1).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   const result = await runJS(
     `(function(){try{var el=document.querySelector('${sel}');if(!el){var q=function(r){var a=r.querySelectorAll('*');for(var i=0;i<a.length;i++){if(a[i].shadowRoot){el=a[i].shadowRoot.querySelector('${sel}');if(el)return el;el=q(a[i].shadowRoot);if(el)return el;}}return null;};el=q(document);}if(!el)return 'Element not found: ${sel}';el.focus();if(el.isContentEditable||el.getAttribute('contenteditable')==='true'){` +
     // Quill editor detection (LinkedIn share composer in 2026 — they migrated from
@@ -1726,7 +1900,7 @@ export async function fill({ selector, value, ref }) {
       // Strategy 1: beforeinput with insertFromPaste + DataTransfer
       `try{lexEl.focus();var lexSel=window.getSelection();if(lexSel){var lexRng=document.createRange();lexRng.selectNodeContents(lexEl);lexSel.removeAllRanges();lexSel.addRange(lexRng);}var lexDt=new DataTransfer();lexDt.setData('text/plain','${val}');var lexBi=new InputEvent('beforeinput',{inputType:'insertFromPaste',dataTransfer:lexDt,bubbles:true,cancelable:true});var lexCancelled=!lexEl.dispatchEvent(lexBi);if(lexCancelled||lexEl.textContent.indexOf('${val.substring(0, 20)}')>=0){return 'Filled CE (Lexical beforeinput paste)';}}catch(lexE1){}` +
       // Strategy 2: parseEditorState + setEditorState (direct state replacement)
-      `try{var lexJson='{"root":{"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"${val}","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"textFormat":0,"type":"paragraph","version":1}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}';var lexNs=lex.parseEditorState(lexJson);lex.setEditorState(lexNs);if(typeof lex.focus==='function')lex.focus();return 'Filled CE (Lexical setEditorState)';}catch(lexE2){}` +
+      `try{var lexJson='{"root":{"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"${lexVal}","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"textFormat":0,"type":"paragraph","version":1}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}';var lexNs=lex.parseEditorState(lexJson);lex.setEditorState(lexNs);if(typeof lex.focus==='function')lex.focus();return 'Filled CE (Lexical setEditorState)';}catch(lexE2){}` +
     `}` +
     // ProseMirror detection
     `var pm=el.closest('.ProseMirror')||el.querySelector('.ProseMirror');if(pm){try{var v=null;if(pm.pmViewDesc&&pm.pmViewDesc.view)v=pm.pmViewDesc.view;else if(pm.cmView&&pm.cmView.view)v=pm.cmView.view;else{var keys=Object.keys(pm);for(var ki=0;ki<keys.length;ki++){var o=pm[keys[ki]];if(o&&o.state&&o.dispatch){v=o;break;}}}` +
@@ -1816,7 +1990,7 @@ export async function fill({ selector, value, ref }) {
 
     const fillResult = await runJS(
       `(function(){` +
-      `var el=document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` +
+      `var el=document.querySelector('${escJsSingleQuote(selector)}');` +
       `if(!el)return 'Element not found';` +
       `el.focus();el.click();` +
       `var t=document.activeElement||el;` +
@@ -1865,7 +2039,7 @@ export async function fill({ selector, value, ref }) {
 
     const fillResult = await runJS(
       `(function(){` +
-      `var el=document.querySelector('${selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}');` +
+      `var el=document.querySelector('${escJsSingleQuote(selector)}');` +
       `if(!el)return 'Element not found';` +
       `el.focus();el.click();` +
       `var sel=window.getSelection();if(sel.rangeCount){var r=document.createRange();r.selectNodeContents(el);r.collapse(false);sel.removeAllRanges();sel.addRange(r);}` +
@@ -1881,7 +2055,7 @@ export async function fill({ selector, value, ref }) {
   // descriptor setter. Fall back to native CGEvent Cmd+V paste — real keyboard events
   // route through the framework's normal input pipeline.
   if (typeof result === 'string' && result.startsWith('__FILL_VALUE_MISMATCH__')) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     await runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'not-found';` +
       `el.focus();if('select' in el){el.select();}else if(el.setSelectionRange){el.setSelectionRange(0,(el.value||'').length);}` +
@@ -1901,7 +2075,7 @@ export async function fill({ selector, value, ref }) {
   // events dismiss the dialog. Use CGEvent Cmd+V — real paste, isTrusted:true, windowed so
   // no focus steal. Requires the element to be focused + have a collapsed selection at end.
   if (result === "__NATIVE_PASTE_DIALOG__") {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     await runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'not-found';` +
       `el.focus();` +
@@ -1932,7 +2106,7 @@ export async function fill({ selector, value, ref }) {
 export async function verifyState({ selector, expected, ref }) {
   if (ref) selector = refSelector(ref);
   if (!selector) throw new Error("verifyState requires selector or ref");
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   const exp = String(expected || '').replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   const expSnippet = String(expected || '').substring(0, 30).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "");
   return runJS(
@@ -1970,8 +2144,6 @@ export async function verifyState({ selector, expected, ref }) {
         try {
           var lexText = '';
           lex.getEditorState().read(function(){
-            var root = lex._editorState && lex._editorState._nodeMap ? lex._editorState._nodeMap.get('root') : null;
-            // Fallback: read DOM text since direct API requires Lexical's $getRoot
             lexText = (lexEl || el).textContent || '';
           });
           return JSON.stringify({ match: lexText.indexOf(snippet) >= 0, mode: 'lexical', actual: lexText.substring(0, 200), expected: expected.substring(0, 200) });
@@ -2006,7 +2178,7 @@ export async function verifyState({ selector, expected, ref }) {
 }
 
 export async function clearField({ selector }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';if(el.isContentEditable){el.focus();document.execCommand('selectAll');document.execCommand('delete');el.dispatchEvent(new Event('input',{bubbles:true}));return 'Cleared (contenteditable)';}var t=el._valueTracker;if(t)t.setValue('x');var p=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;var d=Object.getOwnPropertyDescriptor(p,'value');if(d&&d.set)d.set.call(el,'');else el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.dispatchEvent(new Event('blur',{bubbles:true}));return 'Cleared';})()`
   );
@@ -2022,7 +2194,7 @@ export async function selectOption({ selector, value, ref }) {
   if (ref) {
     finder = `mcpFindRef('${String(ref).replace(/'/g, "\\'")}')`;
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     finder = `(document.querySelector('${sel}')||mcpQuerySelectorDeep('${sel}'))`;
   } else {
     throw new Error("selectOption requires 'ref' or 'selector'");
@@ -2045,7 +2217,7 @@ export async function reactSelectSet({ selector, ref, value }) {
     const safeRef = String(ref).replace(/'/g, "\\'");
     finder = `mcpFindRef('${safeRef}')`;
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     finder = `mcpQuerySelectorDeep('${sel}')`;
   } else {
     throw new Error("reactSelectSet requires 'ref' or 'selector'");
@@ -2062,7 +2234,7 @@ export async function reactSelectListOptions({ selector, ref }) {
     const safeRef = String(ref).replace(/'/g, "\\'");
     finder = `mcpFindRef('${safeRef}')`;
   } else if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     finder = `mcpQuerySelectorDeep('${sel}')`;
   } else {
     throw new Error("reactSelectListOptions requires 'ref' or 'selector'");
@@ -2076,7 +2248,7 @@ export async function fillForm({ fields }) {
   // Same React-state-sync logic as `fill`: _valueTracker reset, prototype-correct setter,
   // InputEvent with inputType, composed events for shadow DOM, dialog-aware blur.
   const fieldsJSON = JSON.stringify(fields.map(f => ({
-    s: f.selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'"),
+    s: escJsSingleQuote(f.selector),
     v: f.value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n"),
   })));
   return runJS(
@@ -2171,7 +2343,7 @@ export async function nativeType({ value, selector, ref }) {
   if (!value) throw new Error("nativeType requires 'value'");
   // Focus the target element if selector/ref provided
   if (ref || selector) {
-    const sel = ref ? refSelector(ref) : selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = ref ? refSelector(ref) : escJsSingleQuote(selector);
     await runJS(`(function(){ var el=document.querySelector('${sel}'); if(el){el.focus();el.click();} return el?'focused':'not found'; })()`);
     await new Promise(r => setTimeout(r, 50));
   }
@@ -2289,13 +2461,28 @@ export async function pressKey({ key, modifiers = [] }) {
   // Non-modifier keys: pure JavaScript (no System Events)
   const jsKey = jsKeyMap[k] || key;
   const safeKey = jsKey.replace(/'/g, "\\'");
+  // W3C `code` values: special keys are NOT "Key"-prefixed ("Enter", "ArrowUp", ...);
+  // only letters are ("KeyA"), digits are "Digit1". Apps that route on event.code
+  // (Notion, Monaco, Google Docs) ignore a bogus "KeyEnter".
+  const jsCodeMap = {
+    "Enter": "Enter", "Tab": "Tab", "Escape": "Escape", " ": "Space",
+    "Backspace": "Backspace", "Delete": "Delete",
+    "ArrowUp": "ArrowUp", "ArrowDown": "ArrowDown", "ArrowLeft": "ArrowLeft", "ArrowRight": "ArrowRight",
+    "Home": "Home", "End": "End", "PageUp": "PageUp", "PageDown": "PageDown",
+    "F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6",
+  };
+  const jsCode = jsCodeMap[jsKey]
+    || (/^[a-z]$/i.test(jsKey) ? "Key" + jsKey.toUpperCase()
+      : /^[0-9]$/.test(jsKey) ? "Digit" + jsKey
+        : jsKey);
+  const safeCode = jsCode.replace(/'/g, "\\'");
   const shiftKey = hasShift;
   const altKey = modifiers.some((m) => m.toLowerCase() === "alt");
 
   const result = await runJS(
     `(function(){
       var el = document.activeElement || document.body;
-      var opts = {key:'${safeKey}',code:'Key${safeKey.length === 1 ? safeKey.toUpperCase() : safeKey}',bubbles:true,cancelable:true,shiftKey:${shiftKey},altKey:${altKey}};
+      var opts = {key:'${safeKey}',code:'${safeCode}',bubbles:true,cancelable:true,shiftKey:${shiftKey},altKey:${altKey}};
       var down = new KeyboardEvent('keydown', opts);
       var prevented = !el.dispatchEvent(down);
       if (!prevented) {
@@ -2352,47 +2539,38 @@ export async function pressKey({ key, modifiers = [] }) {
 // real paste pipeline.
 async function _nativeTypeViaClipboard(text) {
   await _acquireClipboardLock();
+  let savedClipboard;
   try {
     // Save current clipboard
-    const savedClipboard = await _saveClipboard();
+    savedClipboard = await _saveClipboard();
 
     // Set clipboard to our text via pipe (safe from shell injection)
-    await new Promise((resolve, reject) => {
-      const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      proc.stdin.write(text);
-      proc.stdin.end();
-      proc.on("close", resolve);
-      proc.on("error", reject);
-    });
+    await _pbcopy(text);
 
     // Paste via CGEvent Cmd+V targeted to Safari window — NO activate, NO focus steal
     // MUST have windowId — global CGEvent (windowId=0) would steal focus and move mouse
     const geo = await _getSafariWindowGeometry();
     if (!geo.windowId) {
-      // Can't get window ID — restore clipboard and let catch block release lock
-      await _restoreClipboard(savedClipboard);
       throw new Error("Cannot native-paste without Safari window ID — would steal focus");
     }
     // keyCode 9 = V key, flags: ["cmd"]
     await _helperNativeKeyboard(9, ["cmd"], geo.windowId);
 
-    // Wait for paste to settle, then restore clipboard immediately
+    // Wait for paste to settle
     await new Promise(r => setTimeout(r, 100)); // 100ms is enough for Cmd+V to process
-    await _restoreClipboard(savedClipboard);
-    _releaseClipboardLock();
-
     return `Typed ${text.length} chars (native paste into iframe)`;
-  } catch (err) {
-    // Ensure lock is released on ANY error (including the windowId check above)
+  } finally {
+    // ALWAYS restore the user's clipboard + release the lock — even if the daemon died
+    // mid-paste — so the user never silently inherits the tool's pasted text.
+    if (savedClipboard !== undefined) await _restoreClipboard(savedClipboard).catch(() => {});
     if (_clipboardLocked) _releaseClipboardLock();
-    throw err;
   }
 }
 
 export async function typeText({ text, selector, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     await runJS(`document.querySelector('${sel}')?.focus()`);
     // Quick poll for focus to settle (was 200ms fixed sleep)
     await new Promise((r) => setTimeout(r, 30));
@@ -2589,13 +2767,7 @@ export async function replaceEditorContent({ text }) {
       await _acquireClipboardLock();
       try {
         const savedClip = await _saveClipboard();
-        await new Promise((resolve, reject) => {
-          const proc = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-          proc.stdin.write(text);
-          proc.stdin.end();
-          proc.on("close", resolve);
-          proc.on("error", reject);
-        });
+        await _pbcopy(text);
         await _helperNativeKeyboard(9, ["cmd"], 0); // Cmd+V global
         await new Promise(r => setTimeout(r, 200));
         await _restoreClipboard(savedClip);
@@ -2724,128 +2896,9 @@ export async function replaceEditorContent({ text }) {
 
 // ========== SCREENSHOT ==========
 
-async function installScreenshotOverlay(mode) {
-  if (!mode) return false;
-  const safeMode = String(mode).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  const result = await runJS(
-    `(function(){
-      var mode='${safeMode}';
-      var old=document.getElementById('__mcp_screenshot_overlay');
-      if(old) old.remove();
-      var wrap=document.createElement('div');
-      wrap.id='__mcp_screenshot_overlay';
-      wrap.setAttribute('data-mcp-overlay','true');
-      wrap.style.cssText='position:fixed;inset:0;z-index:2147483647;pointer-events:none;width:100vw;height:100vh;';
-      var canvas=document.createElement('canvas');
-      var dpr=window.devicePixelRatio||1;
-      canvas.width=Math.max(1,Math.round(window.innerWidth*dpr));
-      canvas.height=Math.max(1,Math.round(window.innerHeight*dpr));
-      canvas.style.cssText='width:100%;height:100%;display:block;';
-      wrap.appendChild(canvas);
-      document.documentElement.appendChild(wrap);
-      var ctx=canvas.getContext('2d');
-      ctx.scale(dpr,dpr);
-      ctx.font='11px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif';
-      ctx.lineWidth=2;
-      var lastHit=window.__mcpLastHitTest&&window.__mcpLastHitTest.point;
-
-      function ref(el){return el&&el.getAttribute?el.getAttribute('data-mcp-ref'):null;}
-      function selector(el){
-        if(!el||!el.tagName)return '';
-        var tag=el.tagName.toLowerCase();
-        if(el.id)return tag+'#'+el.id;
-        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
-        if(cls)return tag+'.'+cls;
-        return tag;
-      }
-      function text(el){
-        return ((el&&((el.innerText||el.textContent)||''))||'').replace(/\\s+/g,' ').trim().slice(0,24);
-      }
-      function isHidden(el, r, cs){
-        return !r.width||!r.height||cs.display==='none'||cs.visibility==='hidden'||cs.visibility==='collapse'||parseFloat(cs.opacity||'1')===0;
-      }
-      function isCovered(el, r){
-        var x=r.left+r.width/2, y=r.top+r.height/2;
-        if(x<0||y<0||x>window.innerWidth||y>window.innerHeight)return false;
-        var top=document.elementFromPoint(x,y);
-        return !!top&&top!==el&&!el.contains(top)&&!top.closest('#__mcp_screenshot_overlay');
-      }
-      function drawBox(el, label, color, fill){
-        var r=el.getBoundingClientRect();
-        if(r.right<0||r.bottom<0||r.left>window.innerWidth||r.top>window.innerHeight)return;
-        var x=Math.max(0,r.left), y=Math.max(0,r.top);
-        var w=Math.max(1,Math.min(window.innerWidth,r.right)-x);
-        var h=Math.max(1,Math.min(window.innerHeight,r.bottom)-y);
-        ctx.strokeStyle=color;
-        ctx.fillStyle=fill||'rgba(0,0,0,0)';
-        if(fill)ctx.fillRect(x,y,w,h);
-        ctx.strokeRect(x+1,y+1,Math.max(1,w-2),Math.max(1,h-2));
-        if(label){
-          var labelText=String(label).slice(0,36);
-          var tw=Math.min(ctx.measureText(labelText).width+8, Math.max(32,w));
-          ctx.fillStyle=color;
-          ctx.fillRect(x+1,Math.max(0,y-16),tw,15);
-          ctx.fillStyle='#fff';
-          ctx.fillText(labelText,x+5,Math.max(11,y-4));
-        }
-        var cx=r.left+r.width/2, cy=r.top+r.height/2;
-        if(cx>=0&&cy>=0&&cx<=window.innerWidth&&cy<=window.innerHeight){
-          ctx.beginPath();ctx.arc(cx,cy,3,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();
-        }
-      }
-
-      var nodes=Array.from(document.querySelectorAll('[data-mcp-ref]')).filter(function(el){return !el.closest('#__mcp_screenshot_overlay');}).slice(0,80);
-      if(mode==='refs'){
-        nodes.forEach(function(el){drawBox(el, ref(el)||selector(el), '#2563eb', 'rgba(37,99,235,0.08)');});
-      } else if(mode==='layout'){
-        nodes.forEach(function(el){
-          var r=el.getBoundingClientRect();
-          var cs=getComputedStyle(el);
-          var off=r.right<0||r.bottom<0||r.left>window.innerWidth||r.top>window.innerHeight;
-          var hidden=isHidden(el,r,cs);
-          var covered=isCovered(el,r);
-          var clipped=false;
-          var p=el.parentElement;
-          while(p&&!clipped){
-            var ps=getComputedStyle(p);
-            if(['hidden','clip','scroll','auto'].indexOf(ps.overflowX)>=0||['hidden','clip','scroll','auto'].indexOf(ps.overflowY)>=0){
-              var pr=p.getBoundingClientRect();
-              clipped=r.left<pr.left||r.top<pr.top||r.right>pr.right||r.bottom>pr.bottom;
-            }
-            p=p.parentElement;
-          }
-          var color=hidden||off?'#dc2626':(covered?'#d97706':(clipped?'#9333ea':'#16a34a'));
-          var issue=hidden?'hidden':(off?'offscreen':(covered?'covered':(clipped?'clipped':'ok')));
-          drawBox(el, (ref(el)||selector(el))+':'+issue, color, color==='#16a34a'?'rgba(22,163,74,0.05)':'rgba(220,38,38,0.08)');
-        });
-      } else if(mode==='hit_test'){
-        if(lastHit){
-          var stack=document.elementsFromPoint(lastHit.x,lastHit.y).slice(0,10);
-          stack.forEach(function(el,i){drawBox(el, i+':'+(ref(el)||selector(el)||text(el)), i===0?'#dc2626':'#0f766e', i===0?'rgba(220,38,38,0.1)':'rgba(15,118,110,0.06)');});
-          ctx.beginPath();ctx.arc(lastHit.x,lastHit.y,7,0,Math.PI*2);ctx.strokeStyle='#dc2626';ctx.lineWidth=3;ctx.stroke();
-          ctx.beginPath();ctx.moveTo(lastHit.x-12,lastHit.y);ctx.lineTo(lastHit.x+12,lastHit.y);ctx.moveTo(lastHit.x,lastHit.y-12);ctx.lineTo(lastHit.x,lastHit.y+12);ctx.stroke();
-        } else {
-          ctx.fillStyle='rgba(220,38,38,0.9)';
-          ctx.fillRect(8,8,180,20);
-          ctx.fillStyle='#fff';
-          ctx.fillText('No prior hit_test point',14,22);
-        }
-      }
-      return 'overlay installed: '+mode;
-    })()`,
-    { timeout: 5000 }
-  );
-  return typeof result === "string" && result.startsWith("overlay installed");
-}
-
-async function removeScreenshotOverlay() {
-  await runJS("(function(){var el=document.getElementById('__mcp_screenshot_overlay');if(el)el.remove();return 'overlay removed';})()", { timeout: 5000 }).catch(() => {});
-}
-
-export async function screenshot({ fullPage = false, overlay } = {}) {
+export async function screenshot({ fullPage = false } = {}) {
   await refreshTargetWindow();
   const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
-  const overlayInstalled = await installScreenshotOverlay(overlay).catch(() => false);
   try {
     // Check if target tab is a background tab — if so, use JS screenshot to avoid tab jumping
     let isBackgroundTab = false;
@@ -2861,9 +2914,12 @@ export async function screenshot({ fullPage = false, overlay } = {}) {
     const skipScreencapture = isBackgroundTab;
 
     // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
-    const windowId = !skipScreencapture ? await osascript(
+    const windowIdRaw = !skipScreencapture ? await osascript(
       `tell application "Safari" to return id of ${getTargetWindowRef()}`
     ).catch(() => null) : null;
+    // Window IDs are OS-assigned integers — reject anything non-numeric before it reaches
+    // `do shell script "screencapture -l<id>"` (defense-in-depth against odd AppleScript stdout).
+    const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
 
     // On macOS Tahoe, screencapture -l may briefly steal focus.
     // Save frontmost app via daemon so we can hide Safari if it stole focus.
@@ -2911,12 +2967,10 @@ export async function screenshot({ fullPage = false, overlay } = {}) {
             );
           }
         }
-        // Re-activate previous app if screencapture stole focus (common on macOS Tahoe)
+        // Re-activate previous app if screencapture stole focus (common on macOS Tahoe).
+        // Centralized restore handles settle delay + hide fallback if activate is blocked.
         if (previousBundleId && previousBundleId !== "com.apple.Safari") {
-          const cur = await _helperGetFrontApp();
-          if (cur?.bundleId === "com.apple.Safari") {
-            await _helperActivateApp(previousBundleId).catch(() => {});
-          }
+          await restoreFocusIfStolen(previousBundleId).catch(() => {});
         }
         // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
         // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit
@@ -2963,27 +3017,27 @@ export async function screenshot({ fullPage = false, overlay } = {}) {
       { timeout: 30000 }
     );
 
-    if (dataUrl && dataUrl !== "FALLBACK_TEXT") {
+    // canvas/SVG returns a Promise `do JavaScript` can't await → guard against the
+    // unsettled "[object Promise]"/empty value and only return a real base64 PNG.
+    const looksBase64 = typeof dataUrl === 'string' && dataUrl.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(dataUrl.slice(0, 120));
+    if (looksBase64) {
       return dataUrl;
     }
 
     // Final fallback: throw with clear message for the retry logic in index.js
     throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen Recording, then restart Safari.");
   } finally {
-    if (overlayInstalled) await removeScreenshotOverlay();
     await unlink(tmpFile).catch(() => {});
   }
 }
 
 // ========== ELEMENT SCREENSHOT ==========
 
-export async function screenshotElement({ selector, overlay }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  const overlayInstalled = await installScreenshotOverlay(overlay).catch(() => false);
+export async function screenshotElement({ selector }) {
+  const sel = escJsSingleQuote(selector);
   // Use html2canvas-like approach: capture element via SVG foreignObject
-  try {
-    const result = await runJS(
-      `(async function(){
+  const result = await runJS(
+    `(async function(){
       var el = document.querySelector('${sel}');
       if (!el) return 'Element not found: ${sel}';
       var rect = el.getBoundingClientRect();
@@ -3027,31 +3081,48 @@ export async function screenshotElement({ selector, overlay }) {
         img.src = url;
       });
     })()`,
-      { timeout: 15000 }
-    );
+    { timeout: 15000 }
+  );
 
-    if (result === "SVG_RENDER_FAILED" || result.startsWith("Element")) {
+  // The canvas/SVG path returns a Promise that `do JavaScript` can't await (so it yields
+  // "[object Promise]"/empty), and foreignObject can't render cross-origin images/fonts.
+  // Treat anything that isn't a valid base64 PNG as a render failure and fall through to
+  // the reliable screencapture+crop path.
+  const looksBase64 = typeof result === 'string' && result.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(result.slice(0, 120));
+  if (!looksBase64) {
     // Fallback: use screencapture + crop
     const tmpFile = join(tmpdir(), `safari-el-${Date.now()}.png`);
+    let cropFile = null;
     try {
-      const windowId = await osascript(`tell application "Safari" to return id of ${getTargetWindowRef()}`).catch(() => null);
+      const windowIdRaw = await osascript(`tell application "Safari" to return id of ${getTargetWindowRef()}`).catch(() => null);
+      const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
       if (!windowId) throw new Error("Cannot get Safari window ID");
 
       // Get element bounds relative to screen
       const bounds = await runJS(
-        `(function(){var el=document.querySelector('${sel}');if(!el)return '';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});})()`
+        `(function(){var el=document.querySelector('${sel}');if(!el)return '';var r=el.getBoundingClientRect();return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height),dpr:(window.devicePixelRatio||1)});})()`
       );
-      if (!bounds) throw new Error(result);
+      if (!bounds) throw new Error(typeof result === 'string' && result.startsWith('Element') ? result : 'Element not found for screenshot');
 
       // Full window screenshot then crop with sips
       await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
-      const { x, y, w, h } = JSON.parse(bounds);
-      // Use sips to crop (macOS built-in)
-      const toolbarHeight = 74; // Safari toolbar approximate height (matches _getSafariWindowGeometry)
-      const cropFile = join(tmpdir(), `safari-el-crop-${Date.now()}.png`);
+      const { x, y, w, h, dpr = 1 } = JSON.parse(bounds);
+      // Use sips to crop (macOS built-in). Use the DYNAMIC toolbar height — Sequoia+ chrome is
+      // ~90px, not 74, so a hardcoded 74 left element screenshots vertically offset. Fall back
+      // to 74 only if geometry can't be read.
+      let toolbarHeight = 74;
+      try { const g = await _getSafariWindowGeometry(); if (g?.toolbarHeight) toolbarHeight = g.toolbarHeight; } catch {}
+      // screencapture writes the window PNG at PHYSICAL resolution (2× on Retina), but the
+      // bounds + toolbar height are CSS points. Scale every crop dimension by devicePixelRatio
+      // so the crop lands on the right physical pixels instead of a half-size top-left region.
+      const sw = Math.round(w * dpr);
+      const sh = Math.round(h * dpr);
+      const sx = Math.round(x * dpr);
+      const sy = Math.round((y + toolbarHeight) * dpr);
+      cropFile = join(tmpdir(), `safari-el-crop-${Date.now()}.png`);
       await execFileAsync("sips", [
-        "-c", String(h), String(w),
-        "--cropOffset", String(y + toolbarHeight), String(x),
+        "-c", String(sh), String(sw),
+        "--cropOffset", String(sy), String(sx),
         tmpFile, "--out", cropFile
       ]);
       const data = await readFile(cropFile);
@@ -3060,16 +3131,12 @@ export async function screenshotElement({ selector, overlay }) {
       if (data.length > 100) return data.toString("base64");
     } catch (e) {
       await unlink(tmpFile).catch(() => {});
-      // Also clean cropFile if it was created before the error
-      await unlink(tmpFile.replace('safari-el-', 'safari-el-crop-')).catch(() => {});
+      if (cropFile) await unlink(cropFile).catch(() => {});  // captured path — old code rebuilt it with the wrong timestamp and leaked it
       throw new Error(`Element screenshot failed: ${e.message}`);
     }
-    }
-
-    return result;
-  } finally {
-    if (overlayInstalled) await removeScreenshotOverlay();
   }
+
+  return result;
 }
 
 // ========== SCROLL ==========
@@ -3090,9 +3157,11 @@ export async function scrollTo({ x = 0, y = 0 }) {
 
 export async function listTabs() {
   await refreshTargetWindow();
-  // If we have a tracked URL, re-resolve the index (it may have shifted)
-  // If no URL tracked, reset index (new session should open its own tab)
-  if (_activeTabURL) {
+  // Re-resolve when EITHER the URL or the tab marker is tracked — the URL may be
+  // cleared after a redirect while the marker is still valid; resetting the index
+  // then caused spurious "tab tracking lost" errors. Only a session with no
+  // tracking at all should reset.
+  if (_activeTabURL || _activeTabMarker) {
     await resolveActiveTab();
   } else {
     _activeTabIndex = null;
@@ -3120,7 +3189,7 @@ export async function listTabs() {
 
 export async function newTab(url = "") {
   await refreshTargetWindow();
-  const safeUrl = url ? url.replace(/"/g, '\\"') : "";
+  const safeUrl = escAppleScriptString(url); // url defaults to "" → escAppleScriptString("") === ""
   try {
     if (url) {
       await osascript(`tell application "Safari"\ntell ${getTargetWindowRef()}\nset userTab to current tab\nmake new tab with properties {URL:"${safeUrl}"}\nset current tab to userTab\nend tell\nend tell`);
@@ -3140,13 +3209,14 @@ export async function newTab(url = "") {
       else { await osascript('tell application "Safari" to make new document'); }
     }
   }
-  // Get count atomically from the same tell block as tab creation (avoids TOCTOU if user opens tabs concurrently)
+  // NOT atomic with the creation call above — a tab the user opens between the two
+  // osascript round-trips can skew this count; the marker stamped below self-corrects
+  // via resolveActiveTab() on the next operation.
   const tabCount = await osascriptFast(`tell application "Safari" to return count of tabs of ${getTargetWindowRef()}`);
   _activeTabIndex = Number(tabCount);  // New tab is always appended as last
   _activeTabURL = url || null;
   _lastResolveTime = Date.now();
   _lastTabCount = Number(tabCount);  // Update tab count cache
-  _lastNewTabAt = Date.now();        // (legacy — grace window superseded by _hasOwnedTab)
   _hasOwnedTab = true;               // Permanently true: this session has opened its own tab,
                                      // so write ops must NEVER fall back to the user's current tab.
   // Set bulletproof tab marker — stamped onto the tab by _stampTab() after load.
@@ -3180,6 +3250,32 @@ export async function newTab(url = "") {
 
 export async function closeTab() {
   await refreshTargetWindow();
+  // ── Guard: never close a window's LAST tab. Closing it shuts the window —
+  // which quits Safari if it's the only window, AND (for profile-targeted
+  // instances) makes the target window vanish so every later op throws
+  // "profile window not found". It also wedges a 0-tab "ghost" window that
+  // resists `close`. Per-window (not global): with SAFARI_PROFILE set, several
+  // skills race closes on the same profile window while other-profile windows
+  // exist, so a global count would wrongly allow shutting the profile window.
+  // If the target window is down to one tab, blank it instead of closing.
+  try {
+    const _winTabs = parseInt(
+      await osascript(`tell application "Safari" to return (count of tabs of ${getTargetWindowRef()})`),
+      10
+    );
+    if (Number.isFinite(_winTabs) && _winTabs <= 1) {
+      const _ref = _activeTabIndex
+        ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}`
+        : `current tab of ${getTargetWindowRef()}`;
+      await osascript(`tell application "Safari" to set URL of ${_ref} to "about:blank"`);
+      _activeTabIndex = null;
+      _activeTabURL = null;
+      _lastTabCount = null;
+      _lastResolveTime = 0;
+      return "Window's last tab blanked instead of closed (closing it would shut the window / quit Safari)";
+    }
+  } catch { /* count check failed — fall through to normal close */ }
+
   if (_activeTabIndex) {
     await osascript(
       `tell application "Safari" to close tab ${_activeTabIndex} of ${getTargetWindowRef()}`
@@ -3229,8 +3325,8 @@ export async function waitFor({ selector, text, timeout = 10000 }) {
   // `do JavaScript` can't await, so an in-page async wait loop returns immediately
   // (handing back an unsettled promise) instead of waiting. The wait loop runs on
   // the Node side: each tick re-evaluates one SYNCHRONOUS check against the page.
-  const safeSelector = selector ? selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
-  const safeText = text ? text.replace(/\\/g, "\\\\").replace(/'/g, "\\'") : "";
+  const safeSelector = selector ? escJsSingleQuote(selector) : "";
+  const safeText = text ? escJsSingleQuote(text) : "";
   if (!safeSelector && !safeText) {
     throw new Error("waitFor requires selector or text");
   }
@@ -3388,135 +3484,32 @@ export async function evaluate({ script }) {
   const wrappedJs = `(function(){ try { return (${expr}); } catch(__mcpErr) { return 'Error: ' + __mcpErr.message; } })()`;
   if (process.env.MCP_DEBUG) console.error('[evaluate] wrapped:', wrappedJs.substring(0, 300));
   const result = await runJS(wrappedJs);
+  // The regex async-sniff in _buildEvalExpr only catches a literal await/.then/async.
+  // It misses scripts whose *value* is a thenable — `Promise.resolve(5)`, an async IIFE
+  // with no inner await, any fn returning a promise. `do JavaScript` can't await those,
+  // so they come back as the literal "[object Promise]". Re-run through the async poller
+  // in that case. (Pathological: a script genuinely returning the string "[object Promise]"
+  // re-runs to the same value, so there is no downside.)
+  if (typeof result === 'string' && result.trim() === '[object Promise]') {
+    return _evaluateAsync(expr);
+  }
   if (result === null || result === undefined || result === '') {
     return '(no return value)';
   }
   return result;
 }
 
-// ========== SITE-PROVIDED HOOKS ==========
-
-function _jsonForPage(value) {
-  return JSON.stringify(value === undefined ? null : value)
-    .replace(/</g, "\\u003c")
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029");
-}
-
-export async function listSiteHooks({ timeout } = {}) {
-  const timeoutMs = Math.max(1000, Math.min(Number(timeout) || 5000, 60000));
-  return runJS(
-    `(function(){
-      function root(){
-        return window.__safariMcp || window.__safariMCP || window.__safariMcpHooks || window.__mcpSiteHooks || null;
-      }
-      function hookMap(api){
-        return (api && (api.hooks || api.workflows || api.actions)) || {};
-      }
-      function describeHook(name, hook){
-        var fn = typeof hook === 'function';
-        var meta = fn ? {} : (hook || {});
-        return {
-          name: name,
-          description: meta.description || meta.title || '',
-          readOnly: meta.readOnly !== false && meta.mutates !== true,
-          inputSchema: meta.inputSchema || meta.schema || null,
-          returns: meta.returns || null
-        };
-      }
-      var api = root();
-      if (!api) return JSON.stringify({available:false,hooks:[],contract:'window.__safariMcp = { name, version, getState, hooks: { hookName: { readOnly, description, inputSchema, run(args, context) } } }'});
-      var hooks = hookMap(api);
-      return JSON.stringify({
-        available:true,
-        name:api.name || api.app || null,
-        version:api.version || null,
-        description:api.description || null,
-        hasState:typeof api.getState === 'function' || typeof api.inspect === 'function' || typeof api.state === 'function',
-        hooks:Object.keys(hooks).map(function(name){return describeHook(name,hooks[name]);})
-      });
-    })()`,
-    { timeout: timeoutMs }
-  );
-}
-
-async function _callSiteAsync(expr, timeout = 15000) {
-  const token = '__mcpSiteHook_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const timeoutMs = Math.max(1000, Math.min(Number(timeout) || 15000, 60000));
-  const startJs =
-    `(function(){` +
-    `var token='${token}';` +
-    `window[token]={done:false,value:null,error:null};` +
-    `Promise.resolve().then(function(){return (${expr});}).then(function(v){` +
-    `window[token].value=v===undefined?null:v;window[token].done=true;` +
-    `},function(e){window[token].error=String(e&&e.message||e);window[token].done=true;});` +
-    `return token;` +
-    `})()`;
-  await runJS(startJs, { timeout: 5000 });
-  const pollJs =
-    `(function(){var s=window['${token}'];if(!s)return '__MCP_GONE__';if(!s.done)return '';` +
-    `try{return JSON.stringify({value:s.value,error:s.error});}catch(e){return JSON.stringify({error:'Hook result is not JSON-serializable: '+e.message});}})()`;
-  const deadline = Date.now() + timeoutMs;
-  let raw = "";
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    raw = await runJS(pollJs, { timeout: 5000 }).catch(() => "");
-    if (raw === "__MCP_GONE__") return JSON.stringify({ error: "page navigated while site hook was running" });
-    if (raw) break;
-  }
-  runJS(`(function(){try{delete window['${token}'];}catch(e){window['${token}']=undefined;}return '';})()`).catch(() => {});
-  if (!raw) return JSON.stringify({ error: `site hook timed out after ${timeoutMs}ms` });
-  return raw;
-}
-
-export async function getSiteState({ timeout } = {}) {
-  const expr =
-    `(function(){` +
-    `var api=window.__safariMcp||window.__safariMCP||window.__safariMcpHooks||window.__mcpSiteHooks;` +
-    `if(!api)return {available:false,error:'No site hook API registered'};` +
-    `var ctx={url:location.href,title:document.title,now:Date.now()};` +
-    `if(typeof api.getState==='function')return api.getState(ctx);` +
-    `if(typeof api.inspect==='function')return api.inspect(ctx);` +
-    `if(typeof api.state==='function')return api.state(ctx);` +
-    `if(api.state!==undefined)return api.state;` +
-    `return {available:true,error:'No getState/inspect/state hook registered'};` +
-    `})()`;
-  return _callSiteAsync(expr, timeout);
-}
-
-export async function callSiteHook({ hook, params = {}, allowWrite = false, timeout } = {}) {
-  if (!hook) return JSON.stringify({ error: "site hook call requires hook" });
-  const hookJson = _jsonForPage(String(hook));
-  const argsJson = _jsonForPage(params);
-  const expr =
-    `(function(){` +
-    `var api=window.__safariMcp||window.__safariMCP||window.__safariMcpHooks||window.__mcpSiteHooks;` +
-    `if(!api)return {error:'No site hook API registered'};` +
-    `var hooks=api.hooks||api.workflows||api.actions||{};` +
-    `var hookName=${hookJson};` +
-    `var entry=hooks[hookName];` +
-    `if(!entry)return {error:'Unknown site hook: '+hookName,available:Object.keys(hooks)};` +
-    `var fn=typeof entry==='function'?entry:(entry.run||entry.call||entry.handler);` +
-    `if(typeof fn!=='function')return {error:'Site hook is not callable: '+hookName};` +
-    `var readOnly=typeof entry==='function'?true:(entry.readOnly!==false&&entry.mutates!==true);` +
-    `if(!readOnly&&!${allowWrite ? "true" : "false"})return {error:'Hook '+hookName+' is declared readOnly:false. Retry with allowWrite:true on an MCP-owned tab.',readOnly:false};` +
-    `var ctx={url:location.href,title:document.title,now:Date.now(),hook:hookName,readOnly:readOnly};` +
-    `return fn.call(entry,${argsJson},ctx);` +
-    `})()`;
-  return _callSiteAsync(expr, timeout);
-}
-
 // ========== ELEMENT INFO ==========
 
 export async function getElementInfo({ selector }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   return runJS(
     `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';var r=el.getBoundingClientRect();return JSON.stringify({tag:el.tagName,text:el.textContent.trim().substring(0,200),href:el.href||'',value:el.value||'',visible:r.width>0&&r.height>0,rect:{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)},attrs:Object.fromEntries([...el.attributes].map(function(a){return[a.name,a.value.substring(0,100)]}))})})()`
   );
 }
 
 export async function querySelectorAll({ selector, limit = 20 }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   return runJS(
     `JSON.stringify([...document.querySelectorAll('${sel}')].slice(0,${Number(limit)}).map(function(el,i){return{index:i,tag:el.tagName,text:el.textContent.trim().substring(0,100),href:el.href||undefined,value:el.value||undefined}}))`
   );
@@ -3527,7 +3520,7 @@ export async function querySelectorAll({ selector, limit = 20 }) {
 export async function hover({ selector, x, y, ref }) {
   if (ref) selector = refSelector(ref);
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found';el.scrollIntoView({block:'center'});el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));el.dispatchEvent(new MouseEvent('mouseenter',{bubbles:true}));return 'Hovered: '+el.tagName;})()`
     );
@@ -3540,111 +3533,11 @@ export async function hover({ selector, x, y, ref }) {
   throw new Error("hover requires selector or x/y coordinates");
 }
 
-export async function hitTest({ x, y, ref } = {}) {
-  const options = {
-    x: x === undefined ? null : Number(x),
-    y: y === undefined ? null : Number(y),
-    ref: ref || null,
-  };
-  return runJS(
-    `(function(){
-      var opts=${JSON.stringify(options)};
-      function getShadowRoot(el){return window.__mcpGetShadowRoot ? window.__mcpGetShadowRoot(el) : (el && el.shadowRoot ? el.shadowRoot : null);}
-      function walkDeep(root, visit){
-        if(!root||!visit)return;
-        var children=root.children||[];
-        for(var i=0;i<children.length;i++){
-          var child=children[i];
-          if(visit(child)===false)return false;
-          var shadow=getShadowRoot(child);
-          if(shadow&&walkDeep(shadow,visit)===false)return false;
-          if(walkDeep(child,visit)===false)return false;
-        }
-      }
-      function resolveByRef(refValue){
-        if(!refValue)return null;
-        var found=null;
-        walkDeep(document.documentElement,function(node){
-          if(node.getAttribute&&node.getAttribute('data-mcp-ref')===refValue){found=node;return false;}
-        });
-        return found;
-      }
-      function selector(el){
-        if(!el||!el.tagName)return null;
-        var tag=el.tagName.toLowerCase();
-        if(el.id)return tag+'#'+el.id;
-        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
-        if(cls)return tag+'.'+cls;
-        if(el.getAttribute&&el.getAttribute('name'))return tag+'[name="'+el.getAttribute('name').slice(0,40)+'"]';
-        if(el.getAttribute&&el.getAttribute('data-testid'))return tag+'[data-testid="'+el.getAttribute('data-testid').slice(0,40)+'"]';
-        return tag;
-      }
-      function text(el){
-        return ((el&&((el.innerText||el.textContent)||''))||'').replace(/\\s+/g,' ').trim().slice(0,60);
-      }
-      function refOf(el){return el&&el.getAttribute?el.getAttribute('data-mcp-ref'):null;}
-      function roleOf(el){return el&&el.getAttribute?(el.getAttribute('role')||null):null;}
-      function isInteractive(el){
-        if(!el||!el.tagName)return false;
-        var tag=el.tagName;
-        return ['A','BUTTON','INPUT','TEXTAREA','SELECT','SUMMARY','LABEL'].indexOf(tag)>=0 ||
-          !!roleOf(el) || el.getAttribute('tabindex')!==null || !!el.onclick || !!el.isContentEditable;
-      }
-      var intended=null;
-      var point=null;
-      if(opts.ref){
-        intended=resolveByRef(opts.ref);
-        if(!intended)return JSON.stringify({ error:'Ref not found: '+opts.ref });
-        var r=intended.getBoundingClientRect();
-        point={ x:Math.round((r.left+r.width/2)*100)/100, y:Math.round((r.top+r.height/2)*100)/100 };
-      } else if(Number.isFinite(opts.x)&&Number.isFinite(opts.y)) {
-        point={ x:opts.x, y:opts.y };
-      } else {
-        return JSON.stringify({ error:'hit_test requires ref or x/y' });
-      }
-      var stack=document.elementsFromPoint(point.x,point.y);
-      var items=stack.map(function(el, index){
-        var cs=getComputedStyle(el);
-        return {
-          depth:index,
-          ref:refOf(el),
-          tag:el.tagName,
-          selector:selector(el),
-          text:text(el),
-          role:roleOf(el),
-          pointerEvents:cs.pointerEvents,
-          visibility:cs.visibility,
-          opacity:cs.opacity,
-          interactive:isInteractive(el)
-        };
-      });
-      var actionable=null;
-      for(var i=0;i<stack.length;i++){
-        if(isInteractive(stack[i]) && getComputedStyle(stack[i]).pointerEvents!=='none'){
-          actionable={ ref:refOf(stack[i]), tag:stack[i].tagName, selector:selector(stack[i]), depth:i, reason:i===0?'topmost interactive element':'first interactive element in stack' };
-          break;
-        }
-      }
-      var topmost=stack[0]||null;
-      var intendedTopmost=!!intended && !!topmost && (topmost===intended || intended.contains(topmost));
-      var result={
-        point:point,
-        stack:items,
-        actionable:actionable,
-        intended: intended ? { ref:opts.ref, selector:selector(intended), tag:intended.tagName, topmostAtCenter:intendedTopmost } : null
-      };
-      window.__mcpLastHitTest={ point:point, ref:opts.ref||null, time:Date.now() };
-      return JSON.stringify(result);
-    })()`,
-    { timeout: 5000 }
-  );
-}
-
 // ========== DIALOG HANDLING ==========
 
 export async function handleDialog({ action = "accept", text }) {
   if (text !== undefined) {
-    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeText = escJsSingleQuote(text);
     await runJS(
       `window.__mcp_dialog_response='${safeText}';window.__origPrompt=window.prompt;window.prompt=function(){var r=window.__mcp_dialog_response;window.prompt=window.__origPrompt;return r;}`
     );
@@ -3663,53 +3556,12 @@ export async function handleDialog({ action = "accept", text }) {
 
 // ========== WINDOW ==========
 
-async function _getViewportInfo() {
-  const raw = await runJS(
-    "JSON.stringify({innerWidth:window.innerWidth,innerHeight:window.innerHeight,outerWidth:window.outerWidth,outerHeight:window.outerHeight,visualWidth:window.visualViewport?window.visualViewport.width:null,visualHeight:window.visualViewport?window.visualViewport.height:null,devicePixelRatio:window.devicePixelRatio||1})",
-    { timeout: 5000 }
-  );
-  return JSON.parse(raw);
-}
-
-async function _waitForViewportChange(previous, timeout = 2500) {
-  const deadline = Date.now() + timeout;
-  let current = null;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 100));
-    try {
-      current = await _getViewportInfo();
-      if (!previous || current.innerWidth !== previous.innerWidth || current.innerHeight !== previous.innerHeight) {
-        return current;
-      }
-    } catch { /* retry */ }
-  }
-  return current || previous;
-}
-
-function _viewportChanged(before, after) {
-  return !!before && !!after && (
-    after.innerWidth !== before.innerWidth ||
-    after.innerHeight !== before.innerHeight ||
-    after.outerWidth !== before.outerWidth ||
-    after.outerHeight !== before.outerHeight ||
-    after.visualWidth !== before.visualWidth ||
-    after.visualHeight !== before.visualHeight
-  );
-}
-
 export async function resizeWindow({ width, height }) {
   await refreshTargetWindow();
-  const before = await _getViewportInfo().catch(() => null);
   await osascript(
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(width)}, ${Number(height)}}`
   );
-  const viewport = await _waitForViewportChange(before);
-  return JSON.stringify({
-    requested: { width: Number(width), height: Number(height) },
-    viewport,
-    changed: _viewportChanged(before, viewport),
-    layoutChanged: !!before && !!viewport && (viewport.innerWidth !== before.innerWidth || viewport.innerHeight !== before.innerHeight),
-  });
+  return `Resized to ${width}x${height}`;
 }
 
 // ========== COOKIES & STORAGE ==========
@@ -3720,11 +3572,11 @@ export async function getCookies() {
 
 export async function getLocalStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`localStorage.getItem('${safeKey}')`);
   }
   return runJS(
-    "JSON.stringify(Object.fromEntries(Object.keys(localStorage).map(function(k){return[k,localStorage.getItem(k).substring(0,200)]})))"
+    "JSON.stringify(Object.fromEntries(Object.keys(localStorage).map(function(k){var v=localStorage.getItem(k);return[k,v==null?null:v.substring(0,200)]})))"
   );
 }
 
@@ -3740,8 +3592,8 @@ export async function getNetworkRequests({ limit = 50 } = {}) {
 
 export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, targetX, targetY }) {
   if (sourceSelector && targetSelector) {
-    const srcSel = sourceSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    const tgtSel = targetSelector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const srcSel = escJsSingleQuote(sourceSelector);
+    const tgtSel = escJsSingleQuote(targetSelector);
     return runJS(
       `(function(){` +
       `var src=document.querySelector('${srcSel}');var tgt=document.querySelector('${tgtSel}');` +
@@ -3777,50 +3629,34 @@ export async function drag({ sourceSelector, targetSelector, sourceX, sourceY, t
 
 // ========== FILE PATH SAFETY ==========
 // Prevent reading sensitive system files via upload/paste tools
-async function _validateFilePath(filePath) {
+function _validateFilePath(filePath) {
   const resolved = resolvePath(filePath);
-  const linkInfo = await lstat(resolved);
-  if (linkInfo.isSymbolicLink()) throw new Error("Symlink file paths are not allowed: " + filePath);
-  if (!linkInfo.isFile()) throw new Error("File path must point to a regular file: " + filePath);
-  if (linkInfo.size > LOCAL_FILE_MAX_BYTES) {
-    throw new Error(`File too large: ${filePath} (${linkInfo.size} bytes, max ${LOCAL_FILE_MAX_BYTES})`);
-  }
-  const real = await realpath(resolved);
+  // resolve() already collapses "..", so checking the RESOLVED path for it is a dead no-op.
+  // Reject traversal sequences in the RAW input instead; the allowlist below is the real guard.
+  if (/(^|[/\\])\.\.([/\\]|$)/.test(filePath)) throw new Error("Path traversal not allowed: " + filePath);
   const blocked = ['.ssh', '.gnupg', '.aws', '.config/gcloud', 'credentials', '.env', '.npmrc', '.netrc', 'id_rsa', 'id_ed25519', '.keychain'];
-  const lower = real.toLowerCase();
-  for (const b of blocked) {
-    if (lower.includes(b)) throw new Error("Blocked: reading sensitive path " + filePath);
+  // Resolve symlinks when the target exists, so a symlink under /Users/ pointing at /etc
+  // can't slip past the allowlist. Falls back to the lexical path when the file doesn't
+  // exist yet (e.g. savePDF's output path).
+  let real = resolved;
+  try { real = realpathSync(resolved); } catch { /* not created yet — keep lexical path */ }
+  for (const checkPath of new Set([resolved, real])) {
+    const lower = checkPath.toLowerCase();
+    for (const b of blocked) {
+      if (lower.includes(b)) throw new Error("Blocked: sensitive path " + filePath);
+    }
+    // realpathSync resolves /var/folders/... to /private/var/folders/... on macOS —
+    // without the /private form an EXISTING file under /var/folders was rejected.
+    if (!checkPath.startsWith('/Users/') && !checkPath.startsWith('/tmp/') && !checkPath.startsWith('/var/folders/') && !checkPath.startsWith('/private/tmp/') && !checkPath.startsWith('/private/var/folders/')) {
+      throw new Error("File path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
+    }
   }
-  // Must be under /Users/ or /tmp/ or /var/folders/ (macOS temp)
-  if (!real.startsWith('/Users/') && !real.startsWith('/tmp/') && !real.startsWith('/var/folders/') && !real.startsWith('/private/tmp/')) {
-    throw new Error("File path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
-  }
-  return real;
-}
-
-async function _validateOutputPath(filePath, extension) {
-  const resolved = resolvePath(filePath);
-  if (extension && !resolved.toLowerCase().endsWith(extension)) {
-    throw new Error(`Output path must end with ${extension}: ${filePath}`);
-  }
-  try {
-    const info = await lstat(resolved);
-    if (info.isSymbolicLink()) throw new Error("Symlink output paths are not allowed: " + filePath);
-  } catch (err) {
-    if (err.code !== "ENOENT") throw err;
-  }
-  const parent = dirname(resolved);
-  const realParent = await realpath(parent);
-  if (!realParent.startsWith('/Users/') && !realParent.startsWith('/tmp/') && !realParent.startsWith('/var/folders/') && !realParent.startsWith('/private/tmp/')) {
-    throw new Error("Output path must be under /Users/, /tmp/, or /var/folders/: " + filePath);
-  }
-  return resolved;
 }
 
 // ========== UPLOAD FILE ==========
 
 export async function uploadFile({ selector, filePath }) {
-  const validatedPath = await _validateFilePath(filePath);
+  _validateFilePath(filePath);
   // Read file in Node.js, send as base64 to Safari JS, create File + DataTransfer
   // NO file dialog, NO System Events, NO focus stealing
 
@@ -3846,11 +3682,11 @@ export async function uploadFile({ selector, filePath }) {
     end tell`
   ).catch(() => {}); // Ignore if no dialog open
 
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   const { basename, extname } = await import("node:path");
-  let fileName = basename(validatedPath);
-  let ext = extname(validatedPath).toLowerCase().replace(".", "");
-  let resolvedPath = validatedPath;
+  let fileName = basename(filePath);
+  let ext = extname(filePath).toLowerCase().replace(".", "");
+  let resolvedPath = filePath;
 
   // Auto-convert images that the target input rejects.
   // Quora is the canonical case — declares accept="image/png,image/jpeg" and silently
@@ -3895,9 +3731,11 @@ export async function uploadFile({ selector, filePath }) {
   const mime = mimeMap[ext] || "application/octet-stream";
   const safeName = fileName.replace(/'/g, "\\'");
 
-  // Send to Safari via runJSLarge (handles files >260KB via temp file)
+  // Send to Safari via runJSLarge (handles files >260KB via temp file).
+  // Fully synchronous IIFE — `do JavaScript` can't await a Promise, so an `async`
+  // wrapper would hand back "[object Promise]" before the body settled.
   const result = await runJSLarge(
-    `(async function(){
+    `(function(){
       // Deep query: main document → shadow DOM → iframes
       function deepQuery(sel) {
         var el = document.querySelector(sel);
@@ -3944,8 +3782,8 @@ export async function uploadFile({ selector, filePath }) {
       el.dispatchEvent(new Event('change', { bubbles: true }));
       el.dispatchEvent(new Event('input', { bubbles: true }));
 
-      // Wait briefly for framework to process drop events before checking
-      await new Promise(function(r) { setTimeout(r, 200); });
+      // No await here: do-JavaScript cannot await a Promise, and the drop events above
+      // already dispatched synchronously. A framework that needs a tick is surfaced by the hint below.
 
       // Re-check after drop
       if (el.files && el.files.length > 0) {
@@ -3959,23 +3797,25 @@ export async function uploadFile({ selector, filePath }) {
     { timeout: 30000 }
   );
 
+  // Clean up the temp PNG produced by any sips image conversion above (was leaked before).
+  if (resolvedPath !== filePath) await unlink(resolvedPath).catch(() => {});
   return result;
 }
 
 // ========== PASTE IMAGE FROM FILE ==========
 
 export async function pasteImageFromFile({ filePath }) {
-  const validatedPath = await _validateFilePath(filePath);
+  _validateFilePath(filePath);
   // Paste image via JS ClipboardEvent — NO clipboard touch, NO System Events, NO focus steal
   const { extname } = await import("node:path");
-  const ext = extname(validatedPath).toLowerCase().replace(".", "");
+  const ext = extname(filePath).toLowerCase().replace(".", "");
   const mimeMap = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
   const mime = mimeMap[ext] || "image/png";
 
   // Read image as base64
-  const fileData = await readFile(validatedPath);
+  const fileData = await readFile(filePath);
   const base64 = fileData.toString("base64");
-  const fileName = validatedPath.split("/").pop().replace(/'/g, "\\'");
+  const fileName = filePath.split("/").pop().replace(/'/g, "\\'");
 
   // Use runJSLarge — images are often >260KB as base64
   const result = await runJSLarge(
@@ -4020,9 +3860,6 @@ export async function pasteImageFromFile({ filePath }) {
 export async function emulate({ device, width, height, userAgent, scale = 1 }) {
   await refreshTargetWindow();
   const devices = {
-    "iphone-15": { width: 393, height: 852, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
-    "iphone-15-pro": { width: 393, height: 852, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
-    "iphone-15-pro-max": { width: 430, height: 932, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
     "iphone-14": { width: 390, height: 844, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
     "iphone-14-pro-max": { width: 430, height: 932, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
     "ipad": { width: 820, height: 1180, ua: "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
@@ -4031,18 +3868,15 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
     "galaxy-s24": { width: 412, height: 915, ua: "Mozilla/5.0 (Linux; Android 14; SM-S921B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36" },
   };
 
-  const deviceKey = device ? device.toLowerCase().trim().replace(/\s+/g, "-") : "";
-  const d = deviceKey ? devices[deviceKey] : null;
+  const d = device ? devices[device.toLowerCase()] : null;
   const w = d ? d.width : (width || 375);
   const h = d ? d.height : (height || 812);
   const ua = d ? d.ua : (userAgent || "");
-  const before = await _getViewportInfo().catch(() => null);
 
   // Resize Safari window to match device
   await osascript(
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${w}, ${h + 100}}`
   );
-  const viewportAfterResize = await _waitForViewportChange(before);
 
   // Override viewport meta and user agent if specified
   if (ua) {
@@ -4056,187 +3890,19 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
     `(function(){var m=document.querySelector('meta[name=viewport]');if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}m.content='width=${w},initial-scale=${scale}';})()`
   );
 
-  // Reload to apply changes
-  // Reload and wait via inline JS polling (not fixed sleep)
-  await runJS(
-    `(async function(){location.reload();await new Promise(function(r){setTimeout(r,300)});for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return 'done';})()`
-  );
-  const viewport = await _getViewportInfo().catch(() => viewportAfterResize);
+  // Reload to apply changes, then wait for load — polled from Node (`do JavaScript`
+  // can't await an in-page loop).
+  const navIndex = _activeTabIndex;
+  await runJS("location.reload()", { tabIndex: navIndex });
+  await new Promise(r => setTimeout(r, 200));
+  await _pollReadyAndRead(navIndex);
 
   return JSON.stringify({
     device: device || "custom",
     width: w,
     height: h,
-    viewport,
-    resized: _viewportChanged(before, viewportAfterResize),
-    layoutChanged: !!before && !!viewportAfterResize && (viewportAfterResize.innerWidth !== before.innerWidth || viewportAfterResize.innerHeight !== before.innerHeight),
     userAgent: ua ? ua.substring(0, 60) + "..." : "(default)",
   });
-}
-
-// ========== LAYOUT OBSERVATION ==========
-
-export async function observeLayout({ selector = "body" } = {}) {
-  const safeSelector = String(selector || "body").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  return runJS(
-    `(function(){
-      var selector='${safeSelector}';
-      var target=document.querySelector(selector)||document.body||document.documentElement;
-      if(!target)return JSON.stringify({error:'observe_layout target not found: '+selector});
-      if(window.__mcpLayoutObserverState&&window.__mcpLayoutObserverState.disconnect){
-        window.__mcpLayoutObserverState.disconnect();
-      }
-      var events=[];
-      var maxEvents=200;
-      var seq=0;
-      function ref(el){return el&&el.getAttribute?el.getAttribute('data-mcp-ref'):null;}
-      function selectorFor(el){
-        if(!el||!el.tagName)return null;
-        var tag=el.tagName.toLowerCase();
-        if(el.id)return tag+'#'+el.id;
-        var testid=el.getAttribute&&el.getAttribute('data-testid');
-        if(testid)return tag+'[data-testid="'+testid.slice(0,40)+'"]';
-        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
-        if(cls)return tag+'.'+cls;
-        return tag;
-      }
-      function rect(el){
-        if(!el||!el.getBoundingClientRect)return null;
-        var r=el.getBoundingClientRect();
-        return {x:Math.round(r.left*100)/100,y:Math.round(r.top*100)/100,width:Math.round(r.width*100)/100,height:Math.round(r.height*100)/100};
-      }
-      function describe(el){
-        return {ref:ref(el),selector:selectorFor(el),tag:el&&el.tagName||null,rect:rect(el)};
-      }
-      function push(event){
-        event.seq=++seq;
-        event.time=Date.now();
-        events.push(event);
-        if(events.length>maxEvents)events.splice(0,events.length-maxEvents);
-      }
-      var mutationObserver=new MutationObserver(function(records){
-        records.slice(0,40).forEach(function(record){
-          push({
-            type:'mutation',
-            kind:record.type,
-            target:describe(record.target),
-            attribute:record.attributeName||undefined,
-            added:record.addedNodes?record.addedNodes.length:0,
-            removed:record.removedNodes?record.removedNodes.length:0
-          });
-        });
-      });
-      mutationObserver.observe(target,{subtree:true,childList:true,attributes:true,attributeFilter:['class','style','hidden','aria-hidden','aria-expanded']});
-
-      var resizeObserver=null;
-      try{
-        resizeObserver=new ResizeObserver(function(entries){
-          entries.slice(0,40).forEach(function(entry){
-            push({type:'resize',target:describe(entry.target),contentRect:{width:Math.round(entry.contentRect.width*100)/100,height:Math.round(entry.contentRect.height*100)/100}});
-          });
-        });
-        resizeObserver.observe(target);
-        Array.from(target.querySelectorAll('button,a,input,textarea,select,[role],[data-mcp-ref]')).slice(0,80).forEach(function(el){resizeObserver.observe(el);});
-      }catch(_err){}
-
-      var intersectionObserver=null;
-      try{
-        intersectionObserver=new IntersectionObserver(function(entries){
-          entries.slice(0,40).forEach(function(entry){
-            push({type:'intersection',target:describe(entry.target),isIntersecting:entry.isIntersecting,ratio:Math.round(entry.intersectionRatio*100)/100});
-          });
-        },{threshold:[0,0.01,0.5,1]});
-        intersectionObserver.observe(target);
-        Array.from(target.querySelectorAll('button,a,input,textarea,select,[role],[data-mcp-ref]')).slice(0,80).forEach(function(el){intersectionObserver.observe(el);});
-      }catch(_err){}
-
-      var performanceObserver=null;
-      try{
-        performanceObserver=new PerformanceObserver(function(list){
-          list.getEntries().forEach(function(entry){
-            if(entry.hadRecentInput)return;
-            push({type:'layout-shift',value:Math.round(entry.value*10000)/10000,sources:(entry.sources||[]).slice(0,5).map(function(source){return describe(source.node);})});
-          });
-        });
-        performanceObserver.observe({type:'layout-shift',buffered:true});
-      }catch(_err){}
-
-      var lastScroll={x:window.scrollX||0,y:window.scrollY||0};
-      function onScroll(event){
-        var source=event&&event.target&&event.target!==document?event.target:document.scrollingElement||document.documentElement;
-        var current={x:window.scrollX||0,y:window.scrollY||0};
-        push({type:'scroll',target:describe(source),from:lastScroll,to:current});
-        lastScroll=current;
-      }
-      window.addEventListener('scroll',onScroll,true);
-
-      window.__mcpLayoutEvents=events;
-      window.__mcpLayoutObserverState={
-        selector:selector,
-        startedAt:Date.now(),
-        events:events,
-        disconnect:function(){
-          try{mutationObserver.disconnect();}catch(_err){}
-          try{resizeObserver&&resizeObserver.disconnect();}catch(_err){}
-          try{intersectionObserver&&intersectionObserver.disconnect();}catch(_err){}
-          try{performanceObserver&&performanceObserver.disconnect();}catch(_err){}
-          try{window.removeEventListener('scroll',onScroll,true);}catch(_err){}
-        }
-      };
-      return JSON.stringify({observing:true,selector:selector,events:0});
-    })()`,
-    { timeout: 5000 }
-  );
-}
-
-export async function getLayoutEvents({ limit = 50, detail = false } = {}) {
-  const max = Math.max(1, Math.min(Number(limit) || 50, 200));
-  return runJS(
-    `(function(){
-      var state=window.__mcpLayoutObserverState;
-      var events=(window.__mcpLayoutEvents||[]).slice(-${max});
-      var groups={};
-      events.forEach(function(event){
-        var target=event.target||{};
-        var key=event.type+'|'+(target.ref||target.selector||target.tag||'unknown')+'|'+(event.kind||event.attribute||'');
-        if(!groups[key]){
-          groups[key]={type:event.type,count:0,target:target,kind:event.kind,attribute:event.attribute,firstSeq:event.seq,lastSeq:event.seq,lastTime:event.time};
-        }
-        groups[key].count++;
-        groups[key].lastSeq=event.seq;
-        groups[key].lastTime=event.time;
-        if(event.added)groups[key].added=(groups[key].added||0)+event.added;
-        if(event.removed)groups[key].removed=(groups[key].removed||0)+event.removed;
-        if(event.value)groups[key].value=(groups[key].value||0)+event.value;
-        if(event.to)groups[key].to=event.to;
-        if(event.isIntersecting!==undefined)groups[key].isIntersecting=event.isIntersecting;
-      });
-      var summary=Object.keys(groups).map(function(key){return groups[key];}).sort(function(a,b){return a.firstSeq-b.firstSeq;});
-      var result={
-        observing:!!state,
-        selector:state&&state.selector||null,
-        eventCount:window.__mcpLayoutEvents?window.__mcpLayoutEvents.length:0,
-        returned:events.length,
-        summary:summary.slice(0,${max})
-      };
-      if(${detail ? "true" : "false"})result.events=events;
-      return JSON.stringify(result);
-    })()`,
-    { timeout: 5000 }
-  );
-}
-
-export async function clearLayoutEvents() {
-  return runJS(
-    `(function(){
-      var state=window.__mcpLayoutObserverState;
-      if(state&&state.disconnect)state.disconnect();
-      window.__mcpLayoutObserverState=null;
-      window.__mcpLayoutEvents=[];
-      return JSON.stringify({observing:false,eventCount:0});
-    })()`,
-    { timeout: 5000 }
-  );
 }
 
 export async function resetEmulation() {
@@ -4249,9 +3915,11 @@ export async function resetEmulation() {
   await osascript(
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, 1440, 900}`
   );
-  await runJS(
-    `(async function(){location.reload();await new Promise(function(r){setTimeout(r,300)});for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}return 'done';})()`
-  );
+  // Reload + wait for load — polled from Node (`do JavaScript` can't await an in-page loop).
+  const navIndex = _activeTabIndex;
+  await runJS("location.reload()", { tabIndex: navIndex });
+  await new Promise(r => setTimeout(r, 200));
+  await _pollReadyAndRead(navIndex);
   return "Emulation reset to desktop";
 }
 
@@ -4259,7 +3927,7 @@ export async function resetEmulation() {
 
 export async function startConsoleCapture() {
   await runJS(
-    "if(!window.__mcp_console){window.__mcp_console=[];var orig={log:console.log,warn:console.warn,error:console.error,info:console.info};['log','warn','error','info'].forEach(function(level){console[level]=function(){window.__mcp_console.push({level:level,message:[].slice.call(arguments).map(String).join(' '),time:Date.now()});orig[level].apply(console,arguments);};});window.addEventListener('error',function(e){window.__mcp_console.push({level:'error',message:e.message,time:Date.now()});});}"
+    "if(!window.__mcp_console){window.__mcp_console=[];var orig={log:console.log,warn:console.warn,error:console.error,info:console.info};['log','warn','error','info'].forEach(function(level){console[level]=function(){window.__mcp_console.push({level:level,message:[].slice.call(arguments).map(String).join(' '),time:Date.now()});if(window.__mcp_console.length>2000)window.__mcp_console.shift();orig[level].apply(console,arguments);};});window.addEventListener('error',function(e){window.__mcp_console.push({level:'error',message:e.message,time:Date.now()});if(window.__mcp_console.length>2000)window.__mcp_console.shift();});}"
   );
   return "Console capture started";
 }
@@ -4276,7 +3944,7 @@ export async function clearConsoleCapture() {
 
 export async function savePDF({ path: pdfPath }) {
   await refreshTargetWindow();
-  const safePdfPath = await _validateOutputPath(pdfPath, ".pdf");
+  _validateFilePath(pdfPath);  // allowlist (/Users//tmp//var-folders) + block sensitive paths — prevents arbitrary overwrite
   // NO focus stealing — uses screencapture + Python Quartz to generate PDF
 
   // Step 1: Get full page dimensions
@@ -4294,9 +3962,11 @@ export async function savePDF({ path: pdfPath }) {
   await new Promise(r => setTimeout(r, 500)); // Let page reflow
 
   // Step 3: Take screenshot via screencapture -l (window-targeted, NO focus steal)
-  const windowId = await osascript(
+  const windowIdRaw = await osascript(
     `tell application "Safari" to return id of ${getTargetWindowRef()}`
   );
+  const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
+  if (!windowId) throw new Error("Cannot get Safari window ID for PDF capture");
   const tmpPng = join(tmpdir(), `safari-mcp-pdf-${Date.now()}.png`);
   try {
     // Use do shell script to inherit osascript's Screen Recording permission
@@ -4315,15 +3985,17 @@ export async function savePDF({ path: pdfPath }) {
     `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${origBounds}}`
   ).catch(() => {});
 
-  // Step 5: Convert screenshot to PDF using Python3 + macOS Quartz (no external deps)
+  // Step 5: Convert screenshot to PDF using Python3 + macOS Quartz (no external deps).
+  // Paths are passed as argv — NOT interpolated into the source — so there is no shell
+  // or Python string-escaping to get wrong, and no code-injection surface.
   try {
     await execFileAsync("python3", ["-c", `
 import sys
 from Quartz import CGImageSourceCreateWithURL, CGImageSourceCreateImageAtIndex, CGImageGetWidth, CGImageGetHeight, CGPDFContextCreateWithURL, CGRectMake, CGPDFContextBeginPage, CGPDFContextEndPage, CGContextDrawImage
 from CoreFoundation import CFURLCreateFromFileSystemRepresentation
 
-png_path = sys.argv[1].encode("utf-8")
-pdf_path = sys.argv[2].encode("utf-8")
+png_path = sys.argv[1].encode('utf-8')
+pdf_path = sys.argv[2].encode('utf-8')
 
 src_url = CFURLCreateFromFileSystemRepresentation(None, png_path, len(png_path), False)
 img_src = CGImageSourceCreateWithURL(src_url, None)
@@ -4342,14 +4014,14 @@ CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img)
 CGPDFContextEndPage(ctx)
 del ctx
 print(f"OK {w}x{h}")
-`.trim(), tmpPng, safePdfPath], { timeout: 15000 });
+`.trim(), tmpPng, pdfPath], { timeout: 15000 });
   } catch (err) {
     throw new Error(`PDF conversion failed: ${err.message}`);
   } finally {
     unlink(tmpPng).catch(() => {});
   }
 
-  return `PDF saved to: ${safePdfPath} (image-based, no focus stealing)`;
+  return `PDF saved to: ${pdfPath} (image-based, no focus stealing)`;
 }
 
 // ========== SNAPSHOT — ref-based interaction (like Chrome DevTools MCP) ==========
@@ -4543,10 +4215,14 @@ export function refSelector(ref) {
 // Execute multiple safari.js operations in a single tool call
 // Avoids round-trip overhead of calling tools one by one
 // script is a JSON array of steps: [{action: "navigate", args: {url: "..."}}, {action: "click", args: {selector: "..."}}, ...]
-export async function runScript({ steps }) {
+export async function runScript({ steps, onStep }) {
   const results = [];
   for (const step of steps) {
     const { action, args = {} } = step;
+    // Safety callback (tab-ownership, wired by index.js) runs OUTSIDE the per-step
+    // try/catch: a refusal must abort the whole batch, not be recorded as a step
+    // error and silently continue to the next step.
+    if (onStep) onStep(action, args);
     try {
       // Map action names to safari.js functions
       const actions = {
@@ -4560,7 +4236,10 @@ export async function runScript({ steps }) {
         getCookies, setCookie, deleteCookies, getElementInfo, querySelectorAll,
         extractTables, extractMeta, extractImages, extractLinks,
         analyzePage, detectForms, getAccessibilityTree, getPerformanceMetrics,
-        listSiteHooks, getSiteState, callSiteHook,
+        // Previously-missing actions — these tools existed but couldn't be batched.
+        verifyState, reactSelectSet, reactSelectListOptions,
+        nativeClick, nativeHover, nativeType, nativeKeyboard,
+        replaceEditorContent, uploadFile, mockNetworkRoute,
       };
       const fn = actions[action];
       if (!fn) {
@@ -4635,15 +4314,18 @@ export async function getAccessibilityTree({ selector, maxDepth = 5 }) {
 // ========== COOKIE CRUD ==========
 
 export async function setCookie({ name, value, domain, path: cookiePath, expires, secure, sameSite, httpOnly }) {
-  const safeName = name.replace(/'/g, "\\'");
-  const safeValue = value.replace(/'/g, "\\'");
+  const safeName = escJsSingleQuote(name);
+  const safeValue = escJsSingleQuote(value);
+  // Every interpolated attribute goes through escJsSingleQuote — path/domain/expires
+  // used to be embedded raw and then "escaped" with a quote-only replace (no
+  // backslash-first), which both broke legitimate values and re-opened the literal.
   let cookie = `${safeName}=${safeValue}`;
-  if (cookiePath) cookie += `; path=${cookiePath}`;
-  if (domain) cookie += `; domain=${domain}`;
-  if (expires) cookie += `; expires=${expires}`;
+  if (cookiePath) cookie += `; path=${escJsSingleQuote(cookiePath)}`;
+  if (domain) cookie += `; domain=${escJsSingleQuote(domain)}`;
+  if (expires) cookie += `; expires=${escJsSingleQuote(expires)}`;
   if (secure) cookie += '; secure';
   if (sameSite) cookie += `; samesite=${sameSite}`;
-  return runJS(`document.cookie='${cookie.replace(/'/g, "\\'")}'; 'Cookie set: ${safeName}'`);
+  return runJS(`document.cookie='${cookie}'; 'Cookie set: ${safeName}'`);
 }
 
 export async function deleteCookies({ name, all }) {
@@ -4653,7 +4335,7 @@ export async function deleteCookies({ name, all }) {
     );
   }
   if (name) {
-    const safeName = name.replace(/'/g, "\\'");
+    const safeName = escJsSingleQuote(name);
     return runJS(
       `document.cookie='${safeName}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/'; 'Deleted cookie: ${safeName}'`
     );
@@ -4665,29 +4347,29 @@ export async function deleteCookies({ name, all }) {
 
 export async function getSessionStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`sessionStorage.getItem('${safeKey}')`);
   }
   return runJS(
-    "JSON.stringify(Object.fromEntries(Object.keys(sessionStorage).map(function(k){return[k,sessionStorage.getItem(k).substring(0,200)]})))"
+    "JSON.stringify(Object.fromEntries(Object.keys(sessionStorage).map(function(k){var v=sessionStorage.getItem(k);return[k,v==null?null:v.substring(0,200)]})))"
   );
 }
 
 export async function setSessionStorage({ key, value }) {
-  const safeKey = key.replace(/'/g, "\\'");
-  const safeValue = value.replace(/'/g, "\\'");
+  const safeKey = escJsSingleQuote(key);
+  const safeValue = escJsSingleQuote(value);
   return runJS(`sessionStorage.setItem('${safeKey}','${safeValue}'); 'Set sessionStorage: ${safeKey}'`);
 }
 
 export async function setLocalStorage({ key, value }) {
-  const safeKey = key.replace(/'/g, "\\'");
-  const safeValue = value.replace(/'/g, "\\'");
+  const safeKey = escJsSingleQuote(key);
+  const safeValue = escJsSingleQuote(value);
   return runJS(`localStorage.setItem('${safeKey}','${safeValue}'); 'Set localStorage: ${safeKey}'`);
 }
 
 export async function deleteLocalStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`localStorage.removeItem('${safeKey}'); 'Deleted localStorage: ${safeKey}'`);
   }
   return runJS("var n=localStorage.length; localStorage.clear(); 'Cleared localStorage: '+n+' items'");
@@ -4695,7 +4377,7 @@ export async function deleteLocalStorage({ key }) {
 
 export async function deleteSessionStorage({ key }) {
   if (key) {
-    const safeKey = key.replace(/'/g, "\\'");
+    const safeKey = escJsSingleQuote(key);
     return runJS(`sessionStorage.removeItem('${safeKey}'); 'Deleted sessionStorage: ${safeKey}'`);
   }
   return runJS("var n=sessionStorage.length; sessionStorage.clear(); 'Cleared sessionStorage: '+n+' items'");
@@ -4770,6 +4452,9 @@ export async function clipboardWrite({ text, restore = true }) {
     // Restore clipboard after 2 seconds (reduced from 5s — shorter exposure window)
     if (restore && oldClipboard !== null) {
       if (_clipboardRestoreTimer) clearTimeout(_clipboardRestoreTimer);
+      // Stash the content so flushClipboardRestore() can restore it synchronously if the
+      // process is signalled to exit inside this 2s window — otherwise the user is left
+      // holding the tool's pasted text (violates the clipboard-safety guarantee).
       _pendingClipboardRestore = oldClipboard;
       _clipboardRestoreTimer = setTimeout(async () => {
         await _restoreClipboard(oldClipboard);
@@ -4788,6 +4473,9 @@ export async function clipboardWrite({ text, restore = true }) {
   }
 }
 
+// Synchronously flush a pending clipboard restore — called from the shutdown handler so the
+// user never inherits the tool's pasted text if the process exits inside the 2s restore
+// window. Uses spawnSync (blocking) because we're on the exit path and can't await a Promise.
 export function flushClipboardRestore() {
   if (_clipboardRestoreTimer) {
     clearTimeout(_clipboardRestoreTimer);
@@ -4798,7 +4486,7 @@ export function flushClipboardRestore() {
   _pendingClipboardRestore = undefined;
   try {
     spawnSync("pbcopy", [], { input: content });
-  } catch {}
+  } catch { /* best effort — we're exiting anyway */ }
   _releaseClipboardLock();
 }
 
@@ -4806,10 +4494,13 @@ export function flushClipboardRestore() {
 
 // Intercept fetch/XHR requests matching a URL pattern and return mock responses
 export async function mockNetworkRoute({ urlPattern, response }) {
-  const safePattern = urlPattern.replace(/'/g, "\\'").replace(/\\/g, "\\\\");
-  const safeBody = (response.body || "").replace(/'/g, "\\'").replace(/\\/g, "\\\\").replace(/\n/g, "\\n");
-  const status = response.status || 200;
-  const contentType = response.contentType || "application/json";
+  // Escape backslash FIRST, then quotes — the reverse order double-escapes the quote
+  // (\' → \\') and breaks out of the JS string literal.
+  const safePattern = escJsSingleQuote(urlPattern);
+  const safeBody = (response.body || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
+  const status = Number(response.status) || 200;
+  // contentType reaches the injected JS literal — escape it like every other field.
+  const contentType = escJsSingleQuote(response.contentType || "application/json");
 
   return runJS(
     `(function(){
@@ -4888,9 +4579,9 @@ export async function startNetworkCapture() {
       return origFetch.apply(this,arguments).then(function(resp){
         var entry={url:typeof url==='string'?url:url.url,method:opts.method||'GET',status:resp.status,statusText:resp.statusText,
           type:'fetch',duration:Date.now()-start,headers:Object.fromEntries([...resp.headers.entries()].slice(0,20)),time:new Date().toISOString()};
-        window.__mcp_network.push(entry);return resp;
+        window.__mcp_network.push(entry);if(window.__mcp_network.length>5000)window.__mcp_network.shift();return resp;
       }).catch(function(err){
-        window.__mcp_network.push({url:typeof url==='string'?url:url.url,method:opts.method||'GET',error:err.message,type:'fetch',time:new Date().toISOString()});
+        window.__mcp_network.push({url:typeof url==='string'?url:url.url,method:opts.method||'GET',error:err.message,type:'fetch',time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
         throw err;
       });
     };
@@ -4899,10 +4590,10 @@ export async function startNetworkCapture() {
       this.__mcp_method=method;this.__mcp_url=url;this.__mcp_start=Date.now();
       this.addEventListener('load',function(){
         window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,status:this.status,statusText:this.statusText,
-          type:'xhr',duration:Date.now()-this.__mcp_start,responseSize:this.responseText.length,time:new Date().toISOString()});
+          type:'xhr',duration:Date.now()-this.__mcp_start,responseSize:this.responseText.length,time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
       });
       this.addEventListener('error',function(){
-        window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,error:'Network error',type:'xhr',time:new Date().toISOString()});
+        window.__mcp_network.push({url:this.__mcp_url,method:this.__mcp_method,error:'Network error',type:'xhr',time:new Date().toISOString()});if(window.__mcp_network.length>5000)window.__mcp_network.shift();
       });
       return origXHR.apply(this,arguments);
     };}`
@@ -5111,560 +4802,6 @@ export async function extractLinks({ limit = 100, filter }) {
   );
 }
 
-// ========== STRUCTURED DOM TREE ==========
-
-export async function extractDomTree({
-  selector,
-  ref,
-  maxDepth = 5,
-  limit = 200,
-  includeText = false,
-  includeStyles = false,
-  includeGeometry = true,
-  includeHidden = false,
-  pierceShadow = true,
-} = {}) {
-  const options = {
-    selector: selector || null,
-    ref: ref || null,
-    maxDepth: Math.max(0, Math.min(Number(maxDepth) || 5, 12)),
-    limit: Math.max(1, Math.min(Number(limit) || 200, 1000)),
-    includeText: !!includeText,
-    includeStyles: !!includeStyles,
-    includeGeometry: includeGeometry !== false,
-    includeHidden: !!includeHidden,
-    pierceShadow: pierceShadow !== false,
-  };
-
-  return runJS(
-    `(function(){
-      var opts=${JSON.stringify(options)};
-      var counts={nodes:0,shadowRoots:0,iframes:0};
-      var truncated=false;
-      var nextId=0;
-      var domGen=window.__mcpDomTreeGen||0;
-      window.__mcpDomTreeGen=domGen+1;
-      var refPrefix='dom'+domGen+'_';
-      var getShadowRoot=window.__mcpGetShadowRoot||function(el){return el?(el.shadowRoot||null):null;};
-
-      function rect(el){
-        var r=el.getBoundingClientRect();
-        return {x:Math.round(r.left*100)/100,y:Math.round(r.top*100)/100,width:Math.round(r.width*100)/100,height:Math.round(r.height*100)/100};
-      }
-      function visible(el){
-        var cs=getComputedStyle(el);
-        if(cs.display==='none'||cs.visibility==='hidden'||cs.visibility==='collapse')return false;
-        var r=el.getBoundingClientRect();
-        return r.width>0&&r.height>0;
-      }
-      function selectorFor(el){
-        if(!el||!el.tagName)return null;
-        var tag=el.tagName.toLowerCase();
-        if(el.id)return tag+'#'+el.id;
-        var testid=el.getAttribute&&el.getAttribute('data-testid');
-        if(testid)return tag+'[data-testid="'+testid.slice(0,40)+'"]';
-        var name=el.getAttribute&&el.getAttribute('name');
-        if(name)return tag+'[name="'+name.slice(0,40)+'"]';
-        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
-        if(cls)return tag+'.'+cls;
-        return tag;
-      }
-      function roleOf(el){
-        var role=el.getAttribute&&el.getAttribute('role');
-        if(role)return role;
-        var tag=el.tagName.toLowerCase();
-        var map={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',img:'img',h1:'heading',h2:'heading',h3:'heading',h4:'heading',h5:'heading',h6:'heading',nav:'navigation',main:'main',header:'banner',footer:'contentinfo',form:'form',table:'table',tr:'row',th:'columnheader',td:'cell',ul:'list',ol:'list',li:'listitem',dialog:'dialog',details:'group',summary:'button',label:'label',iframe:'document',canvas:'canvas'};
-        if(tag==='input'){
-          var type=(el.type||'text').toLowerCase();
-          if(type==='checkbox')return 'checkbox';
-          if(type==='radio')return 'radio';
-          if(type==='submit'||type==='button')return 'button';
-          if(type==='file')return 'file';
-          if(type==='range')return 'slider';
-        }
-        return map[tag]||null;
-      }
-      function nameOf(el){
-        var aria=el.getAttribute&&el.getAttribute('aria-label');
-        if(aria)return aria.slice(0,80);
-        var labelled=el.getAttribute&&el.getAttribute('aria-labelledby');
-        if(labelled){
-          var label=document.getElementById(labelled);
-          if(label)return label.textContent.trim().replace(/\\s+/g,' ').slice(0,80);
-        }
-        if(el.tagName==='IMG')return (el.alt||'').slice(0,80);
-        if(['A','BUTTON','LABEL','SUMMARY'].indexOf(el.tagName)>=0)return el.textContent.trim().replace(/\\s+/g,' ').slice(0,80);
-        if(el.placeholder)return el.placeholder.slice(0,80);
-        if(el.title)return el.title.slice(0,80);
-        return '';
-      }
-      function directText(el){
-        var out='';
-        for(var i=0;i<el.childNodes.length;i++){
-          if(el.childNodes[i].nodeType===Node.TEXT_NODE)out+=el.childNodes[i].nodeValue+' ';
-        }
-        return out.replace(/\\s+/g,' ').trim().slice(0,160);
-      }
-      function styleSubset(el){
-        var cs=getComputedStyle(el);
-        return {display:cs.display,position:cs.position,visibility:cs.visibility,overflow:cs.overflow,zIndex:cs.zIndex,opacity:cs.opacity};
-      }
-      function ensureRef(el){
-        if(!el.getAttribute)return null;
-        var current=el.getAttribute('data-mcp-ref');
-        if(current)return current;
-        var created=refPrefix+(nextId++);
-        el.setAttribute('data-mcp-ref',created);
-        return created;
-      }
-      function resolveByRef(refValue){
-        if(!refValue)return null;
-        if(window.mcpFindRef){
-          var helperMatch=window.mcpFindRef(refValue);
-          if(helperMatch)return helperMatch;
-        }
-        var found=null;
-        function scan(root){
-          if(!root||found)return;
-          var all=root.querySelectorAll?root.querySelectorAll('[data-mcp-ref]'):[];
-          for(var i=0;i<all.length;i++){
-            if(all[i].getAttribute('data-mcp-ref')===refValue){found=all[i];return;}
-          }
-          var nodes=root.querySelectorAll?root.querySelectorAll('*'):[];
-          for(var j=0;j<nodes.length&&!found;j++){
-            var shadow=getShadowRoot(nodes[j]);
-            if(shadow)scan(shadow);
-          }
-        }
-        scan(document);
-        return found;
-      }
-      function queryRoot(selectorText){
-        if(!selectorText)return null;
-        if(window.mcpQuerySelectorDeep)return window.mcpQuerySelectorDeep(selectorText);
-        var direct=document.querySelector(selectorText);
-        if(direct)return direct;
-        var found=null;
-        function scan(root){
-          if(!root||found)return;
-          var all=root.querySelectorAll?root.querySelectorAll('*'):[];
-          for(var i=0;i<all.length;i++){
-            var shadow=getShadowRoot(all[i]);
-            if(shadow){
-              try{found=shadow.querySelector(selectorText);}catch(_err){}
-              if(found)return;
-              scan(shadow);
-            }
-          }
-        }
-        scan(document);
-        return found;
-      }
-      function childElements(el){
-        var children=Array.from(el.children||[]);
-        if(opts.pierceShadow){
-          var shadow=getShadowRoot(el);
-          if(shadow){
-            counts.shadowRoots++;
-            children=children.concat(Array.from(shadow.children||[]));
-          }
-        }
-        return children;
-      }
-      function iframeBoundary(el,node,depth){
-        if(el.tagName!=='IFRAME')return;
-        counts.iframes++;
-        try{
-          if(!el.contentDocument){node.iframe='not-loaded';return;}
-          node.iframe='same-origin';
-          if(depth<opts.maxDepth && counts.nodes<opts.limit){
-            var docRoot=el.contentDocument.documentElement;
-            if(docRoot)node.children=[build(docRoot,depth+1)].filter(Boolean);
-          }
-        }catch(_err){node.iframe='cross-origin';}
-      }
-      function build(el,depth){
-        if(!el||counts.nodes>=opts.limit){truncated=true;return null;}
-        if(depth>opts.maxDepth){truncated=true;return null;}
-        if(!opts.includeHidden&&!visible(el))return null;
-        counts.nodes++;
-        var shadow=getShadowRoot(el);
-        var node={
-          ref:ensureRef(el),
-          tag:el.tagName,
-          role:roleOf(el),
-          name:nameOf(el)||undefined,
-          selector:selectorFor(el),
-          shadowRoot:shadow?(opts.pierceShadow?'open':'open-unpierced'):'none'
-        };
-        if(opts.includeGeometry)node.rect=rect(el);
-        if(opts.includeText){
-          var t=directText(el);
-          if(t)node.text=t;
-        }
-        if(opts.includeStyles)node.style=styleSubset(el);
-        iframeBoundary(el,node,depth);
-        if(!node.children){
-          var kids=childElements(el);
-          var out=[];
-          for(var i=0;i<kids.length;i++){
-            if(counts.nodes>=opts.limit){truncated=true;break;}
-            var child=build(kids[i],depth+1);
-            if(child)out.push(child);
-          }
-          if(out.length)node.children=out;
-        }
-        return node;
-      }
-      var root=opts.ref?resolveByRef(opts.ref):(opts.selector?queryRoot(opts.selector):(document.body||document.documentElement));
-      if(!root)return JSON.stringify({error:opts.ref?'Ref not found: '+opts.ref:'Selector not found: '+opts.selector});
-      var result={root:build(root,0),truncated:truncated,counts:counts};
-      return JSON.stringify(result);
-    })()`,
-    { timeout: 10000 }
-  );
-}
-
-// ========== CANVAS DIAGNOSTICS ==========
-
-export async function extractCanvas({
-  selector = "canvas",
-  sampleFrames = 2,
-  sampleDelayMs = 250,
-  includePixels = false,
-  includeWebGL = true,
-  limit = 10,
-} = {}) {
-  const options = {
-    selector: selector || "canvas",
-    sampleFrames: Math.max(1, Math.min(Number(sampleFrames) || 2, 5)),
-    sampleDelayMs: Math.max(0, Math.min(Number(sampleDelayMs) || 250, 2000)),
-    includePixels: !!includePixels,
-    includeWebGL: includeWebGL !== false,
-    limit: Math.max(1, Math.min(Number(limit) || 10, 50)),
-  };
-
-  const sampleScript = `(function(){
-      var opts=${JSON.stringify(options)};
-      var getShadowRoot=window.__mcpGetShadowRoot||function(el){return el?(el.shadowRoot||null):null;};
-      function rect(canvas){
-        var r=canvas.getBoundingClientRect();
-        return {x:Math.round(r.left*100)/100,y:Math.round(r.top*100)/100,width:Math.round(r.width*100)/100,height:Math.round(r.height*100)/100};
-      }
-      function selectorFor(el){
-        if(!el||!el.tagName)return null;
-        var tag=el.tagName.toLowerCase();
-        if(el.id)return tag+'#'+el.id;
-        var cls=Array.from(el.classList||[]).slice(0,2).join('.');
-        if(cls)return tag+'.'+cls;
-        return tag;
-      }
-      function ref(el){return el&&el.getAttribute?el.getAttribute('data-mcp-ref'):null;}
-      function visible(el){
-        var cs=getComputedStyle(el);
-        var r=el.getBoundingClientRect();
-        return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden'&&cs.visibility!=='collapse'&&parseFloat(cs.opacity||'1')!==0;
-      }
-      function findCanvases(root, out, seen){
-        if(!root||out.length>=opts.limit)return;
-        var matches=[];
-        try{matches=Array.from(root.querySelectorAll(opts.selector));}catch(_err){matches=[];}
-        matches.forEach(function(canvas){
-          if(canvas.tagName==='CANVAS'&&!seen.has(canvas)&&out.length<opts.limit){seen.add(canvas);out.push(canvas);}
-        });
-        var all=root.querySelectorAll?root.querySelectorAll('*'):[];
-        for(var i=0;i<all.length&&out.length<opts.limit;i++){
-          var shadow=getShadowRoot(all[i]);
-          if(shadow)findCanvases(shadow,out,seen);
-        }
-      }
-      function contextInfo(canvas){
-        var ctx=null, type=null;
-        try{ctx=canvas.getContext('2d',{willReadFrequently:true});if(ctx)type='2d';}catch(_err){}
-        if(!ctx&&opts.includeWebGL){try{ctx=canvas.getContext('webgl2',{preserveDrawingBuffer:true});if(ctx)type='webgl2';}catch(_err){}}
-        if(!ctx&&opts.includeWebGL){try{ctx=canvas.getContext('webgl',{preserveDrawingBuffer:true})||canvas.getContext('experimental-webgl',{preserveDrawingBuffer:true});if(ctx)type='webgl';}catch(_err){}}
-        return {ctx:ctx,type:type};
-      }
-      function statsFromBytes(bytes, width, height, stride){
-        var nonZero=0, alphaNonZero=0, total=0, r=0, g=0, b=0, a=0, hash=2166136261;
-        var step=Math.max(4, stride||4);
-        for(var i=0;i<bytes.length;i+=step){
-          var rr=bytes[i]||0, gg=bytes[i+1]||0, bb=bytes[i+2]||0, aa=bytes[i+3]||0;
-          if(rr||gg||bb||aa)nonZero++;
-          if(aa)alphaNonZero++;
-          r+=rr;g+=gg;b+=bb;a+=aa;total++;
-          hash^=rr;hash=(hash*16777619)>>>0;
-          hash^=gg;hash=(hash*16777619)>>>0;
-          hash^=bb;hash=(hash*16777619)>>>0;
-          hash^=aa;hash=(hash*16777619)>>>0;
-        }
-        return {
-          width:width,
-          height:height,
-          sampledPixels:total,
-          nonZeroRatio:total?Math.round((nonZero/total)*10000)/10000:0,
-          alphaNonZeroRatio:total?Math.round((alphaNonZero/total)*10000)/10000:0,
-          avg:[total?Math.round(r/total):0,total?Math.round(g/total):0,total?Math.round(b/total):0,total?Math.round(a/total):0],
-          hash:String(hash)
-        };
-      }
-      function sampleCanvas(canvas, ctx, type){
-        try{
-          if(typeof window.__mcpBeforeCanvasSample==='function')window.__mcpBeforeCanvasSample(canvas);
-        }catch(_err){}
-        var width=canvas.width||0, height=canvas.height||0;
-        if(type==='2d'){
-          var sw=Math.min(width,64), sh=Math.min(height,64);
-          if(!sw||!sh)return {stats:statsFromBytes([],width,height),tainted:false};
-          var sampleCanvasEl=document.createElement('canvas');
-          sampleCanvasEl.width=sw;
-          sampleCanvasEl.height=sh;
-          var sampleCtx=sampleCanvasEl.getContext('2d',{willReadFrequently:true});
-          sampleCtx.drawImage(canvas,0,0,sw,sh);
-          var data=sampleCtx.getImageData(0,0,sw,sh).data;
-          return {stats:statsFromBytes(data,sw,sh),tainted:false};
-        }
-        if(type==='webgl'||type==='webgl2'){
-          var gl=ctx;
-          var gw=gl.drawingBufferWidth||width, gh=gl.drawingBufferHeight||height;
-          var rw=Math.min(gw,64), rh=Math.min(gh,64);
-          var bytes=new Uint8Array(Math.max(0,rw*rh*4));
-          if(rw&&rh)gl.readPixels(0,0,rw,rh,gl.RGBA,gl.UNSIGNED_BYTE,bytes);
-          return {stats:statsFromBytes(bytes,rw,rh),tainted:false};
-        }
-        return {stats:null,tainted:false};
-      }
-      function webglInfo(ctx, type){
-        if(!ctx||!(type==='webgl'||type==='webgl2'))return null;
-        var info={drawingBuffer:{width:ctx.drawingBufferWidth||0,height:ctx.drawingBufferHeight||0},contextLost:ctx.isContextLost?ctx.isContextLost():false};
-        try{
-          var dbg=ctx.getExtension('WEBGL_debug_renderer_info');
-          if(dbg){
-            info.vendor=ctx.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
-            info.renderer=ctx.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
-          } else {
-            info.vendor=ctx.getParameter(ctx.VENDOR);
-            info.renderer=ctx.getParameter(ctx.RENDERER);
-          }
-          var vp=ctx.getParameter(ctx.VIEWPORT);
-          if(vp)info.viewport={x:vp[0],y:vp[1],width:vp[2],height:vp[3]};
-          var err=ctx.getError();
-          info.error=err===ctx.NO_ERROR?null:err;
-        }catch(_err){}
-        return info;
-      }
-      function instrumentationInfo(canvas){
-        try{
-          if(window.__mcpGetCanvasInstrumentation)return window.__mcpGetCanvasInstrumentation(canvas);
-        }catch(_err){}
-        return null;
-      }
-      var canvases=[];
-      findCanvases(document,canvases,new Set());
-      var results=[];
-      for(var i=0;i<canvases.length;i++){
-        var canvas=canvases[i];
-        var ci=contextInfo(canvas);
-        var item={
-          ref:ref(canvas),
-          selector:selectorFor(canvas),
-          rect:rect(canvas),
-          drawingBuffer:{width:canvas.width||0,height:canvas.height||0},
-          context:ci.type||'none',
-          visible:visible(canvas),
-          tainted:false,
-          blank:null,
-          changing:null,
-          issues:[]
-        };
-        try{
-          var sample=sampleCanvas(canvas,ci.ctx,ci.type);
-          item.tainted=!!sample.tainted;
-          if(sample.stats)item.pixelSample=sample.stats;
-        }catch(err){
-          item.tainted=true;
-          item.issues.push('tainted-or-unreadable');
-        }
-        if(item.pixelSample)item.blank=item.pixelSample.nonZeroRatio===0||item.pixelSample.alphaNonZeroRatio===0;
-        if(!item.visible)item.issues.push('hidden-or-zero-size');
-        if(!item.drawingBuffer.width||!item.drawingBuffer.height)item.issues.push('zero-drawing-buffer');
-        if(item.blank===true)item.issues.push('blank');
-        if(opts.includeWebGL)item.webgl=webglInfo(ci.ctx,ci.type);
-        var instrumentation=instrumentationInfo(canvas);
-        if(instrumentation){
-          item.instrumentation=instrumentation;
-          if(item.webgl){
-            item.webgl.drawCallsLastFrame=instrumentation.drawCalls;
-            item.webgl.shaderErrors=instrumentation.shaderErrors||[];
-            item.webgl.programLinkErrors=instrumentation.programLinkErrors||[];
-            if(instrumentation.viewport)item.webgl.viewport=instrumentation.viewport;
-          }
-        }
-        if(item.webgl&&item.webgl.contextLost)item.issues.push('webgl-context-lost');
-        if(item.webgl&&item.webgl.shaderErrors&&item.webgl.shaderErrors.length)item.issues.push('shader-errors');
-        if(item.webgl&&item.webgl.programLinkErrors&&item.webgl.programLinkErrors.length)item.issues.push('program-link-errors');
-        results.push(item);
-      }
-      return JSON.stringify({canvases:results,count:results.length});
-    })()`;
-
-  const frames = [];
-  for (let i = 0; i < options.sampleFrames; i++) {
-    if (i > 0 && options.sampleDelayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, options.sampleDelayMs));
-    }
-    frames.push(JSON.parse(await runJS(sampleScript, { timeout: 10000 })));
-  }
-
-  const first = frames[0] || { canvases: [], count: 0 };
-  for (let i = 0; i < first.canvases.length; i++) {
-    const item = first.canvases[i];
-    const samples = frames.map((frame) => frame.canvases && frame.canvases[i] && frame.canvases[i].pixelSample).filter(Boolean);
-    if (samples.length) {
-      item.blank = samples[0].nonZeroRatio === 0 || samples[0].alphaNonZeroRatio === 0;
-      item.changing = samples.length > 1 && samples.some((sample) => sample.hash !== samples[0].hash);
-      if (options.includePixels) item.pixels = samples;
-      delete item.pixelSample;
-    }
-    if (options.sampleFrames > 1 && item.changing === false && !item.blank && !item.issues.includes("static")) item.issues.push("static");
-  }
-  return JSON.stringify(first);
-}
-
-export async function extractVisual({
-  selector = "canvas",
-  mode = "scene_health",
-  sampleFrames = 2,
-  sampleDelayMs = 250,
-  limit = 10,
-  includePixels = false,
-  includeWebGL = true,
-} = {}) {
-  const visualMode = ["scene_health", "pixel_stats", "threejs"].includes(mode) ? mode : "scene_health";
-  const canvasRaw = await extractCanvas({
-    selector,
-    sampleFrames,
-    sampleDelayMs,
-    includePixels: visualMode === "pixel_stats" || includePixels,
-    includeWebGL,
-    limit,
-  });
-  const canvasResult = JSON.parse(canvasRaw);
-  const canvases = canvasResult.canvases || [];
-  const issueCounts = {};
-  for (const canvas of canvases) {
-    for (const issue of canvas.issues || []) issueCounts[issue] = (issueCounts[issue] || 0) + 1;
-  }
-  const renderingCanvasCount = canvases.filter((canvas) => canvas.visible && canvas.blank === false && !canvas.tainted && !(canvas.issues || []).includes("zero-drawing-buffer")).length;
-  const animatedCanvasCount = canvases.filter((canvas) => canvas.changing === true).length;
-  const blankCanvasCount = canvases.filter((canvas) => canvas.blank === true).length;
-  const visibleCanvasCount = canvases.filter((canvas) => canvas.visible).length;
-  const webglCanvasCount = canvases.filter((canvas) => canvas.context === "webgl" || canvas.context === "webgl2").length;
-
-  let primaryIssue = null;
-  if (!canvases.length) primaryIssue = "canvas-not-mounted";
-  else if (!visibleCanvasCount) primaryIssue = "no-visible-canvas";
-  else if (canvases.some((canvas) => (canvas.issues || []).includes("zero-drawing-buffer"))) primaryIssue = "zero-drawing-buffer";
-  else if (blankCanvasCount === visibleCanvasCount) primaryIssue = "blank-canvas";
-  else if (!animatedCanvasCount && renderingCanvasCount > 0) primaryIssue = "static-canvas";
-  else if (canvases.some((canvas) => canvas.webgl && canvas.webgl.contextLost)) primaryIssue = "webgl-context-lost";
-
-  const recommendations = [];
-  if (!canvases.length) recommendations.push("No canvas matched the selector. Check mount timing or selector scope.");
-  else if (!visibleCanvasCount) recommendations.push("Canvas exists but is hidden or zero-sized. Inspect layout for the canvas element.");
-  else if (primaryIssue === "blank-canvas") recommendations.push("Canvas pixels are blank. Check clear color, camera framing, render loop, and asset load state.");
-  else if (primaryIssue === "static-canvas") recommendations.push("Canvas is rendering but did not change across samples. If animation is expected, check requestAnimationFrame and render-loop state.");
-  else recommendations.push("Canvas is rendering. Use screenshot overlay=refs or kind=canvas includePixels=true for targeted evidence.");
-
-  const result = {
-    mode: visualMode,
-    summary: {
-      visibleCanvasCount,
-      renderingCanvasCount,
-      animatedCanvasCount,
-      blankCanvasCount,
-      webglCanvasCount,
-      primaryIssue,
-    },
-    issues: Object.keys(issueCounts).map((issue) => ({ issue, count: issueCounts[issue] })).slice(0, 5),
-    recommendations,
-  };
-
-  if (visualMode === "pixel_stats") {
-    result.canvases = canvases.map((canvas) => ({
-      ref: canvas.ref,
-      selector: canvas.selector,
-      context: canvas.context,
-      rect: canvas.rect,
-      drawingBuffer: canvas.drawingBuffer,
-      blank: canvas.blank,
-      changing: canvas.changing,
-      issues: canvas.issues,
-      pixels: canvas.pixels,
-    }));
-  } else {
-    result.canvases = canvases.slice(0, 5).map((canvas) => ({
-      ref: canvas.ref,
-      selector: canvas.selector,
-      context: canvas.context,
-      visible: canvas.visible,
-      blank: canvas.blank,
-      changing: canvas.changing,
-      issues: canvas.issues,
-      webgl: canvas.webgl ? {
-        drawingBuffer: canvas.webgl.drawingBuffer,
-        viewport: canvas.webgl.viewport,
-        renderer: canvas.webgl.renderer,
-        contextLost: canvas.webgl.contextLost,
-      } : null,
-    }));
-  }
-
-  if (visualMode === "threejs") {
-    result.threejs = JSON.parse(await runJS(
-      `(function(){
-        var out={detected:false,global:false,version:null,renderers:[]};
-        try{
-          if(window.THREE){out.detected=true;out.global=true;out.version=window.THREE.REVISION||null;}
-          var seen=[];
-          function addRenderer(value,path){
-            if(!value||seen.indexOf(value)>=0)return;
-            var dom=value.domElement||value.canvas;
-            var info=value.info||null;
-            var caps=value.capabilities||null;
-            if(dom&&dom.tagName==='CANVAS'&&(info||caps||typeof value.render==='function')){
-              seen.push(value);
-              out.detected=true;
-              out.renderers.push({
-                path:path,
-                canvasRef:dom.getAttribute&&dom.getAttribute('data-mcp-ref'),
-                canvasSelector:(dom.id?'canvas#'+dom.id:(dom.className?'canvas.'+String(dom.className).trim().split(/\\s+/).slice(0,2).join('.'):'canvas')),
-                pixelRatio:typeof value.getPixelRatio==='function'?value.getPixelRatio():null,
-                size:typeof value.getSize==='function'?(function(){var v=value.getSize({x:0,y:0,set:function(x,y){this.x=x;this.y=y;}});return {width:v.x||0,height:v.y||0};})():null,
-                info:info?{memory:info.memory||null,render:info.render||null,programs:info.programs?info.programs.length:undefined}:null,
-                capabilities:caps?{isWebGL2:!!caps.isWebGL2,maxTextureSize:caps.maxTextureSize||null,precision:caps.precision||null}:null
-              });
-            }
-          }
-          Object.keys(window).slice(0,1500).forEach(function(key){
-            try{
-              var value=window[key];
-              addRenderer(value,'window.'+key);
-              if(value&&typeof value==='object'){
-                ['renderer','webglRenderer','gl','threeRenderer'].forEach(function(prop){try{addRenderer(value[prop],'window.'+key+'.'+prop);}catch(_err){}});
-              }
-            }catch(_err){}
-          });
-        }catch(err){out.error=String(err&&err.message||err);}
-        return JSON.stringify(out);
-      })()`,
-      { timeout: 5000 }
-    ));
-  }
-
-  return JSON.stringify(result);
-}
-
 // ========== GEOLOCATION OVERRIDE ==========
 
 export async function overrideGeolocation({ latitude, longitude, accuracy = 100 }) {
@@ -5680,409 +4817,12 @@ export async function overrideGeolocation({ latitude, longitude, accuracy = 100 
   );
 }
 
-// ========== LAYOUT DIAGNOSTICS ==========
-
-export async function extractLayout({
-  selector,
-  ref,
-  refs,
-  limit = 20,
-  properties,
-  includeAncestors = false,
-  includeChildren = false,
-  viewportOnly = true,
-  diagnostics = true,
-} = {}) {
-  const options = {
-    selector: selector || null,
-    ref: ref || null,
-    refs: Array.isArray(refs) ? refs.filter(Boolean) : [],
-    limit: Math.max(1, Math.min(Number(limit) || 20, 50)),
-    properties: Array.isArray(properties) && properties.length ? properties : null,
-    includeAncestors: !!includeAncestors,
-    includeChildren: !!includeChildren,
-    viewportOnly: viewportOnly !== false,
-    diagnostics: diagnostics !== false,
-  };
-
-  return runJS(
-    `(function(){
-      var opts = ${JSON.stringify(options)};
-      var defaultStyleProps = ['display','visibility','opacity','pointer-events','position','z-index','overflow','overflow-x','overflow-y','transform'];
-      var styleProps = Array.isArray(opts.properties) && opts.properties.length ? opts.properties : defaultStyleProps;
-      var getShadowRoot = window.__mcpGetShadowRoot || function(el){ return el ? (el.shadowRoot || null) : null; };
-      var viewport = {
-        width: Math.round(window.innerWidth || 0),
-        height: Math.round(window.innerHeight || 0),
-        scrollX: Math.round(window.scrollX || 0),
-        scrollY: Math.round(window.scrollY || 0),
-        devicePixelRatio: window.devicePixelRatio || 1
-      };
-
-      function clampRect(rect) {
-        return {
-          x: Math.round(rect.left * 100) / 100,
-          y: Math.round(rect.top * 100) / 100,
-          width: Math.round(rect.width * 100) / 100,
-          height: Math.round(rect.height * 100) / 100
-        };
-      }
-
-      function asRect(obj) {
-        return {
-          left: obj.left,
-          top: obj.top,
-          right: obj.right,
-          bottom: obj.bottom,
-          width: Math.max(0, obj.right - obj.left),
-          height: Math.max(0, obj.bottom - obj.top)
-        };
-      }
-
-      function intersectRect(a, b) {
-        var left = Math.max(a.left, b.left);
-        var top = Math.max(a.top, b.top);
-        var right = Math.min(a.right, b.right);
-        var bottom = Math.min(a.bottom, b.bottom);
-        if (right <= left || bottom <= top) return null;
-        return { left: left, top: top, right: right, bottom: bottom };
-      }
-
-      function rectArea(rect) {
-        if (!rect) return 0;
-        return Math.max(0, rect.right - rect.left) * Math.max(0, rect.bottom - rect.top);
-      }
-
-      function makeSelector(el) {
-        if (!el || !el.tagName) return null;
-        var tag = el.tagName.toLowerCase();
-        if (el.id) return tag + '#' + el.id;
-        var cls = Array.from(el.classList || []).slice(0, 2).join('.');
-        if (cls) return tag + '.' + cls;
-        if (el.getAttribute && el.getAttribute('name')) return tag + '[name="' + el.getAttribute('name').slice(0, 40) + '"]';
-        if (el.getAttribute && el.getAttribute('data-testid')) return tag + '[data-testid="' + el.getAttribute('data-testid').slice(0, 40) + '"]';
-        return tag;
-      }
-
-      function textSnippet(el) {
-        if (!el) return '';
-        var text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-        return text.slice(0, 80);
-      }
-
-      function getRef(el) {
-        return el && el.getAttribute ? (el.getAttribute('data-mcp-ref') || null) : null;
-      }
-
-      function isElementDisabled(el) {
-        return !!(el && (el.disabled || el.getAttribute('aria-disabled') === 'true'));
-      }
-
-      function getDeepParent(el) {
-        if (!el) return null;
-        if (el.parentElement) return el.parentElement;
-        var root = el.getRootNode ? el.getRootNode() : null;
-        return root && root.host ? root.host : null;
-      }
-
-      function walkDeep(root, visit) {
-        if (!root || !visit) return;
-        var children = root.children || [];
-        for (var i = 0; i < children.length; i++) {
-          var child = children[i];
-          if (visit(child) === false) return false;
-          var shadow = getShadowRoot(child);
-          if (shadow && walkDeep(shadow, visit) === false) return false;
-          if (walkDeep(child, visit) === false) return false;
-        }
-      }
-
-      function deepQueryAll(selectorText, maxCount) {
-        var found = [];
-        var seen = new Set();
-        walkDeep(document.documentElement, function(node) {
-          if (!node.matches) return;
-          try {
-            if (node.matches(selectorText) && !seen.has(node)) {
-              seen.add(node);
-              found.push(node);
-              if (found.length >= maxCount) return false;
-            }
-          } catch (_err) {}
-        });
-        return found;
-      }
-
-      function resolveByRef(refValue) {
-        if (!refValue) return null;
-        var matches = deepQueryAll('[data-mcp-ref]', 2000);
-        for (var i = 0; i < matches.length; i++) {
-          if (matches[i].getAttribute('data-mcp-ref') === refValue) return matches[i];
-        }
-        return null;
-      }
-
-      function collectDefaultTargets(maxCount) {
-        var targets = [];
-        var seen = new Set();
-        var refKeys = window.__mcpRefs ? Object.keys(window.__mcpRefs) : [];
-        for (var i = 0; i < refKeys.length; i++) {
-          var el = resolveByRef(refKeys[i]);
-          if (!el || seen.has(el)) continue;
-          seen.add(el);
-          targets.push(el);
-          if (targets.length >= maxCount) return targets;
-        }
-        walkDeep(document.documentElement, function(node) {
-          if (!node || !node.tagName || seen.has(node)) return;
-          var tag = node.tagName;
-          var interactive = ['A','BUTTON','INPUT','TEXTAREA','SELECT','SUMMARY','DETAILS'].indexOf(tag) >= 0;
-          if (!interactive && !node.getAttribute('role') && node.getAttribute('tabindex') === null && !node.onclick && !node.isContentEditable) return;
-          seen.add(node);
-          targets.push(node);
-          if (targets.length >= maxCount) return false;
-        });
-        return targets;
-      }
-
-      function getComputedSubset(el) {
-        var styles = window.getComputedStyle(el);
-        var out = {};
-        for (var i = 0; i < styleProps.length; i++) {
-          out[styleProps[i]] = styles.getPropertyValue(styleProps[i]);
-        }
-        return { styles: styles, subset: out };
-      }
-
-      function getImmediateChildren(el) {
-        var items = [];
-        var children = Array.from(el.children || []);
-        for (var i = 0; i < children.length && i < 10; i++) {
-          items.push({
-            ref: getRef(children[i]),
-            tag: children[i].tagName,
-            selector: makeSelector(children[i]),
-            rect: clampRect(children[i].getBoundingClientRect())
-          });
-        }
-        var shadow = getShadowRoot(el);
-        if (shadow) {
-          var shadowChildren = Array.from(shadow.children || []);
-          for (var j = 0; j < shadowChildren.length && items.length < 10; j++) {
-            items.push({
-              ref: getRef(shadowChildren[j]),
-              tag: shadowChildren[j].tagName,
-              selector: makeSelector(shadowChildren[j]),
-              rect: clampRect(shadowChildren[j].getBoundingClientRect()),
-              shadowChild: true
-            });
-          }
-        }
-        return items;
-      }
-
-      function summarizeElement(el) {
-        var computed = getComputedSubset(el);
-        var styles = computed.styles;
-        var rect = el.getBoundingClientRect();
-        var rawRect = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
-        var viewportRect = { left: 0, top: 0, right: window.innerWidth || 0, bottom: window.innerHeight || 0 };
-        var viewportIntersection = intersectRect(rawRect, viewportRect);
-        var clipRect = viewportIntersection;
-        var ancestorDetails = [];
-        var current = getDeepParent(el);
-        while (current) {
-          var currentStyles = window.getComputedStyle(current);
-          var overflowX = currentStyles.overflowX || currentStyles.overflow;
-          var overflowY = currentStyles.overflowY || currentStyles.overflow;
-          var shouldClip = ['hidden', 'clip', 'scroll', 'auto'].indexOf(overflowX) >= 0 || ['hidden', 'clip', 'scroll', 'auto'].indexOf(overflowY) >= 0;
-          if (shouldClip) {
-            var ancestorRect = current.getBoundingClientRect();
-            clipRect = intersectRect(clipRect || rawRect, {
-              left: ancestorRect.left,
-              top: ancestorRect.top,
-              right: ancestorRect.right,
-              bottom: ancestorRect.bottom
-            });
-          }
-          if (opts.includeAncestors && ancestorDetails.length < 12) {
-            var transformed = currentStyles.transform && currentStyles.transform !== 'none';
-            var positioned = currentStyles.position && currentStyles.position !== 'static';
-            if (shouldClip || transformed || positioned) {
-              ancestorDetails.push({
-                ref: getRef(current),
-                tag: current.tagName,
-                selector: makeSelector(current),
-                rect: clampRect(current.getBoundingClientRect()),
-                overflowX: overflowX,
-                overflowY: overflowY,
-                position: currentStyles.position,
-                transform: transformed ? currentStyles.transform : undefined
-              });
-            }
-          }
-          current = getDeepParent(current);
-        }
-
-        var center = { x: rect.left + (rect.width / 2), y: rect.top + (rect.height / 2) };
-        var centerInsideViewport = center.x >= 0 && center.x <= viewportRect.right && center.y >= 0 && center.y <= viewportRect.bottom;
-        var centerStack = centerInsideViewport ? document.elementsFromPoint(center.x, center.y) : [];
-        var topmost = centerStack.length ? centerStack[0] : null;
-        var topmostInfo = topmost ? {
-          ref: getRef(topmost),
-          tag: topmost.tagName,
-          selector: makeSelector(topmost),
-          text: textSnippet(topmost)
-        } : null;
-
-        var issues = [];
-        if (styles.display === 'none') issues.push('display-none');
-        if (styles.visibility === 'hidden' || styles.visibility === 'collapse') issues.push('visibility-hidden');
-        if (rect.width <= 0 || rect.height <= 0) issues.push('zero-size');
-        if (!viewportIntersection) issues.push('offscreen');
-        var area = rectArea(rawRect);
-        var clippedArea = rectArea(clipRect);
-        if (area > 0 && clippedArea < area - 1) issues.push('clipped');
-        if (parseFloat(styles.opacity || '1') === 0) issues.push('opacity-zero');
-        if (styles.pointerEvents === 'none') issues.push('pointer-events-none');
-        if (isElementDisabled(el)) issues.push('disabled');
-        var centerTopmost = centerInsideViewport && !!topmost && (topmost === el || el.contains(topmost));
-        if (centerInsideViewport && !centerTopmost) issues.push('covered-at-center');
-
-        var visible = issues.indexOf('display-none') === -1 &&
-          issues.indexOf('visibility-hidden') === -1 &&
-          issues.indexOf('zero-size') === -1 &&
-          issues.indexOf('offscreen') === -1 &&
-          issues.indexOf('opacity-zero') === -1 &&
-          clippedArea > 0;
-        var clickable = visible &&
-          centerInsideViewport &&
-          centerTopmost &&
-          issues.indexOf('pointer-events-none') === -1 &&
-          issues.indexOf('disabled') === -1;
-
-        var item = {
-          ref: getRef(el),
-          selector: makeSelector(el),
-          tag: el.tagName,
-          text: textSnippet(el),
-          rect: clampRect(rect),
-          visible: visible,
-          clickable: clickable,
-          centerTopmost: centerTopmost,
-          topmostAtCenter: topmostInfo,
-          issues: opts.diagnostics ? issues : [],
-          style: computed.subset
-        };
-        if (opts.includeAncestors) item.ancestors = ancestorDetails;
-        if (opts.includeChildren) item.children = getImmediateChildren(el);
-        if (opts.diagnostics) {
-          item.viewportIntersection = viewportIntersection ? clampRect(asRect(viewportIntersection)) : null;
-          item.center = { x: Math.round(center.x * 100) / 100, y: Math.round(center.y * 100) / 100 };
-          item.centerStackDepth = centerStack.length;
-        }
-        return item;
-      }
-
-      var targets = [];
-      var seen = new Set();
-      function pushTarget(el) {
-        if (!el || seen.has(el)) return;
-        seen.add(el);
-        targets.push(el);
-      }
-
-      if (opts.ref) pushTarget(resolveByRef(opts.ref));
-      if (Array.isArray(opts.refs)) {
-        for (var i = 0; i < opts.refs.length; i++) pushTarget(resolveByRef(opts.refs[i]));
-      }
-      if (opts.selector) {
-        var matches = deepQueryAll(opts.selector, opts.limit * 3);
-        for (var j = 0; j < matches.length; j++) pushTarget(matches[j]);
-      }
-      if (!targets.length) {
-        var defaults = collectDefaultTargets(opts.limit * 3);
-        for (var k = 0; k < defaults.length; k++) pushTarget(defaults[k]);
-      }
-
-      var items = [];
-      for (var m = 0; m < targets.length; m++) {
-        var summary = summarizeElement(targets[m]);
-        if (opts.viewportOnly && !opts.selector && !opts.ref && !opts.refs.length && !summary.visible && summary.issues.indexOf('covered-at-center') === -1) {
-          continue;
-        }
-        items.push(summary);
-        if (items.length >= opts.limit) break;
-      }
-
-      var response = {
-        viewport: viewport,
-        items: items
-      };
-
-      if (opts.diagnostics) {
-        response.next = [];
-        for (var n = 0; n < items.length && response.next.length < 5; n++) {
-          if (items[n].ref && items[n].issues.indexOf('covered-at-center') >= 0) {
-            response.next.push('call safari_extract kind=layout ref=' + items[n].ref + ' includeAncestors=true');
-          } else if (items[n].selector && items[n].issues.indexOf('offscreen') >= 0) {
-            response.next.push('call safari_browser action=scroll_to_element selector="' + items[n].selector + '"');
-          }
-        }
-      }
-
-      function serialize(value) {
-        try { return JSON.stringify(value); } catch (_err) { return '{"error":"layout serialization failed"}'; }
-      }
-
-      function compactForBudget(value) {
-        var compact = value;
-        var serialized = serialize(compact);
-        var budgetMode = !opts.properties && !opts.includeAncestors && !opts.includeChildren && opts.limit <= 20;
-        if (!budgetMode || serialized.length <= 12000) return serialized;
-
-        delete compact.next;
-        serialized = serialize(compact);
-        if (serialized.length <= 12000) return serialized;
-
-        compact.items.forEach(function(item) {
-          if (item.text) item.text = item.text.slice(0, 40);
-          delete item.viewportIntersection;
-          delete item.center;
-          delete item.centerStackDepth;
-          if (item.topmostAtCenter && item.topmostAtCenter.text) item.topmostAtCenter.text = item.topmostAtCenter.text.slice(0, 32);
-        });
-        serialized = serialize(compact);
-        if (serialized.length <= 12000) return serialized;
-
-        compact.items.forEach(function(item) {
-          if (item.selector) item.selector = item.selector.slice(0, 60);
-          if (item.style) {
-            delete item.style['overflow-x'];
-            delete item.style['overflow-y'];
-            delete item.style.transform;
-          }
-        });
-        serialized = serialize(compact);
-        if (serialized.length <= 12000) return serialized;
-
-        if (compact.items.length > 12) compact.items = compact.items.slice(0, 12);
-        serialized = serialize(compact);
-        return serialized;
-      }
-
-      return compactForBudget(response);
-    })()`,
-    { timeout: 15000 }
-  );
-}
-
 // ========== COMPUTED STYLES ==========
 
 export async function getComputedStyles({ selector, properties }) {
-  const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const sel = escJsSingleQuote(selector);
   const propsFilter = properties
-    ? `.filter(function(p){return [${properties.map((p) => `'${p}'`).join(",")}].includes(p)})`
+    ? `.filter(function(p){return [${properties.map((p) => `'${String(p).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}].includes(p)})`
     : "";
   return runJS(
     `(function(){
@@ -6102,7 +4842,8 @@ export async function getComputedStyles({ selector, properties }) {
 export async function getIndexedDB({ dbName, storeName, limit = 20 }) {
   const safeDb = dbName.replace(/'/g, "\\'");
   const safeStore = storeName.replace(/'/g, "\\'");
-  return runJS(
+  // `do JavaScript` can't await a Promise — route async work through the Node-side poller.
+  return _evaluateAsync(
     `(async function(){
       return new Promise(function(resolve, reject) {
         var request = indexedDB.open('${safeDb}');
@@ -6125,13 +4866,12 @@ export async function getIndexedDB({ dbName, storeName, limit = 20 }) {
           cursor.onerror = function() { resolve(JSON.stringify({ error: 'Cursor error' })); db.close(); };
         };
       });
-    })()`,
-    { timeout: 15000 }
+    })()`
   );
 }
 
 export async function listIndexedDBs() {
-  return runJS(
+  return _evaluateAsync(
     `(async function(){
       try {
         var dbs = await indexedDB.databases();
@@ -6146,8 +4886,8 @@ export async function listIndexedDBs() {
 // ========== CSS COVERAGE ==========
 
 export async function getCSSCoverage() {
-  return runJS(
-    `(function(){
+  return evalReturningJSON(
+    `
       var results = [];
       for (var i = 0; i < document.styleSheets.length; i++) {
         try {
@@ -6178,51 +4918,79 @@ export async function getCSSCoverage() {
         }
       }
       return JSON.stringify(results);
-    })()`
+    `
   );
 }
 
 // ========== WEBKIT / iOS WEB-DEV VALIDATION ==========
 
+// Validate <meta name="viewport"> against iOS Safari best practices.
+// Pure read-only DOM inspection — returns parsed attrs + severity-tagged issues.
 export async function inspectViewport() {
   return runJS(VIEWPORT_SCRIPT);
 }
 
-export async function safeAreaInsets() {
+// Read live CSS safe-area-inset values via a hidden probe element, check
+// viewport-fit=cover, and scan stylesheets for env(safe-area-inset-*) usage.
+export async function getSafeAreaInsets() {
   return runJS(SAFE_AREA_SCRIPT);
 }
 
-export async function getSafeAreaInsets() {
-  return safeAreaInsets();
-}
-
+// Audit the page for iOS "Add to Home Screen" / PWA readiness.
 export async function checkPWA() {
   return runJS(PWA_SCRIPT);
 }
 
-export async function webkitCompat() {
+// Check every CSS property used on the page against THIS Safari via
+// CSS.supports() — no regex guessing, tested in the live engine.
+export async function checkWebKitCompat() {
   return runJS(WEBKIT_COMPAT_SCRIPT);
 }
 
-export async function checkWebKitCompat() {
-  return webkitCompat();
+// ========== DOCTOR (PREFLIGHT DIAGNOSTICS) ==========
+
+// One-shot check of the whole macOS permission + daemon chain, so the
+// "it doesn't work even with permissions granted" failures (#14/#15/#29)
+// surface as one actionable checklist instead of scattered cryptic errors.
+// ========== macOS NATIVE-INPUT COMPAT ==========
+// CGEvent.postToPid (native clicks/keys/hover) can silently no-op on macOS 26+ (Tahoe) even
+// with Accessibility granted — the events are accepted by the API but never cross into Safari's
+// WebContent process (issue #29). doctor() prints the OS version so a bug report carries the
+// single most relevant fact, and flags the known-risky range so users reach for safari_evaluate
+// or extension-based clicks on trust-gated forms instead of chasing a phantom permission grant.
+// Pure (no I/O) so it's unit-tested directly — see test/macos-compat.test.mjs.
+export function macosCompatNote(productVersion) {
+  const raw = String(productVersion ?? "").trim();
+  const major = parseInt(raw.split(".")[0], 10);
+  if (!Number.isFinite(major)) {
+    return {
+      version: "unknown",
+      major: null,
+      risky: false,
+      line: "macOS version: unknown (sw_vers gave no parseable version)",
+    };
+  }
+  const risky = major >= 26;
+  const line = risky
+    ? `macOS ${raw} ⚠ CGEvent native clicks/keys may silently no-op on macOS 26+ even with Accessibility granted (issue #29) — for trust-gated forms prefer safari_evaluate or extension-based safari_click.`
+    : `macOS ${raw} — CGEvent native input supported.`;
+  return { version: raw, major, risky, line };
 }
 
 export async function doctor() {
   const checks = [];
   const add = (ok, label, detail, fix) => checks.push({ ok, label, detail, fix: ok ? null : fix });
 
+  // 1. Safari running
   let safariUp = false;
   try {
     const { stdout } = await execFileAsync("pgrep", ["-x", "Safari"], { timeout: 2000 });
     safariUp = stdout.trim().length > 0;
-  } catch {
-    safariUp = false;
-  }
+  } catch { safariUp = false; }
   add(safariUp, "Safari running", safariUp ? "Safari process is up" : "Safari is not running", "Open Safari, then retry.");
 
-  let aeOk = false;
-  let aeDetail = "";
+  // 2. Apple Events / Automation — the bridge every AppleScript tool uses
+  let aeOk = false, aeDetail = "";
   try {
     const out = await osascript(`tell application "Safari" to return (count of windows) as string`, { timeout: 5000 });
     aeOk = /^\d+$/.test(String(out).trim());
@@ -6234,22 +5002,22 @@ export async function doctor() {
     else aeDetail = m.slice(0, 80);
   }
   add(aeOk, "Apple Events / Automation", aeDetail,
-    "System Settings > Privacy & Security > Automation -> enable Safari for your terminal/host app; and Safari > Develop > Allow JavaScript from Apple Events.");
+    "System Settings > Privacy & Security > Automation → enable Safari for your terminal/host app; and Safari > Develop > Allow JavaScript from Apple Events.");
 
-  let pf = null;
-  let pfErr = "";
+  // 3-5. Native helper daemon + Accessibility + Screen Recording (one preflight round-trip)
+  let pf = null, pfErr = "";
   try { pf = await _helperPreflight(); } catch (e) { pfErr = e.message || String(e); }
   add(!!pf, "Native helper daemon", pf ? "safari-helper responding" : `not responding: ${pfErr}`,
     "It auto-restarts; if this persists, reinstall safari-mcp.");
   add(!!pf && pf.accessibility === true, "Accessibility (native clicks)",
-    pf ? (pf.accessibility ? "CGEvent posting permitted" : "NOT permitted; native clicks silently no-op") : "unknown (helper not responding)",
-    "System Settings > Privacy & Security > Accessibility -> enable safari-helper, then retry.");
+    pf ? (pf.accessibility ? "CGEvent posting permitted" : "NOT permitted — native clicks silently no-op (the #29 root cause)") : "unknown (helper not responding)",
+    "System Settings > Privacy & Security > Accessibility → enable safari-helper, then retry.");
   add(!!pf && pf.screenRecording === true, "Screen Recording (screenshots)",
-    pf ? (pf.screenRecording ? "permitted" : "NOT permitted; screenshots may be blank/blocked") : "unknown (helper not responding)",
-    "System Settings > Privacy & Security > Screen Recording -> enable your terminal/host app.");
+    pf ? (pf.screenRecording ? "permitted" : "NOT permitted — screenshots will be blank/blocked") : "unknown (helper not responding)",
+    "System Settings > Privacy & Security > Screen Recording → enable your terminal/host app.");
 
-  let idOk = false;
-  let idDetail = "";
+  // 6. Helper codesign identity — a stale/ad-hoc id breaks the Accessibility grant on reinstall
+  let idOk = false, idDetail = "";
   const helperPath = join(__dirname, "safari-helper");
   try {
     const res = await execFileAsync("codesign", ["-d", "--verbose=2", helperPath], { timeout: 4000 })
@@ -6258,18 +5026,25 @@ export async function doctor() {
     const m = /Identifier=(.+)/.exec(text);
     const id = m ? m[1].trim() : "(unknown)";
     idOk = id === "com.achiya-automation.safari-mcp";
-    idDetail = idOk ? `stable identifier: ${id}` : `unstable identifier "${id}"; Accessibility grant will not persist across reinstalls`;
-  } catch (e) {
-    idDetail = "could not read codesign identity: " + (e.message || "").slice(0, 60);
-  }
+    idDetail = idOk ? `stable identifier: ${id}` : `unstable identifier "${id}" — Accessibility grant won't persist across reinstalls`;
+  } catch (e) { idDetail = "could not read codesign identity: " + (e.message || "").slice(0, 60); }
   add(idOk, "Helper codesign identity", idDetail,
     `Re-sign: codesign -s - -f --identifier com.achiya-automation.safari-mcp --entitlements safari-helper.entitlements "${helperPath}"`);
 
+  // macOS version — the single most relevant fact for #29-class "native clicks silently fail"
+  // reports. Best-effort: sw_vers is macOS-only and absent in sandboxes/CI, so never block doctor.
+  let osLine = null;
+  try {
+    const { stdout } = await execFileAsync("sw_vers", ["-productVersion"], { timeout: 2000 });
+    osLine = macosCompatNote(stdout).line;
+  } catch { /* sw_vers unavailable — skip the line, the permission checks still stand */ }
+
   const passed = checks.filter((c) => c.ok).length;
-  const lines = [`Safari MCP doctor - ${passed}/${checks.length} checks passed`, ""];
+  const lines = [`Safari MCP doctor — ${passed}/${checks.length} checks passed`, ""];
+  if (osLine) lines.push(osLine, "");
   for (const c of checks) {
-    lines.push(`${c.ok ? "OK" : "FAIL"} ${c.label}: ${c.detail}`);
-    if (!c.ok && c.fix) lines.push(`   -> ${c.fix}`);
+    lines.push(`${c.ok ? "✅" : "❌"} ${c.label}: ${c.detail}`);
+    if (!c.ok && c.fix) lines.push(`   → ${c.fix}`);
   }
   return lines.join("\n");
 }
@@ -6311,40 +5086,37 @@ export async function detectForms() {
 
 export async function scrollToElement({ selector, text, block = "center", timeout = 10000 }) {
   if (selector) {
-    const sel = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(selector);
     return runJS(
       `(function(){var el=document.querySelector('${sel}');if(!el)return 'Element not found: ${sel}';el.scrollIntoView({behavior:'smooth',block:'${block}'});var r=el.getBoundingClientRect();return 'Scrolled to: '+el.tagName+' at y='+Math.round(r.y);})()`
     );
   }
   if (text) {
-    // Virtual DOM scroll: scroll down repeatedly until text appears (for Airtable, etc.)
-    const safeText = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-    return runJS(
-      `(async function(){
-        var deadline = Date.now() + ${Number(timeout)};
-        var scrollable = document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]') || document.scrollingElement || document.documentElement;
-        var lastY = -1;
-        while (Date.now() < deadline) {
-          // Check if text exists in DOM
-          var tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-          while(tw.nextNode()){
-            if(tw.currentNode.textContent.trim().includes('${safeText}')){
-              var el = tw.currentNode.parentElement;
-              el.scrollIntoView({behavior:'smooth',block:'${block}'});
-              return 'Found and scrolled to: "' + el.textContent.trim().substring(0,50) + '"';
-            }
-          }
-          // Scroll down
-          var curY = scrollable.scrollTop;
-          if (curY === lastY) return 'Text not found: ${safeText} (scrolled to bottom)';
-          lastY = curY;
-          scrollable.scrollBy(0, 500);
-          await new Promise(function(r){setTimeout(r,300)});
-        }
-        return 'Timeout: text not found within ${timeout}ms';
-      })()`,
-      { timeout: timeout + 5000 }
-    );
+    // Virtual DOM scroll: scroll down repeatedly until text appears (for Airtable, etc.).
+    // Each check+scroll is one synchronous step; the loop is driven from Node because
+    // `do JavaScript` can't await an in-page delay (see _evaluateAsync).
+    const safeText = escJsSingleQuote(text);
+    const safeBlock = String(block).replace(/[^a-z]/gi, '') || 'center';
+    const navIndex = _activeTabIndex;
+    const stepJs =
+      `(function(){` +
+      `var scrollable=document.querySelector('[class*="grid"],[class*="virtual"],[class*="scroll"],[role="grid"],[role="table"]')||document.scrollingElement||document.documentElement;` +
+      `var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null);` +
+      `while(tw.nextNode()){if(tw.currentNode.textContent.trim().includes('${safeText}')){var el=tw.currentNode.parentElement;el.scrollIntoView({behavior:'smooth',block:'${safeBlock}'});return 'Found and scrolled to: "'+el.textContent.trim().substring(0,50)+'"';}}` +
+      `var curY=scrollable.scrollTop;scrollable.scrollBy(0,500);return 'SCROLL:'+curY;})()`;
+    const deadline = Date.now() + Number(timeout);
+    let lastY = -1;
+    while (Date.now() < deadline) {
+      const r = await runJS(stepJs, { tabIndex: navIndex, timeout: 5000 }).catch(() => '');
+      if (typeof r === 'string' && r.startsWith('Found')) return r;
+      if (typeof r === 'string' && r.startsWith('SCROLL:')) {
+        const curY = parseInt(r.slice(7), 10);
+        if (curY === lastY) return `Text not found: ${text} (scrolled to bottom)`;
+        lastY = curY;
+      }
+      await new Promise(res => setTimeout(res, 300));
+    }
+    return `Timeout: text not found within ${timeout}ms`;
   }
   throw new Error("scrollToElement requires selector or text");
 }
@@ -6358,23 +5130,17 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
   await runJS("window.onbeforeunload=null", { timeout: 2000 }).catch(() => {});
   let targetUrl = url;
   if (!/^https?:\/\//i.test(targetUrl)) targetUrl = "https://" + targetUrl;
-  const safeUrl = targetUrl.replace(/"/g, '\\"');
+  // Escape backslash first, then quotes; strip CR/LF — a newline would break out of
+  // the AppleScript string literal and allow AppleScript injection.
+  const safeUrl = targetUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, '');
   if (_activeTabURL) await resolveActiveTab();
   _assertNotFallingBackToUserTab('navigateAndRead');
-  const navTarget = _activeTabIndex ? `tab ${_activeTabIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
+  const navIndex = _activeTabIndex;
+  const navTarget = navIndex ? `tab ${navIndex} of ${getTargetWindowRef()}` : getFallbackTarget();
   await osascriptFast(`tell application "Safari" to set URL of ${navTarget} to "${safeUrl}"`);
   _activeTabURL = targetUrl;
-  // Single JS call: poll readyState + return page data — 1 call instead of 30+
-  const navResult = await runJS(
-    `(async function(){
-      for(var i=0;i<60;i++){
-        if(document.readyState==='complete')break;
-        await new Promise(function(r){setTimeout(r,i<10?200:500)});
-      }
-      return JSON.stringify({title:document.title,url:location.href,text:document.body.innerText.substring(0,${Number(maxLength)})});
-    })()`,
-    { timeout: 30000 }
-  );
+  // Poll readyState from Node, then read — `do JavaScript` can't await an async IIFE.
+  const navResult = await _pollReadyAndRead(navIndex, { maxLength });
   // Update _activeTabURL with the actual URL after navigation
   try {
     const parsed = JSON.parse(navResult);
@@ -6385,13 +5151,14 @@ export async function navigateAndRead(url, { maxLength = 50000 } = {}) {
 
 // Click + wait for navigation or element — common after clicking a link/button
 export async function clickAndWait({ selector, text, waitFor: waitSelector, timeout = 10000 }) {
-  const safeSel = selector ? selector.replace(/'/g, "\\'") : "";
-  const safeText = text ? text.replace(/'/g, "\\'") : "";
-  const safeWait = waitSelector ? waitSelector.replace(/'/g, "\\'") : "";
-  // Single JS call: click + wait — 1 call instead of 20+
-  return runJS(
-    `(async function(){
-      // Find and click
+  const esc = (s) => escJsSingleQuote(s);
+  const safeSel = selector ? esc(selector) : "";
+  const safeText = text ? esc(text) : "";
+  const safeWait = waitSelector ? esc(waitSelector) : "";
+  const navIndex = _activeTabIndex;
+  // Step 1: find + click — fully synchronous, so it runs inside one `do JavaScript`.
+  const clickResult = await runJS(
+    `(function(){
       var el;
       ${safeSel ? `el = document.querySelector('${safeSel}');` : ""}
       ${safeText && !safeSel ? `
@@ -6401,31 +5168,35 @@ export async function clickAndWait({ selector, text, waitFor: waitSelector, time
       if(!el) return JSON.stringify({error:'Element not found'});
       el.scrollIntoView({block:'center'});
       el.click();
-      // Wait
-      var deadline = Date.now() + ${Number(timeout)};
-      ${safeWait ? `
-        while(Date.now()<deadline){
-          if(document.querySelector('${safeWait}'))break;
-          await new Promise(function(r){setTimeout(r,200)});
-        }
-      ` : `
-        await new Promise(function(r){setTimeout(r,300)});
-        while(Date.now()<deadline){
-          if(document.readyState==='complete')break;
-          await new Promise(function(r){setTimeout(r,200)});
-        }
-      `}
-      return JSON.stringify({title:document.title,url:location.href,clicked:el.tagName+' "'+el.textContent.trim().substring(0,50)+'"'});
+      return JSON.stringify({clicked:el.tagName+' "'+el.textContent.trim().substring(0,50)+'"'});
     })()`,
-    { timeout: timeout + 5000 }
+    { tabIndex: navIndex, timeout: 10000 }
   );
+  let clickedInfo = '';
+  try { const c = JSON.parse(clickResult); if (c.error) return clickResult; clickedInfo = c.clicked || ''; } catch {}
+  // Step 2: wait from Node — `do JavaScript` can't await an in-page loop.
+  const deadline = Date.now() + Number(timeout);
+  await new Promise(r => setTimeout(r, 300));
+  while (Date.now() < deadline) {
+    try {
+      if (safeWait) {
+        if (await runJS(`document.querySelector('${safeWait}')?'1':''`, { tabIndex: navIndex, timeout: 5000 }) === '1') break;
+      } else if (await runJS('document.readyState', { tabIndex: navIndex, timeout: 5000 }) === 'complete') {
+        break;
+      }
+    } catch { /* page navigating */ }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  const final = await runJS(`JSON.stringify({title:document.title,url:location.href})`, { tabIndex: navIndex, timeout: 5000 });
+  try { const p = JSON.parse(final); p.clicked = clickedInfo; return JSON.stringify(p); } catch { return final; }
 }
 
 // Fill form + submit — common for login, search, etc.
 export async function fillAndSubmit({ fields, submitSelector }) {
   await fillForm({ fields });
+  const navIndex = _activeTabIndex;
   if (submitSelector) {
-    const sel = submitSelector.replace(/'/g, "\\'");
+    const sel = escJsSingleQuote(submitSelector);
     await runJS(
       `(function(){var el=document.querySelector('${sel}');if(el)el.click();})()`
     );
@@ -6435,15 +5206,9 @@ export async function fillAndSubmit({ fields, submitSelector }) {
       `(function(){var btn=document.querySelector('[type=submit],button:not([type])');if(btn)btn.click();})()`
     );
   }
-  // Wait for navigation/reload via inline JS (not fixed sleep)
-  return runJS(
-    `(async function(){
-      await new Promise(function(r){setTimeout(r,300)});
-      for(var i=0;i<30;i++){if(document.readyState==='complete')break;await new Promise(function(r){setTimeout(r,200)});}
-      return JSON.stringify({title:document.title,url:location.href});
-    })()`,
-    { timeout: 15000 }
-  );
+  // Wait for navigation/reload — polled from Node (`do JavaScript` can't await).
+  await new Promise(r => setTimeout(r, 300));
+  return _pollReadyAndRead(navIndex);
 }
 
 // Full page analysis — extracts everything in ONE call

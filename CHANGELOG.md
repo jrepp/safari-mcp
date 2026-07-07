@@ -5,6 +5,207 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.15.2] - 2026-07-05
+
+### Fixed
+- **Clean installs were broken since 2.14.0 — `ERR_MODULE_NOT_FOUND: transport.js`.** `index.js` imports `./transport.js`, but the file was missing from the `package.json` `files` allowlist, so every published tarball from 2.14.0 through 2.15.1 omitted it. A fresh `npx safari-mcp` (with no local git checkout) exited immediately and the MCP client saw "Connection closed". `transport.js` is now published. Thanks to @e3nemyMine for the precise report (#50). Workaround for older releases: pin `safari-mcp@2.13.0`.
+
+### Internal
+- Added `test/packaging.test.mjs` — asserts every relative import in a published JS file is itself published, so an imported-but-unshipped file turns CI red instead of shipping a broken tarball.
+
+## [2.15.1] - 2026-07-03
+
+### Fixed
+- **Shared HTTP mode (`SAFARI_MCP_HTTP`) now self-heals when a session drops.** A request carrying an unknown/expired `Mcp-Session-Id` returned **HTTP 400**, which wedged the MCP client permanently on `"No valid session"` — every shared Claude Code session died the moment its session dropped (idle SSE close, daemon restart, eviction) with no recovery. It now returns **HTTP 404** per the StreamableHTTP spec, so the client transparently re-initializes a fresh session. (A no-session-id, non-`initialize` request still returns 400.)
+
+## [2.15.0] - 2026-07-03
+
+### Added
+- **Shared HTTP transport (opt-in `SAFARI_MCP_HTTP`)** — run a single Safari MCP daemon that many Claude Code sessions share over StreamableHTTP, instead of a process per session (~17→1 in heavy use; lower memory and startup cost). The default transport stays **stdio**, so existing npm users see **zero behavior change** — this is fully opt-in. Set `SAFARI_MCP_HTTP=1` (and optional `SAFARI_MCP_HTTP_PORT`) to enable. Design notes in `docs/http-transport-design.md`.
+
+### Changed
+- **`safari_doctor`** now reports the macOS version and flags macOS 26+ (Tahoe), where `CGEvent.postToPid` native clicks/keys can silently no-op even with Accessibility granted (issue #29). Bug reports now carry the single most relevant diagnostic fact, and users on the affected range are steered toward `safari_evaluate` / extension-based clicks for trust-gated forms.
+
+### Internal
+- Extracted the tab-ownership state machine into `ownership-state.js` with dedicated behavioral tests asserting cross-client isolation and TTL expiry (#39).
+
+## [2.14.0] - 2026-06-18
+
+iOS/WebKit web-dev validation tools, a permission-chain diagnostic, and a reliability +
+tooling hardening pass (see PR #37). 96 tools total.
+
+### Added
+- **`safari_inspect_viewport`** — validate the `<meta name=viewport>` tag against iOS Safari best practices (device-width, initial-scale, disabled-zoom/WCAG 1.4.4, viewport-fit).
+- **`safari_safe_area_insets`** — read live `safe-area-inset` values + `viewport-fit`/`env()` usage (notch / Dynamic Island).
+- **`safari_check_pwa`** — audit iOS "Add to Home Screen" / PWA readiness (apple-touch-icon incl. 180×180, manifest, theme-color, status bar, splash).
+- **`safari_webkit_compat`** — check every CSS property on the page against THIS Safari via `CSS.supports()` (unsupported props, missing `-webkit-` prefixes, known rendering quirks).
+- **`safari_doctor`** — one-shot diagnosis of the macOS permission + daemon chain (Apple Events / Accessibility / Screen Recording / native helper / codesign identity), with the exact System Settings fix per failure.
+
+### Fixed
+- **Native clicks no longer report phantom success (issue #29).** `safari-helper` now runs `CGPreflightPostEventAccess()` before posting CGEvents (click/hover/keyboard); when Accessibility / post-event access is missing it returns an actionable error instead of reporting "clicked" while the page never reacted.
+- **`safari_evaluate` could return the literal `[object Promise]`** for scripts whose value is a thenable without a literal `await`/`.then` (e.g. `Promise.resolve(x)`, an async IIFE). It now detects that at runtime and resolves via the async poller.
+- **Element screenshots cropped wrong on Retina** — `safari_screenshot_element` now scales the crop region by `devicePixelRatio`.
+- **`postinstall` codesign re-sign failed silently.** It now warns loudly when the helper can't be re-signed to the stable identifier and verifies the result; fixed a latent bug where `codesign -d` (without `--verbose`) never emitted `Identifier=`, so the early-return/verify never fired. Added a runtime codesign-identity check at startup (catches `npm ci` / `--ignore-scripts` / Docker installs that skip postinstall).
+
+### Changed
+- Internal: extracted `response.js` (MCP-response helpers — replaced 82 hand-written envelopes), `injected-validators.js`, and `injected-escape.js`; added an `evalReturningJSON` builder.
+- Tooling: added `jsconfig.json` (checkJs), ESLint + Prettier + TypeScript with `lint`/`format`/`typecheck` scripts; `npm test` now uses `--test-force-exit`.
+- Tests: +17 behavioral tests (`evaluate-wrapping`, `injection-safety`, `validators` via jsdom) → 32 total.
+- Removed the stale, hand-maintained `index.d.ts`.
+
+## [2.13.0] - 2026-06-14
+
+A second correctness/safety + dedup pass following a deep re-audit, and a third
+full-codebase pass (2026-06-11) closing the tab-ownership enforcement gaps end to end.
+
+### Fixed — third pass (2026-06-11)
+
+#### Tab safety
+- **~20 page-mutating tools called the engine directly with no ownership guard** (`safari_click_and_wait`, `safari_fill_and_submit`, `safari_set_cookie`/`safari_delete_cookies`, all local/session-storage writers, `safari_import_storage`, `safari_drag`, `safari_upload_file`, `safari_paste_image`, `safari_emulate`/`safari_reset_emulation`, `safari_select_option`, `safari_react_select_set`, `safari_mock_route`, `safari_throttle_network`, `safari_override_geolocation`, `safari_handle_dialog`, `safari_resize`) — while `safari_click`/`safari_fill` were guarded via `extensionOrFallback`. All now call `_assertTabOwnership()` first.
+- **`safari_run_script` enforces ownership PER STEP while the batch runs.** The single pre-flight check could be defeated mid-batch: `evaluate` was exempt (arbitrary JS in an unowned tab via batching), and a `switchTab`/`navigate` step could move to the user's tab before a `click` executed. `navigate` steps now register ownership of their destination exactly like the standalone tool, and a refused step aborts the whole batch.
+- **`_isURLOwned`'s path-prefix match required no segment boundary** — owning `https://site.com/org` also "owned" `https://site.com/org-evil` on the same origin. Matching now requires a real `/` boundary. The matching semantics moved to `ownership-match.js` with a unit suite locking them.
+- **The ownership TTL is enforced during the session (touch-on-use)**, not only at file-load — a long-lived session no longer accumulates permanently-owned URLs; entries the session stops asserting against expire after 30 minutes.
+- **`_injectHelpersfast()` could inject the MCP helpers into the user's front tab** when tab tracking was lost (it skipped runJS's resolution for speed and dropped its guard with it). Now guarded; the background-injection failure is logged instead of swallowed.
+- **Extension: owned-tab state survives MV3 service-worker restarts** (`storage.session`). A worker restart wiped the in-memory Map, silently re-enabling the "no tabs owned yet" compatibility path — i.e. no guard at all — until the next `new_tab`.
+- **Extension: `navigate_and_read` never updated the session tab cache**, so the next command inside the 3s cache window resolved against the pre-navigation URL and could fall through to the user's active tab.
+- **Extension: a URL match in another window no longer silently retargets the profile window** (a URL collision with a tab in the personal window redirected every subsequent command there). The profile window is re-adopted only when the original window is actually gone.
+- **Extension: `close_tab`'s last-tab guard resolved its target from a second `tabs.query`** — a TOCTOU window against concurrent tab changes. The count and the target now come from the same query.
+
+#### Robustness
+- **Swift daemon: GCD thread leak on AppleScript timeouts.** Every 30s timeout left a thread blocked in `executeAndReturnError` forever; enough of them exhausted the global pool and wedged the daemon silently. The daemon now counts in-flight executions and exits for a clean respawn once 8 are stuck (the Node watchdog restarts it).
+- **Swift daemon: no `autoreleasepool` around the command loop** — command-line Swift never drains the implicit top-level pool, so every `NSAppleScript`/`NSDictionary` accumulated until process exit. The loop body now drains per command.
+- **Swift daemon: explicit `exit(0)` on stdin EOF** — threads still blocked inside AppleScript kept the process alive as an orphan holding Apple Events/Accessibility grants after the parent Node process died.
+- **Swift daemon: the mouse-restore no longer jumps to (0,0)** when the saved cursor position can't be read (hover + legacy click paths) — the restore is skipped instead.
+- **Extension: `connect()` re-entrancy lock** — the startup promise and the keepalive alarm could race two poll loops into existence on a cold worker start.
+- **Extension: `evaluate`'s script-injection result key is unguessable now** (`crypto.randomUUID`); the `Date.now()`-based name let a hostile page pre-seed a fabricated result object and steer the agent.
+- **Extension: `__mcpGetShadowRoot` is non-writable/non-enumerable** — page scripts can no longer replace it to feed fake shadow roots into snapshots.
+- **HTTP bridge: an oversized request body is no longer parsed.** `end` still fires after `destroy()`, so the JSON of a >10MB body was parsed anyway and a second `writeHead` threw `ERR_HTTP_HEADERS_SENT`.
+- **`owned-tabs.json` writes are atomic** (tmp + rename) — two concurrent MCP instances could interleave partial writes and corrupt the shared ownership file.
+- **Proxy-token write failures are logged** — a silent failure left every secondary instance getting 403 on `/proxy-command` with no trace.
+
+#### Correctness
+- **`safari_press_key` sent a bogus `code` for special keys** (`KeyEnter`, `KeyArrowUp`, … instead of the W3C `Enter`, `ArrowUp`); apps that route on `event.code` (Notion, Monaco, Google Docs) ignored the key entirely. Digits map to `Digit1`-style codes now too.
+- **Lexical fill (Strategy 2) silently broke on values containing a double-quote or newline** — the value was interpolated into a JSON literal with JS-string escaping only, and `parseEditorState`'s silent catch hid the failure. That site now uses proper dual-layer (JSON-then-JS) encoding.
+- **`safari_set_cookie`: `path`/`domain`/`expires` were embedded raw**, then "escaped" with a quote-only replace (no backslash-first) — legitimate values broke the injected JS. Every attribute goes through `escJsSingleQuote()` now.
+- **`safari_mock_route`: `contentType` was interpolated with no escaping**; `status` is coerced to a number.
+- **`runJSLarge` and `listTabs` ignored the tab marker** and only re-resolved by URL — after a redirect cleared the tracked URL, large-payload ops (upload/paste) could target a stale index, and `list_tabs` reset tracking, causing spurious "tab tracking lost" errors.
+- **`_validateFilePath` rejected existing files under `/var/folders/`** — `realpathSync` resolves them to `/private/var/folders/…`, which wasn't on the allowlist.
+- **In-page capture buffers are bounded** (console 2,000 / network 5,000 entries) — a chatty SPA grew them without limit, degrading the page (the same memory pressure the WebKit monitor exists to contain).
+
+### Added — third pass (2026-06-11)
+- `ownership-match.js` + `test/ownership-match.test.mjs` — the tab-ownership matching/TTL semantics extracted pure and locked by 12 CI-safe unit tests (including the `/org` vs `/org-evil` boundary).
+- `scripts/contract-clipboard-restore.mjs` and `scripts/contract-focus-restore.mjs` — manual contract tests for the two historically regressing areas (clipboard restore, focus restore). Not in `npm test`: they need a GUI/pasteboard.
+- `npm test` now also runs the unit suites in `test/` (escaping + ownership) alongside the smoke test.
+
+### Changed — third pass (2026-06-11)
+- `engines.node` raised to `>=20` (Node 18 is EOL; CI tests 20/22/24).
+- Hebrew comments in `index.js` translated to English (public package).
+- Dead `_lastNewTabAt`/`NEW_TAB_GRACE_MS` removed; stale comments corrected (idle threshold is 2.5s, helper kill threshold is 5, `newTab`'s count query is not atomic with creation).
+
+### Fixed
+
+#### Tab safety
+- **`safari_run_script` and `safari_native_click`/`_type`/`_keyboard` bypassed the tab-ownership guard.** That guard lived only inside `extensionOrFallback`; these tools call the engine directly, so a `fill`/`click` step (or an OS-level native click) could land on the user's tab. The guard is extracted to `_assertTabOwnership()` and applied to `run_script` (per page-mutating step, unless the batch opens its own tab first) and the native tools.
+- **`runJS`'s fallback guard required `SAFARI_PROFILE`.** Without a profile, `getFallbackTarget()` returns `"front document"` (the user's active tab), so the `_hasOwnedTab && SAFARI_PROFILE` condition was exactly backwards — it disabled the guard precisely where it mattered most. Now keys on `_hasOwnedTab` alone, matching `runJSLarge` and the ghost-recovery path.
+
+#### Clipboard
+- **The user's clipboard could be left holding the tool's text** if the process was signalled to exit inside the 2-second native-paste restore window. A new `flushClipboardRestore()` runs synchronously in the shutdown handler.
+
+#### Daemon / robustness
+- **Orphaned `safari-helper` daemons** under the consecutive-timeout kill path (the kill timer and the `exit` handler both scheduled a respawn). `startHelper()` is now idempotent and the kill-path respawn is guarded.
+- **Shutdown could hang** — `_cleanupTabs()` is now capped at 3s (`Promise.race`) so a wedged daemon can't block exit.
+- **An EPIPE on a `pbcopy` stdin write could crash the whole server** (it reached `uncaughtException` → `process.exit(1)`). All four clipboard writers now go through a single `_pbcopy()` helper with a stdin `error` handler.
+- **Native-helper stdin writes** (click/hover/keyboard) now splice their queue callback out on a write error, preventing a FIFO desync where every later response is shifted by one.
+- **`safari-helper` (Swift): a `keyCode` outside 0…65535 trapped the daemon** on the `UInt16()` conversion. Now validated.
+
+#### State
+- **Ownership TTL never expired** — `_saveOwnershipFile` rewrote every entry's timestamp to `now` on each save, so the 30-minute TTL leaked ownership across sessions (potentially onto the user's tabs). Original timestamps are now preserved.
+- **A timed-out extension command was not removed from the HTTP poll queue**, so the extension could execute a stale `navigate`/`click` long after the caller gave up. The timeout now prunes the queue.
+
+#### Other
+- **`safari_screenshot_element` crop used a hardcoded 74px toolbar height** instead of the dynamic value, offsetting crops on Sequoia+ (~90px chrome).
+- **`safari_run_script` rejected ~10 actions that exist as tools** (`verifyState`, `reactSelectSet`, `nativeClick`, `uploadFile`, …) — added to the dispatch map.
+
+### Changed
+- **String escaping deduplicated.** ~50 hand-inlined copies of the security-relevant `\\`-then-`'` recipe are replaced by `escJsSingleQuote()` / `escAppleScriptString()`, with `test/escaping.test.mjs` locking each helper to the historical inline pattern (escaping order is what prevents JS-string / AppleScript breakout).
+
+## [2.12.0] - 2026-06-02
+
+A correctness + security pass across the engine, server, and extension.
+
+### Fixed
+
+#### Async tools that never actually waited (`do JavaScript` can't await a Promise)
+Several tools passed an `async` IIFE straight to AppleScript `do JavaScript`, which returns the moment the synchronous portion finishes — handing back an unsettled Promise (`[object Promise]`) instead of the result. This is the same constraint already handled for `safari_evaluate`/`safari_wait_for`; these tools now poll page state from the Node side:
+- **`safari_navigate_and_read`** was fully broken — it returned `[object Promise]` instead of the page content. Now polls `readyState`, then reads.
+- **`safari_go_back` / `safari_go_forward`** navigated but never updated the tracked URL, so the next operation could target the wrong tab.
+- **`safari_reload`** reloaded but never waited for load or refreshed the URL.
+- **`safari_click_and_wait`** clicked but never waited; **`safari_fill_and_submit`** submitted but didn't wait for the result page; **`safari_scroll_to`** (text mode) scrolled once instead of looping; **`safari_emulate` / `safari_reset_emulation`** didn't wait for the reload.
+- **`safari_get_indexed_db` / `safari_list_indexed_dbs`** returned `[object Promise]` — now routed through the async poller.
+- **`safari_screenshot_element`** (canvas path) returned a Promise and never fell through to the reliable screencapture+crop fallback; the `safari_screenshot` canvas fallback and `safari_upload_file` drop-fallback had the same flaw.
+
+#### Injection / escaping correctness
+- **`safari_mock_route`**: escape order was reversed (`'`→`\'` before `\`→`\\`), double-escaping quotes and breaking the injected JS. Backslash is now escaped first.
+- **`safari_set_cookie` / `safari_set_local_storage` / `safari_set_session_storage` / `safari_delete_cookies`**: keys/values containing a backslash produced invalid JS (only `'` was escaped). Backslash is now escaped first.
+- **`safari_get_computed_style`**: CSS property names were interpolated into injected JS unsanitized — now escaped.
+- **`safari_navigate` / `safari_new_tab` / `safari_navigate_and_read`**: URLs were only quote-escaped — a backslash or newline could break out of the AppleScript string literal (potential AppleScript injection). Now backslash-escaped and CR/LF stripped.
+- **Extension snapshot**: page-controlled attribute values (`aria-label`, `title`, `value`, `href`, …) are now HTML-escaped, so a crafted attribute can't inject a fake `ref=`/`role=` into the snapshot and steer the agent to the wrong element.
+- **Extension ref lookup**: attribute values are escaped and the query is guarded, so a page-controlled `aria-label`/`name`/`placeholder` containing `"` no longer throws a DOMException that surfaced as a misleading "element not found".
+
+#### Filesystem safety
+- **`safari_save_pdf`**: now validates the output path (allowlist + sensitive-path block) — it could previously overwrite any file. The Python conversion receives paths via `argv` instead of interpolating them into source (the old shell-style escaping was wrong for a Python `-c` string and broke on any path containing a quote).
+- **`_validateFilePath`**: the `..` check was dead (`path.resolve()` already strips `..`); it now rejects traversal in the raw input and resolves symlinks, so a symlink under `/Users/` pointing outside the allowlist is caught.
+- **Temp-file leaks**: `safari_screenshot_element` (crop) reconstructed the wrong filename and leaked it on error; `safari_upload_file` never deleted the PNG produced by image conversion. Both now clean up.
+
+#### Tab safety & focus
+- **Tab-ownership same-origin hole**: once the session opened a single tab on an origin (github.com, google.com, …), *every* tab on that origin — including the user's own — counted as owned, so a click/fill could land in the user's tab. The over-broad rule was removed; same-origin redirects remain covered by the path-prefix check.
+- **`safari_wait_for_new_tab`** never registered the found tab as owned, so the next interaction (e.g. after an OAuth popup) was blocked by the tab-safety guard. It now tracks ownership.
+- **Focus restore** runs in `finally` inside `extensionOrFallback`, so a failed operation that brought Safari to the front still hands focus back.
+- **Clipboard restore** for native paste runs in `finally` — if the helper daemon dies mid-paste, the user's clipboard is restored instead of being left with the tool's text.
+
+#### Robustness
+- **HTTP body-size guard** could call `res.writeHead(413)` twice on one oversized request (`ERR_HTTP_HEADERS_SENT`); guarded with `res.headersSent`.
+- **Extension poll loop**: a single malformed `/poll` body used to tear down the loop and trigger a multi-second reconnect — it's now skipped. The safety-timeout path uses `continue` instead of re-entering `pollForCommands()` (no overlapping loops).
+- **Extension navigate**: sparse pages that are OAuth/redirect callbacks (`code=`/`token=`/`state=` in the URL) are no longer hard-reloaded — the reload dropped POST data and could re-submit forms.
+- **`safari_get_local_storage` / `safari_get_session_storage`** no longer throw on a key whose value is `null`.
+- Window IDs are validated numeric before reaching `do shell script "screencapture -l<id>"`.
+- Stale-detection and proxy-recheck timers are `unref()`'d, so they never keep the Node process alive on their own.
+- **Extension Trusted-Types policy** registers only `createScript` now (dropped the unused, world-accessible `createHTML`/`createScriptURL` pass-throughs).
+
+### Deferred (tracked, intentionally not changed here)
+- The local HTTP/WebSocket bridge has no auth token — any local process can drive it. The CORS guard already blocks web pages (browsers always send an `Origin`), but a no-`Origin` local request passes. A proper fix needs a native-messaging handshake or a Unix-domain socket and is tracked separately, to avoid breaking the extension transport.
+- `manifest.json` `host_permissions: ["<all_urls>"]` is broader than the `http(s)` the bridge needs; narrowing it may force a permission re-grant on installed extensions, so it's deferred.
+
+## [2.11.9] - 2026-05-28
+
+### Fixed
+
+- **MCP `initialize` handshake no longer blocks on profile-window detection at startup.** When launched with `SAFARI_PROFILE=<name>`, the server used to run `await refreshTargetWindow(true)` on the module's top-level await before the stdio loop began responding to the MCP `initialize` request. That call shells out to AppleScript to enumerate Safari windows and match the profile — typically ~50–200ms, but it could exceed 30s if Safari was busy (Spotlight indexing, heavy tab churn, AppleScript daemon stalled). When it did, Claude Code's 30-second MCP handshake timeout fired, the server was killed, and `safari-*` tools silently disappeared from the conversation's tool catalog until the user started a new Claude Code session. The detection now runs in a fire-and-forget async IIFE so module init completes immediately; tool calls that arrive before it finishes already trigger lazy refresh inside `getTargetWindowRef()`, so the targeting behaviour is unchanged.
+
+## [2.11.7] - 2026-05-26
+
+### Fixed
+
+- **Focus theft eliminated on macOS Tahoe.** Three independent gaps in the focus-preservation pipeline let Safari steal the user's foreground app during routine tool calls (`safari_navigate`, `safari_read_page`, `safari_snapshot`, `safari_screenshot`, and any tool that ultimately ran an AppleScript). On Tahoe, Safari implicitly activates itself when an AppleScript mutates one of its windows (`set URL`, `set bounds`, `set current tab`) and `screencapture -l<id>` flashes the window forward mid-capture, so the pre-existing save/restore had race windows that became visible to the user every few calls.
+  - **`osascriptFast` is now focus-guarded.** It is the hot path (~5ms via the persistent Swift daemon, 18× faster than the subprocess fallback) and is called from `safari_navigate`, `safari_snapshot`, the tab-resolution layer, the profile-window detector, and dozens of internal helpers. It previously had no guard at all — only the slower `osascript` subprocess wrapper saved and restored the frontmost app. Added a mirror guard gated on `!_focusGuardActive` so nested calls inside `extensionOrFallback` / `runJSLarge` still skip duplicate save+restore work.
+  - **Awaited restores.** Three sites (`osascript` subprocess, `runJSLarge`, `screenshot`'s screencapture path) previously called `_helperActivateApp(prev).catch(() => {})` without awaiting. `NSRunningApplication.activate()` is async at the OS level, so the function returned to user-space while Safari was still frontmost — keystrokes during the ~5–50ms race landed in Safari. All three now `await restoreFocusIfStolen(prev)`.
+  - **Verify-and-hide fallback inside `restoreFocusIfStolen`.** macOS Tahoe's window-server policy can silently block `NSRunningApplication.activate()`, leaving the previously activated app stuck behind Safari. The function now: activates the saved bundle → settles 5ms (Tahoe needs time to honor the activate) → re-reads frontmost → falls back to `_helperHideSafari()` only if Safari is still on top. Hiding Safari is reliable because the OS auto-picks the next app — which is the one we saved.
+- **Background profile-window polling no longer participates in focus-guard.** Every 3 seconds the server polls `tell application "Safari" to return name of window N` to detect profile-window changes. Once `osascriptFast` became focus-guarded this poll became a tiny ~5ms window during which a manual user switch to Safari could be misread as "Safari stole focus" and trigger the hide fallback against them. The polling now passes `noFocusGuard: true` because the script is read-only and provably can't activate Safari.
+
+## [2.11.6] - 2026-05-26
+
+### Security
+
+- **Bumped transitive `qs` 6.15.0 → 6.15.2** via `npm audit fix` to close [Dependabot alert #18](https://github.com/achiya-automation/safari-mcp/security/dependabot/18). `qs` ships with Express (pulled in by `@modelcontextprotocol/sdk` for the HTTP control surface); `qs.stringify` would crash with a `TypeError` on null/undefined entries inside comma-format arrays when `encodeValuesOnly: true`. `safari-mcp` does not set that option, so this was not exploitable in our code path, but the upgrade clears the alert and any downstream user that does set it. No API changes.
+
+## [2.11.5] - 2026-05-26
+
+### Security
+
+- **Bumped `ws` 8.20.1 → 8.21.0** to pick up the upstream fix for a remote memory-exhaustion DoS (CVE-class issue, responsibly disclosed by Nadav Magier). A peer streaming a high volume of tiny fragments or data chunks over modest network traffic could OOM a `ws` server or client. `safari-mcp` uses `ws` for the Safari extension WebSocket bridge, so the receiving side now caps retained fragments and chunks. No API changes.
+
 ## [2.11.4] - 2026-05-25
 
 ### Fixed

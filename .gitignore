@@ -27,3 +27,9 @@ DerivedData/
 
 # Smithery build artifacts
 .smithery/
+
+# Local backups / debug artifacts (never commit)
+*.bak
+*.bak-before-*
+.archive/
+audit-*.md
