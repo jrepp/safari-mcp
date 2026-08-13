@@ -10,6 +10,9 @@ build/
 .launch-day/
 .agf-workspace/
 
+# Local Metro CLI state when memory commands are run from this checkout
+/data/
+
 # MCP Registry publisher binary (downloaded locally, not for commit)
 mcp-publisher
 
