@@ -1281,9 +1281,15 @@ server.tool(
 
 // ========== SCREENSHOT ==========
 
+function screenshotMimeType(base64) {
+  return typeof base64 === "string" && base64.startsWith("iVBORw0KGgo")
+    ? "image/png"
+    : "image/jpeg";
+}
+
 server.tool(
   "safari_screenshot",
-  "Take a visual screenshot (base64 JPEG). EXPENSIVE — use safari_snapshot instead for most tasks. Only use screenshot when you need to verify visual layout, styling, images, or colors that snapshot can't show.",
+  "Take a visual screenshot. EXPENSIVE — use safari_snapshot instead for most tasks. Only use screenshot when you need to verify visual layout, styling, images, or colors that snapshot can't show.",
   {
     fullPage: z.boolean().optional().describe("Capture full page (not just viewport)"),
   },
@@ -1305,7 +1311,7 @@ server.tool(
       }
     }
     return {
-      content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
+      content: [{ type: "image", data: base64, mimeType: screenshotMimeType(base64) }],
     };
   }
 );
@@ -1320,7 +1326,7 @@ server.tool(
       () => safari.screenshotElement({ selector })
     );
     return {
-      content: [{ type: "image", data: base64, mimeType: "image/jpeg" }],
+      content: [{ type: "image", data: base64, mimeType: screenshotMimeType(base64) }],
     };
   }
 );
@@ -1729,7 +1735,7 @@ server.tool(
 
 server.tool(
   "safari_emulate",
-  "Emulate a mobile device by resizing window and setting user agent. Devices: iphone-14, iphone-14-pro-max, ipad, ipad-pro, pixel-7, galaxy-s24. Or use custom width/height.",
+  "Apply and verify a responsive viewport in Safari. Device presets set viewport dimensions and a current-document user-agent override; network requests still use desktop Safari. Devices: iphone-14, iphone-14-pro-max, ipad, ipad-pro, pixel-7, galaxy-s24. Or use custom width/height.",
   {
     device: z.string().optional().describe("Device name: iphone-14, ipad, pixel-7, galaxy-s24, etc."),
     width: z.coerce.number().optional().describe("Custom viewport width"),
@@ -1746,7 +1752,7 @@ server.tool(
 
 server.tool(
   "safari_reset_emulation",
-  "Reset device emulation back to desktop mode",
+  "Restore the original Safari window bounds, selected tab, viewport metadata, and user-agent property",
   {},
   async () => {
     _assertTabOwnership("reset_emulation");

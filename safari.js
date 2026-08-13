@@ -38,6 +38,38 @@ let _helperProc = null;
 const _helperQueue = []; // callbacks waiting for responses
 let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — kill threshold lives where it's checked (currently 5)
 
+function getHelperPath() {
+  const override = String(process.env.SAFARI_MCP_HELPER_PATH || "").trim();
+  return override ? resolvePath(override) : join(__dirname, "safari-helper");
+}
+
+function getCaptureHelperPath() {
+  const override = String(process.env.SAFARI_MCP_CAPTURE_HELPER_PATH || "").trim();
+  return override ? resolvePath(override) : getHelperPath();
+}
+
+export function screenCaptureCliError(error) {
+  const message = String(error?.message || "");
+  const stdout = String(error?.stdout || "");
+  const stderr = String(error?.stderr || "");
+  const combined = [message, stdout, stderr].filter(Boolean).join("\n");
+  if (combined.includes("__SCREENSHOT_PERMISSION_DENIED__")) {
+    return new Error(
+      "Screen Recording permission denied for safari-helper. Grant it in System Settings → Privacy & Security → Screen Recording (enable safari-helper), then retry.",
+    );
+  }
+  for (const line of stdout.split("\n")) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed?.error) return new Error(`safari-helper screenshot failed: ${parsed.error}`);
+    } catch {
+      // Keep looking for a structured helper reply.
+    }
+  }
+  const detail = (stderr || stdout || message || "unknown helper failure").trim();
+  return new Error(`safari-helper screenshot failed: ${detail}`);
+}
+
 // ── Helper request serialization ──────────────────────────────────────────
 // The Swift helper runs each request on its own background thread, so it can
 // finish requests out of order. The Node side matches responses to callbacks by
@@ -73,7 +105,7 @@ function _drainHelperQueue(reason) {
 
 function startHelper() {
   if (_helperProc) return; // idempotent — a respawn already won the race; don't orphan a daemon
-  const helperPath = join(__dirname, "safari-helper");
+  const helperPath = getHelperPath();
   try {
     _helperProc = spawn(helperPath, [], { stdio: ["pipe", "pipe", "ignore"] });
     let _buf = "";
@@ -892,6 +924,44 @@ function _helperPreflight(timeout = 3000) {
   }));
 }
 
+// Screen Recording is checked in a short-lived helper process using the same
+// responsibility-disclaimed identity as real captures. The daemon preflight is
+// intentionally not used for this permission: macOS can grant the daemon while
+// denying the disclaimed capture identity.
+async function _helperScreenPreflight(timeout = 5000) {
+  try {
+    const { stdout } = await execFileAsync(getCaptureHelperPath(), ["--screen-preflight"], {
+      timeout,
+      maxBuffer: 1024 * 1024,
+    });
+    const line = String(stdout || "").trim().split("\n").filter(Boolean).at(-1) || "";
+    const parsed = JSON.parse(line);
+    if (parsed?.error) throw new Error(parsed.error);
+    return parsed;
+  } catch (error) {
+    throw screenCaptureCliError(error);
+  }
+}
+
+async function _helperCaptureWindow(windowId, outputPath, timeout = 20000) {
+  try {
+    await execFileAsync(
+      getCaptureHelperPath(),
+      ["--screenshot", String(windowId), outputPath],
+      { timeout, maxBuffer: 1024 * 1024 },
+    );
+  } catch (error) {
+    if (process.env.MCP_DEBUG) {
+      console.error("[screenshot] helper capture error", {
+        code: error?.code,
+        stdout: String(error?.stdout || "").trim(),
+        stderr: String(error?.stderr || "").trim(),
+      });
+    }
+    throw screenCaptureCliError(error);
+  }
+}
+
 // ========== NATIVE CLICK VIA CGEVENT ==========
 // Sends a CGEvent click command to the Swift helper daemon.
 // This produces isTrusted: true events — bypasses WAF protection (G2, etc.)
@@ -1100,6 +1170,10 @@ async function _getSafariWindowGeometry() {
 // Run JavaScript in Safari — fastest path, no focus stealing
 // Uses osascriptFast (persistent process, ~5ms) for short scripts,
 // falls back to osascript (~80ms) for long scripts that exceed stdin limits
+/**
+ * @param {string} js
+ * @param {{ tabIndex?: number, timeout?: number }} [options]
+ */
 async function runJS(js, { tabIndex, timeout = 15000 } = {}) {
   await refreshTargetWindow();
   const escaped = js
@@ -2946,136 +3020,94 @@ export async function replaceEditorContent({ text }) {
 
 export async function screenshot({ fullPage = false } = {}) {
   await refreshTargetWindow();
-  const tmpFile = join(tmpdir(), `safari-screenshot-${Date.now()}.png`);
+  const tmpFile = join(tmpdir(), `safari-screenshot-${randomUUID()}.png`);
+  const jpgFile = tmpFile.replace(/\.png$/, ".jpg");
+  const windowRef = getTargetWindowRef();
+  const targetTabIndex = _activeTabIndex;
+  let previousTabIndex = null;
+  let previousBundleId = null;
+  let originalBounds = null;
   try {
-    // Check if target tab is a background tab — if so, use JS screenshot to avoid tab jumping
-    let isBackgroundTab = false;
-    if (_activeTabIndex) {
-      try {
-        const currentIdx = await osascriptFast(
-          `tell application "Safari" to return index of current tab of ${getTargetWindowRef()}`
+    // A window screenshot only contains its current tab. Select the MCP-owned tab
+    // inside Safari's window without activating Safari, then restore the user's tab.
+    if (targetTabIndex) {
+      previousTabIndex = Number(await osascriptFast(
+        `tell application "Safari" to return index of current tab of ${windowRef}`,
+      ));
+      if (!Number.isInteger(previousTabIndex) || previousTabIndex < 1) {
+        throw new Error("Safari returned an invalid current-tab index; screenshot was not taken.");
+      }
+      if (previousTabIndex !== targetTabIndex) {
+        await osascriptFast(
+          `tell application "Safari" to set current tab of ${windowRef} to tab ${targetTabIndex} of ${windowRef}`,
         );
-        isBackgroundTab = Number(currentIdx) !== _activeTabIndex;
-      } catch (_) {}
-    }
-    // When on a background tab, go straight to JS-based screenshot (no tab switch, no focus steal)
-    const skipScreencapture = isBackgroundTab;
-
-    // Try screencapture — use osascript's do shell script to bypass VS Code permission issue
-    const windowIdRaw = !skipScreencapture ? await osascript(
-      `tell application "Safari" to return id of ${getTargetWindowRef()}`
-    ).catch(() => null) : null;
-    // Window IDs are OS-assigned integers — reject anything non-numeric before it reaches
-    // `do shell script "screencapture -l<id>"` (defense-in-depth against odd AppleScript stdout).
-    const windowId = windowIdRaw != null && /^\d+$/.test(String(windowIdRaw).trim()) ? String(windowIdRaw).trim() : null;
-
-    // On macOS Tahoe, screencapture -l may briefly steal focus.
-    // Save frontmost app via daemon so we can hide Safari if it stole focus.
-    let previousBundleId = null;
-    if (windowId) {
-      const fa = await _helperGetFrontApp();
-      previousBundleId = fa?.bundleId || null;
-    }
-
-    if (windowId) {
-      try {
-        if (fullPage) {
-          const bounds = await osascript(
-            `tell application "Safari" to return bounds of ${getTargetWindowRef()}`
-          );
-          const dims = await runJS("JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth})");
-          const { h, w } = JSON.parse(dims);
-          await osascript(
-            `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${Number(w)}, ${Math.min(Number(h) + 100, 5000)}}`
-          );
-          try {
-            await new Promise((r) => setTimeout(r, 500));
-            // Use do shell script to inherit osascript's Screen Recording permission
-            await osascript(
-              `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
-              { timeout: 15000 }
-            );
-          } finally {
-            // Always restore bounds — even if screencapture fails
-            await osascript(
-              `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {${bounds}}`
-            ).catch(() => {});
-          }
-        } else {
-          // Try direct execFile first (works if VS Code has Screen Recording permission)
-          try {
-            await execFileAsync("screencapture", ["-l" + windowId, "-o", "-x", tmpFile]);
-            const testData = await readFile(tmpFile);
-            if (testData.length < 100) throw new Error("empty");
-          } catch (_) {
-            // Fallback: use do shell script (osascript may have permission)
-            await osascript(
-              `do shell script "screencapture -l${windowId} -o -x '${tmpFile}'"`,
-              { timeout: 15000 }
-            );
-          }
-        }
-        // Re-activate previous app if screencapture stole focus (common on macOS Tahoe).
-        // Centralized restore handles settle delay + hide fallback if activate is blocked.
-        if (previousBundleId && previousBundleId !== "com.apple.Safari") {
-          await restoreFocusIfStolen(previousBundleId).catch(() => {});
-        }
-        // Compress: convert PNG to JPEG (50% quality) + resize to max 1200px width
-        // Cuts ~600KB PNG → ~60KB JPEG — critical for staying under 20MB context limit
-        const jpgFile = tmpFile.replace(/\.png$/, '.jpg');
-        try {
-          await execFileAsync("sips", [
-            "-s", "format", "jpeg",
-            "-s", "formatOptions", "50",
-            "--resampleWidth", "1200",
-            tmpFile, "--out", jpgFile
-          ], { timeout: 5000 });
-          const jpgData = await readFile(jpgFile);
-          await unlink(tmpFile).catch(() => {});
-          await unlink(jpgFile).catch(() => {});
-          if (jpgData.length > 100) return jpgData.toString("base64");
-        } catch (_) {
-          // sips failed — fall back to original PNG
-          await unlink(jpgFile).catch(() => {});
-        }
-        const data = await readFile(tmpFile);
-        await unlink(tmpFile).catch(() => {});
-        if (data.length > 100) return data.toString("base64");
-      } catch (_) {
-        // screencapture failed, fall through to JS method
+        await new Promise((resolve) => setTimeout(resolve, 150));
       }
     }
 
-    // Fallback: JS-based screenshot via canvas (no permissions needed)
-    const dataUrl = await runJS(
-      `(async function(){` +
-      `var c=document.createElement('canvas');var ctx=c.getContext('2d');` +
-      `c.width=window.innerWidth;c.height=${fullPage ? 'document.documentElement.scrollHeight' : 'window.innerHeight'};` +
-      `var svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+c.width+'" height="'+c.height+'">' +` +
-      `'<foreignObject width="100%" height="100%">' +` +
-      `'<div xmlns="http://www.w3.org/1999/xhtml">' + document.documentElement.outerHTML + '</div>' +` +
-      `'</foreignObject></svg>';` +
-      `var blob=new Blob([svg],{type:'image/svg+xml'});` +
-      `var url=URL.createObjectURL(blob);` +
-      `var img=new Image();` +
-      `return new Promise(function(resolve){` +
-      `img.onload=function(){ctx.drawImage(img,0,0);resolve(c.toDataURL('image/png').split(',')[1]);};` +
-      `img.onerror=function(){resolve('FALLBACK_TEXT')};` +
-      `img.src=url;});})()`,
-      { timeout: 30000 }
+    const windowIdRaw = await osascriptFast(
+      `tell application "Safari" to return id of ${windowRef}`,
     );
-
-    // canvas/SVG returns a Promise `do JavaScript` can't await → guard against the
-    // unsettled "[object Promise]"/empty value and only return a real base64 PNG.
-    const looksBase64 = typeof dataUrl === 'string' && dataUrl.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(dataUrl.slice(0, 120));
-    if (looksBase64) {
-      return dataUrl;
+    if (process.env.MCP_DEBUG) console.error("[screenshot] resolved Safari window id", windowIdRaw);
+    const windowId = String(windowIdRaw).trim();
+    if (!/^\d+$/.test(windowId)) {
+      throw new Error(`Safari returned an invalid window id: ${windowId || "(empty)"}`);
     }
 
-    // Final fallback: throw with clear message for the retry logic in index.js
-    throw new Error("screencapture failed — Screen Recording permission may have been lost. Grant permission in System Settings → Privacy & Security → Screen Recording, then restart Safari.");
+    const frontApp = await _helperGetFrontApp();
+    previousBundleId = frontApp?.bundleId || null;
+    if (process.env.MCP_DEBUG) console.error("[screenshot] front app", previousBundleId || "unknown");
+
+    if (fullPage) {
+      originalBounds = await osascript(
+        `tell application "Safari" to return bounds of ${windowRef}`,
+      );
+      const dims = JSON.parse(await runJS(
+        "JSON.stringify({h:document.documentElement.scrollHeight,w:document.documentElement.scrollWidth,chrome:window.outerHeight-window.innerHeight})",
+      ));
+      const width = Math.max(1, Math.min(Number(dims.w), 5000));
+      const height = Math.max(1, Math.min(Number(dims.h) + Number(dims.chrome || 90), 5000));
+      await osascriptFast(
+        `tell application "Safari" to set bounds of ${windowRef} to {0, 0, ${width}, ${height}}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+
+    if (process.env.MCP_DEBUG) console.error("[screenshot] invoking helper capture", getCaptureHelperPath());
+    await _helperCaptureWindow(windowId, tmpFile);
+    if (process.env.MCP_DEBUG) console.error("[screenshot] helper capture completed");
+    const pngData = await readFile(tmpFile);
+    if (pngData.length < 100) throw new Error("safari-helper screenshot returned an empty image");
+
+    try {
+      await execFileAsync("sips", [
+        "-s", "format", "jpeg",
+        "-s", "formatOptions", "50",
+        "--resampleWidth", "1200",
+        tmpFile, "--out", jpgFile,
+      ], { timeout: 5000 });
+      const jpgData = await readFile(jpgFile);
+      if (jpgData.length > 100) return jpgData.toString("base64");
+    } catch (_) {
+      // Keep the valid helper PNG when optional compression is unavailable.
+    }
+    return pngData.toString("base64");
   } finally {
+    if (originalBounds && /^-?\d+(?:\.\d+)?(?:,\s*-?\d+(?:\.\d+)?){3}$/.test(String(originalBounds).trim())) {
+      await osascriptFast(
+        `tell application "Safari" to set bounds of ${windowRef} to {${originalBounds}}`,
+      ).catch(() => {});
+    }
+    if (targetTabIndex && previousTabIndex && previousTabIndex !== targetTabIndex) {
+      await osascriptFast(
+        `tell application "Safari" to set current tab of ${windowRef} to tab ${previousTabIndex} of ${windowRef}`,
+      ).catch(() => {});
+    }
+    if (previousBundleId && previousBundleId !== "com.apple.Safari") {
+      await restoreFocusIfStolen(previousBundleId).catch(() => {});
+    }
     await unlink(tmpFile).catch(() => {});
+    await unlink(jpgFile).catch(() => {});
   }
 }
 
@@ -3905,6 +3937,34 @@ export async function pasteImageFromFile({ filePath }) {
 
 // ========== EMULATE (VIEWPORT) ==========
 
+let _emulationState = null;
+
+export function assessEmulationObservation(requested, observed, tolerance = 2) {
+  const problems = [];
+  const observedWidth = Number(observed?.innerWidth);
+  const observedHeight = Number(observed?.innerHeight);
+  if (!Number.isFinite(observedWidth) || Math.abs(observedWidth - Number(requested?.width)) > tolerance) {
+    problems.push(
+      `effective viewport width is ${observed?.innerWidth ?? "unknown"}px; requested ${requested?.width}px`,
+    );
+  }
+  if (!Number.isFinite(observedHeight) || Math.abs(observedHeight - Number(requested?.height)) > tolerance) {
+    problems.push(
+      `effective viewport height is ${observed?.innerHeight ?? "unknown"}px; requested ${requested?.height}px`,
+    );
+  }
+  if (requested?.userAgent && observed?.userAgent !== requested.userAgent) {
+    problems.push("page user agent override did not take effect");
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+async function _readEmulationObservation() {
+  return JSON.parse(await runJS(
+    "JSON.stringify({outerWidth:window.outerWidth,outerHeight:window.outerHeight,innerWidth:window.innerWidth,innerHeight:window.innerHeight,visualWidth:window.visualViewport?window.visualViewport.width:null,visualHeight:window.visualViewport?window.visualViewport.height:null,userAgent:navigator.userAgent,viewport:document.querySelector('meta[name=viewport]')?.content||null})",
+  ));
+}
+
 export async function emulate({ device, width, height, userAgent, scale = 1 }) {
   await refreshTargetWindow();
   const devices = {
@@ -3921,54 +3981,120 @@ export async function emulate({ device, width, height, userAgent, scale = 1 }) {
   const h = d ? d.height : (height || 812);
   const ua = d ? d.ua : (userAgent || "");
 
-  // Resize Safari window to match device
-  await osascript(
-    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, ${w}, ${h + 100}}`
-  );
-
-  // Override viewport meta and user agent if specified
-  if (ua) {
-    await runJS(
-      `Object.defineProperty(navigator,'userAgent',{get:function(){return '${ua.replace(/'/g, "\\'")}'},configurable:true})`
-    );
+  if (!_activeTabIndex) {
+    throw new Error("Responsive viewport requires an MCP-owned tab. Open one with safari_new_tab first.");
   }
 
-  // Set viewport meta tag
-  await runJS(
-    `(function(){var m=document.querySelector('meta[name=viewport]');if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}m.content='width=${w},initial-scale=${scale}';})()`
-  );
+  const windowRef = getTargetWindowRef();
+  const targetTabIndex = _activeTabIndex;
+  if (_emulationState && _emulationState.windowRef !== windowRef) {
+    throw new Error("Responsive viewport is active in another Safari window. Reset it before changing targets.");
+  }
+  if (_emulationState && _emulationState.targetTabIndex !== targetTabIndex) {
+    throw new Error("Responsive viewport is active on another Safari tab. Reset it before changing targets.");
+  }
+  if (!_emulationState) {
+    const bounds = String(await osascript(
+      `tell application "Safari" to return bounds of ${windowRef}`,
+    )).split(",").map((value) => Number(value.trim()));
+    const previousTabIndex = Number(await osascriptFast(
+      `tell application "Safari" to return index of current tab of ${windowRef}`,
+    ));
+    if (bounds.length !== 4 || bounds.some((value) => !Number.isFinite(value))) {
+      throw new Error("Safari returned invalid window bounds; responsive viewport was not applied.");
+    }
+    if (!Number.isInteger(previousTabIndex) || previousTabIndex < 1) {
+      throw new Error("Safari returned an invalid current-tab index; responsive viewport was not applied.");
+    }
+    _emulationState = { bounds, previousTabIndex, windowRef, targetTabIndex };
+  }
 
-  // Reload to apply changes, then wait for load — polled from Node (`do JavaScript`
-  // can't await an in-page loop).
-  const navIndex = _activeTabIndex;
-  await runJS("location.reload()", { tabIndex: navIndex });
-  await new Promise(r => setTimeout(r, 200));
-  await _pollReadyAndRead(navIndex);
+  let emulationApplied = false;
+  try {
+    // Safari does not reflow a background tab when only its window is resized. Make
+    // the MCP-owned tab current inside the window (without activating Safari) first.
+    await osascriptFast(
+      `tell application "Safari" to set current tab of ${windowRef} to tab ${targetTabIndex} of ${windowRef}`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
-  return JSON.stringify({
-    device: device || "custom",
-    width: w,
-    height: h,
-    userAgent: ua ? ua.substring(0, 60) + "..." : "(default)",
-  });
+    const before = await _readEmulationObservation();
+    const chromeHeight = Math.max(0, Number(before.outerHeight) - Number(before.innerHeight));
+    const [x1, y1] = _emulationState.bounds;
+    await osascriptFast(
+      `tell application "Safari" to set bounds of ${windowRef} to {${x1}, ${y1}, ${x1 + w}, ${y1 + h + chromeHeight}}`,
+    );
+
+    const safeUa = escJsSingleQuote(ua);
+    await runJS(
+      `(function(){` +
+        `if(!window.__safariMcpEmulation){var old=document.querySelector('meta[name=viewport]');window.__safariMcpEmulation={hadViewport:!!old,viewport:old?old.content:null};}` +
+        `var m=document.querySelector('meta[name=viewport]');if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}` +
+        `m.content='width=device-width,initial-scale=${Number(scale)}';` +
+        (ua ? `Object.defineProperty(navigator,'userAgent',{get:function(){return '${safeUa}'},configurable:true});` : "") +
+        `return 'responsive viewport prepared';})()`,
+    );
+
+    let observed = null;
+    let assessment = null;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      observed = await _readEmulationObservation();
+      assessment = assessEmulationObservation({ width: w, height: h, userAgent: ua }, observed);
+      if (assessment.ok) break;
+    }
+    if (!assessment?.ok) {
+      throw new Error(
+        `Safari could not apply the requested responsive viewport: ${assessment?.problems.join("; ") || "observed state unavailable"}`,
+      );
+    }
+
+    emulationApplied = true;
+    return JSON.stringify({
+      device: device || "custom",
+      width: w,
+      height: h,
+      observed,
+      userAgentScope: ua ? "current document only; Safari network requests keep the desktop user agent" : "default",
+    });
+  } finally {
+    if (!emulationApplied) await resetEmulation().catch(() => {});
+  }
 }
 
 export async function resetEmulation() {
   await refreshTargetWindow();
-  // Reset user agent — remove the defineProperty override set by emulate()
-  await runJS(
-    "try{var d=Object.getOwnPropertyDescriptor(Navigator.prototype,'userAgent');if(d){Object.defineProperty(navigator,'userAgent',d);}else{delete navigator.userAgent;}}catch(_){}"
-  );
-  // Maximize window
-  await osascript(
-    `tell application "Safari" to set bounds of ${getTargetWindowRef()} to {0, 0, 1440, 900}`
-  );
-  // Reload + wait for load — polled from Node (`do JavaScript` can't await an in-page loop).
-  const navIndex = _activeTabIndex;
-  await runJS("location.reload()", { tabIndex: navIndex });
-  await new Promise(r => setTimeout(r, 200));
-  await _pollReadyAndRead(navIndex);
-  return "Emulation reset to desktop";
+  if (!_emulationState) return "No active responsive viewport to reset";
+
+  const state = _emulationState;
+  const windowRef = state.windowRef;
+  try {
+    if (state.targetTabIndex) {
+      await osascriptFast(
+        `tell application "Safari" to set current tab of ${windowRef} to tab ${state.targetTabIndex} of ${windowRef}`,
+      ).catch(() => {});
+      await runJS(
+        `(function(){` +
+          `try{delete navigator.userAgent;}catch(_){};` +
+          `var s=window.__safariMcpEmulation;var m=document.querySelector('meta[name=viewport]');` +
+          `if(s){if(s.hadViewport){if(m)m.content=s.viewport||'';}else if(m){m.remove();}delete window.__safariMcpEmulation;}` +
+          `return 'reset';})()`,
+        { tabIndex: state.targetTabIndex },
+      ).catch(() => {});
+    }
+    const [x1, y1, x2, y2] = state.bounds;
+    await osascriptFast(
+      `tell application "Safari" to set bounds of ${windowRef} to {${x1}, ${y1}, ${x2}, ${y2}}`,
+    );
+    if (state.previousTabIndex && state.previousTabIndex !== state.targetTabIndex) {
+      await osascriptFast(
+        `tell application "Safari" to set current tab of ${windowRef} to tab ${state.previousTabIndex} of ${windowRef}`,
+      ).catch(() => {});
+    }
+    return "Responsive viewport reset; original window bounds and selected tab restored";
+  } finally {
+    _emulationState = null;
+  }
 }
 
 // ========== CONSOLE CAPTURE ==========
@@ -5052,7 +5178,7 @@ export async function doctor() {
   add(aeOk, "Apple Events / Automation", aeDetail,
     "System Settings > Privacy & Security > Automation → enable Safari for your terminal/host app; and Safari > Develop > Allow JavaScript from Apple Events.");
 
-  // 3-5. Native helper daemon + Accessibility + Screen Recording (one preflight round-trip)
+  // 3-4. Native helper daemon + Accessibility use the daemon identity.
   let pf = null, pfErr = "";
   try { pf = await _helperPreflight(); } catch (e) { pfErr = e.message || String(e); }
   add(!!pf, "Native helper daemon", pf ? "safari-helper responding" : `not responding: ${pfErr}`,
@@ -5060,13 +5186,20 @@ export async function doctor() {
   add(!!pf && pf.accessibility === true, "Accessibility (native clicks)",
     pf ? (pf.accessibility ? "CGEvent posting permitted" : "NOT permitted — native clicks silently no-op (the #29 root cause)") : "unknown (helper not responding)",
     "System Settings > Privacy & Security > Accessibility → enable safari-helper, then retry.");
-  add(!!pf && pf.screenRecording === true, "Screen Recording (screenshots)",
-    pf ? (pf.screenRecording ? "permitted" : "NOT permitted — screenshots will be blank/blocked") : "unknown (helper not responding)",
-    "System Settings > Privacy & Security > Screen Recording → enable your terminal/host app.");
+
+  // 5. Check Screen Recording in the exact short-lived, responsibility-disclaimed
+  // identity used for capture. The daemon can be permitted while this identity is denied.
+  let screenPf = null, screenPfErr = "";
+  try { screenPf = await _helperScreenPreflight(); } catch (e) { screenPfErr = e.message || String(e); }
+  add(!!screenPf && screenPf.screenRecording === true, "Screen Recording (screenshots)",
+    screenPf
+      ? (screenPf.screenRecording ? "permitted for safari-helper capture identity" : "NOT permitted for safari-helper capture identity")
+      : `unknown: ${screenPfErr}`,
+    "System Settings > Privacy & Security > Screen Recording → enable safari-helper, then retry.");
 
   // 6. Helper codesign identity — a stale/ad-hoc id breaks the Accessibility grant on reinstall
   let idOk = false, idDetail = "";
-  const helperPath = join(__dirname, "safari-helper");
+  const helperPath = getCaptureHelperPath();
   try {
     const res = await execFileAsync("codesign", ["-d", "--verbose=2", helperPath], { timeout: 4000 })
       .catch((e) => ({ stdout: "", stderr: e.stderr || "" }));

@@ -8,6 +8,7 @@ build/
 
 .mcpregistry_*
 .launch-day/
+.agf-workspace/
 
 # MCP Registry publisher binary (downloaded locally, not for commit)
 mcp-publisher

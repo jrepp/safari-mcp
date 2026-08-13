@@ -13,6 +13,167 @@ import Foundation
 import Darwin
 import CoreGraphics
 import AppKit
+import ScreenCaptureKit
+import ImageIO
+
+// ========== Disclaimed screen-capture process ==========
+
+// Screen Recording authorization follows the responsible-process identity on
+// macOS. Re-exec only the short-lived capture/preflight commands with
+// responsibility disclaimed so every caller is attributed to this helper's
+// stable signing identity rather than its editor/terminal process chain.
+func reexecDisclaimedIfNeeded() -> String? {
+  if getenv("SAFARI_HELPER_DISCLAIMED") != nil { return nil }
+
+  let rawPath = CommandLine.arguments.first ?? "safari-helper"
+  var executablePath = rawPath
+  if let resolved = realpath(rawPath, nil) {
+    executablePath = String(cString: resolved)
+    free(resolved)
+  }
+
+  var attributes: posix_spawnattr_t?
+  let initResult = posix_spawnattr_init(&attributes)
+  guard initResult == 0 else {
+    return "failed to initialize responsibility-disclaimed spawn attributes: \(initResult)"
+  }
+  defer { posix_spawnattr_destroy(&attributes) }
+
+  guard let handle = dlopen(nil, RTLD_NOW) else {
+    return "responsibility-disclaimed spawn API is unavailable"
+  }
+  defer { dlclose(handle) }
+  guard let symbol = dlsym(handle, "responsibility_spawnattrs_setdisclaim") else {
+    return "responsibility-disclaimed spawn API is unavailable"
+  }
+  typealias DisclaimFunction = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>?, Int32) -> Int32
+  let disclaim = unsafeBitCast(symbol, to: DisclaimFunction.self)
+  let disclaimResult = disclaim(&attributes, 1)
+  guard disclaimResult == 0 else {
+    return "failed to disclaim screen-capture responsibility: \(disclaimResult)"
+  }
+
+  setenv("SAFARI_HELPER_DISCLAIMED", "1", 1)
+
+  var arguments: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
+  arguments.append(nil)
+  defer { for argument in arguments where argument != nil { free(argument) } }
+
+  var child: pid_t = 0
+  let spawnResult = posix_spawn(&child, executablePath, nil, &attributes, arguments, environ)
+  if spawnResult != 0 {
+    unsetenv("SAFARI_HELPER_DISCLAIMED")
+    return "failed to launch responsibility-disclaimed helper: \(spawnResult)"
+  }
+
+  var status: Int32 = 0
+  var waitResult: pid_t
+  repeat {
+    waitResult = waitpid(child, &status, 0)
+  } while waitResult == -1 && errno == EINTR
+  if waitResult == -1 { exit(1) }
+  let exitedNormally = (status & 0x7f) == 0
+  exit(exitedNormally ? ((status >> 8) & 0xff) : 1)
+}
+
+func screenCapturePreflight() -> [String: Any] {
+  _ = NSApplication.shared
+  return [
+    "result": "screen-preflight",
+    "screenRecording": CGPreflightScreenCaptureAccess(),
+    "responsibilityDisclaimed": getenv("SAFARI_HELPER_DISCLAIMED") != nil,
+  ]
+}
+
+@available(macOS 14.0, *)
+func captureWindowWithScreenCaptureKit(windowId: UInt32) -> (CGImage?, String?) {
+  var capturedImage: CGImage?
+  var captureError: String?
+  let semaphore = DispatchSemaphore(value: 0)
+  Task {
+    do {
+      let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+      guard let window = content.windows.first(where: { $0.windowID == windowId }) else {
+        captureError = "window \(windowId) not found in shareable content"
+        semaphore.signal()
+        return
+      }
+      let filter = SCContentFilter(desktopIndependentWindow: window)
+      let configuration = SCStreamConfiguration()
+      let pixelScale = CGFloat(filter.pointPixelScale)
+      configuration.width = max(1, Int((filter.contentRect.width * pixelScale).rounded()))
+      configuration.height = max(1, Int((filter.contentRect.height * pixelScale).rounded()))
+      configuration.showsCursor = false
+      configuration.ignoreShadowsSingleWindow = true
+      configuration.scalesToFit = false
+      capturedImage = try await SCScreenshotManager.captureImage(
+        contentFilter: filter,
+        configuration: configuration
+      )
+    } catch {
+      captureError = "capture: \(error.localizedDescription)"
+    }
+    semaphore.signal()
+  }
+
+  if semaphore.wait(timeout: .now() + 15) == .timedOut {
+    return (nil, "capture timed out")
+  }
+  return (capturedImage, captureError)
+}
+
+// CGWindowListCreateImage was obsoleted in the macOS 15 SDK, but it remains
+// the supported capture path on macOS 12-13. Resolve it dynamically so the
+// helper keeps its macOS 12 deployment target without linking an obsolete API
+// into the modern code path.
+func captureWindowLegacy(windowId: UInt32) -> CGImage? {
+  guard let handle = dlopen(
+    "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+    RTLD_LAZY
+  ) else { return nil }
+  defer { dlclose(handle) }
+  guard let symbol = dlsym(handle, "CGWindowListCreateImage") else { return nil }
+
+  typealias LegacyCaptureFunction = @convention(c) (
+    CGRect,
+    UInt32,
+    UInt32,
+    UInt32
+  ) -> Unmanaged<CGImage>?
+  let capture = unsafeBitCast(symbol, to: LegacyCaptureFunction.self)
+  let listOptions = CGWindowListOption.optionIncludingWindow.rawValue
+  let imageOptions = CGWindowImageOption.boundsIgnoreFraming.rawValue
+    | CGWindowImageOption.bestResolution.rawValue
+  return capture(.null, listOptions, windowId, imageOptions)?.takeRetainedValue()
+}
+
+func captureWindow(windowId: UInt32, toPath path: String) -> [String: Any] {
+  _ = NSApplication.shared
+  if !CGPreflightScreenCaptureAccess() {
+    _ = CGRequestScreenCaptureAccess()
+    return ["error": "__SCREENSHOT_PERMISSION_DENIED__"]
+  }
+
+  let image: CGImage?
+  if #available(macOS 14.0, *) {
+    let result = captureWindowWithScreenCaptureKit(windowId: windowId)
+    if let error = result.1 { return ["error": error] }
+    image = result.0
+  } else {
+    image = captureWindowLegacy(windowId: windowId)
+  }
+  guard let image else { return ["error": "capture returned no image"] }
+
+  let url = URL(fileURLWithPath: path) as CFURL
+  guard let destination = CGImageDestinationCreateWithURL(url, "public.png" as CFString, 1, nil) else {
+    return ["error": "failed to create PNG destination"]
+  }
+  CGImageDestinationAddImage(destination, image, nil)
+  guard CGImageDestinationFinalize(destination) else {
+    return ["error": "failed to finalize PNG"]
+  }
+  return ["result": "captured window \(windowId) (\(image.width)x\(image.height)) -> \(path)"]
+}
 
 // ========== Accessibility preflight (issue #29) ==========
 // Posting synthetic CGEvents requires Accessibility, and macOS 26 (Tahoe) tightened the
@@ -264,10 +425,39 @@ func respond(_ obj: [String: Any]) {
   fflush(stdout)
 }
 
+let args = CommandLine.arguments
+
+// ========== CLI Mode: Screen Recording preflight ==========
+// Runs under the exact responsibility-disclaimed identity used by capture.
+if args.count >= 2 && args[1] == "--screen-preflight" {
+  if let error = reexecDisclaimedIfNeeded() {
+    respond(["error": error])
+    exit(1)
+  }
+  respond(screenCapturePreflight())
+  exit(0)
+}
+
+// ========== CLI Mode: --screenshot <windowId> <outPath> ==========
+if args.count >= 2 && args[1] == "--screenshot" {
+  guard args.count >= 4, let windowId = UInt32(args[2]) else {
+    respond(["error": "usage: safari-helper --screenshot <windowId> <outPath>"])
+    exit(2)
+  }
+  if let error = reexecDisclaimedIfNeeded() {
+    respond(["error": error])
+    exit(1)
+  }
+  let result = captureWindow(windowId: windowId, toPath: args[3])
+  respond(result)
+  if let error = result["error"] as? String {
+    exit(error == "__SCREENSHOT_PERMISSION_DENIED__" ? 3 : 1)
+  }
+  exit(0)
+}
+
 // ========== CLI Mode: --click X Y [--window WID] [--double] ==========
 // For direct invocation: safari-helper --click 500 300 --window 4127
-
-let args = CommandLine.arguments
 if args.count >= 4 && args[1] == "--click" {
   guard let x = Double(args[2]), let y = Double(args[3]) else {
     respond(["error": "Invalid coordinates: \(args[2]) \(args[3])"])
