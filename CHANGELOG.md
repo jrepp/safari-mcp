@@ -7,10 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.15.3] - 2026-07-07
-
 ### Changed
-- Refreshed local development tooling and registry metadata for the 97-tool package surface.
+- Retained the fork's consolidated 97-tool surface, embedded script diagnostics, authenticated extension bridge, and richer DOM/layout instrumentation while forward-merging upstream fixes through 2.15.12.
+
+### Fixed
+- Safari screenshots, element captures, and PDF saves now run through the signed helper's responsibility-disclaimed ScreenCaptureKit identity, with truthful permission diagnostics, correct tab targeting, and PNG/JPEG response metadata.
+- Responsive viewport emulation verifies the effective inner viewport, restores prior window/tab/page state, and isolates emulation ownership across shared-daemon sessions.
+
+## [2.15.12] - 2026-08-05
+
+### Fixed
+- **The WebKit memory guard could never fire in multi-instance setups (#83).** The monitor bailed out for every instance that was not the extension host (the one process that won the port-9224 bind race) — but the host can only sweep tabs *it* opened, so tabs held by the other instances were unreachable by any sweeper and the guard was inert exactly where it was needed. The `_isExtensionHost` gate was redundant with the existing cross-instance `memory-monitor.lock` (atomic `wx` create + stale reclaim), which already guarantees a single sweeper per cycle; the gate is gone, and every instance can now sweep its own tabs, still one at a time.
+- **Concurrent instances silently dropped each other's tab-ownership entries (#82).** `_saveOwnershipFile` wrote a snapshot of only the writing process's in-memory Set over the shared `~/.safari-mcp/owned-tabs.json`, so with two live instances the second writer erased every entry the first added after the second hydrated — spurious "no tabs opened yet" refusals and lost restart recovery (fail-safe, but wrong). Saves now merge with the on-disk state (newest timestamp wins) and propagate deletions explicitly so removals aren't resurrected by the merge. The residual read-vs-rename race window shrinks from process-lifetime to sub-millisecond, and losing it still only ever *loses* ownership, never grants it.
+- **The profile-window poll never backed off (#81).** With `SAFARI_PROFILE` set and that profile's window closed, the background verification loop retried every 3 seconds forever — and because a genuinely absent window returns the same answer as a flaky detection, the "retry once with a plain `osascript` subprocess" fallback fired on every cycle: ~1,200 process spawns and log lines per hour, per instance, with no cap on `/tmp/safari-mcp-profile.log`. The poll now backs off exponentially per consecutive miss (3s → 6s → … → 60s cap, reset on the first successful detection), the subprocess fallback disarms after 3 consecutive misses (re-armed by any success, so it still covers the flaky-helper case it was built for), and the "window not found" warning logs on the transition into the missing state and then at most once per 5 minutes.
+- **`restore-trace.log` no longer lives inside the installed package (#81).** It was written to `__dirname` — wiped on reinstall, read-only in container setups, and mutable state inside `node_modules` either way. It now lives with the rest of the state in `~/.safari-mcp/`.
+
+## [2.15.11] - 2026-07-29
+
+### Fixed
+- **All HTTP-daemon clients shared one extension session (#76).** Every client of a shared daemon sent the extension the same process-wide `SESSION_ID`, so the extension keyed all of them as ONE session and could serve one client another client's cached tab. The extension id is now a composite of the process id and the per-connection MCP session id, so per-session isolation holds across the extension bridge too. (Entry backfilled — the release shipped without one.)
+
+## [2.15.10] - 2026-07-28
+
+### Security
+- **`npm audit`: 0 vulnerabilities** (was 1 high + 2 moderate). Bumped `@modelcontextprotocol/sdk` to 1.30.0 and pinned `@hono/node-server` to `^2.0.5` via an npm override — the SDK accepts `^1.19.9 || ^2.0.5`, but npm's resolver never crosses the major on its own, so the serve-static path-traversal advisory (GHSA, Windows-only; not reachable in safari-mcp, which is macOS-only and never serves static files) kept resolving to 1.x. Also cleared a high-severity `brace-expansion` unbounded-expansion DoS advisory via in-range `npm audit fix`.
+
+## [2.15.9] - 2026-07-28
+
+### Fixed
+- **`safari_save_pdf` was broken end to end in daemon mode — four stacked failures, each unmasked by fixing the previous one.** The tool now works and is verified against a live page; the first three fixes also harden the screenshot fallback paths, which shared them:
+  - **PATH:** launchd agents and MCP hosts commonly run with a trimmed PATH (e.g. `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`), and `do shell script` inherits it — so every capture path that spawned a bare `screencapture` died with `sh: screencapture: command not found` (127). All `screencapture` invocations plus the `ioreg` idle-time probe — the only two spawned binaries living in `/usr/sbin` — now use absolute paths.
+  - **Screen Recording TCC:** with PATH fixed, capture failed with `could not create image from window`. Spawning `screencapture` from the node daemon (directly or via an `osascript` subprocess) attributes the TCC check to node, which has no Screen Recording grant under launchd — only the signed `safari-helper` does (`safari_doctor` was already green because its preflight runs in the helper). Every capture now routes through `osascriptFast` (NSAppleScript inside the helper), so the shell inherits the helper's grant; the element-screenshot crop path got the same helper fallback behind its direct `execFile` attempt.
+  - **PNG→PDF conversion:** the converter ran `python3 -c 'from Quartz import …'`, but current macOS ships pyobjc for neither the system nor the homebrew python3 — `ModuleNotFoundError: Quartz`. Replaced ~30 lines of embedded Python with a single macOS-native call: `/usr/bin/sips -s format pdf`.
+  - **Wrong tab captured:** `screencapture -l` grabs the window's *selected* tab, and `savePDF` never selected the session's target tab — so the PDF showed whatever tab the user last left in front, rendered at the target page's width. The measure/resize/capture sequence is now wrapped in `_withTargetTabFronted`, which selects our tab within the window (no app-level focus steal) and restores the user's selection afterwards.
+
+## [2.15.8] - 2026-07-26
+
+### Fixed
+- **`safari_close_tab` could close one of the user's tabs.** With no tab index of its own, the close path fell back to `close current tab of window` — the tab the user is actually looking at. "No index of its own" is exactly what a session re-initialised after a transport drop reports while its own tab is still open, so the fallback fired at the worst moment; it closed a user's tab during a real run (#68). This is the destructive sibling of #64, and the fail-open sat in all three layers with one shape — *no ownership recorded* read as permission rather than as refusal: `close_tab` was listed among the ownership-exempt "tab management" operations next to `new_tab`/`list_tabs`/`switch_tab` (the only one of the four that destroys a user tab, and the only one with no compensating check), the AppleScript engine fell back to the front document, and the extension engine's "no tabs owned yet → allow" backward-compatibility branch let the close through. The read paths keep that leniency on purpose — a wrong read costs information, so "read the page I'm looking at" still works for a session that never opened a tab — but the destructive path now closes a tab it can prove it owns or throws. Blanking a window's last tab is pinned to the same proven index, internal cleanup names its tab explicitly, and the extension checks the tab it actually removes rather than the one the guard happened to resolve (#68).
+
+## [2.15.7] - 2026-07-24
+
+### Fixed
+- Stdio servers now clean up and exit when their client closes stdin without sending a termination signal, preventing stale Safari MCP process trees from accumulating after sessions end. Thanks to @jgimeno for the fix (#67).
+
+## [2.15.6] - 2026-07-23
+
+### Fixed
+- **A session that lost its transport could run caller JavaScript on the user's current tab.** Every fail-closed branch in the tab layer keys on `hasOwnedTab`, which lives in per-MCP-session state. In HTTP-daemon mode a dropped transport makes the client re-initialise, which mints a new session id, and `_st()` hands it a fresh empty state — `hasOwnedTab` false, `activeTabMarker` null. So the guards all read "this session owns nothing" at precisely the moment an agent is mid-task and already owns a tab, and the next op falls through to the front document: whatever the user is looking at. Reproduced live — a `safari_evaluate` issued right after a transport drop returned a user tab's DOM, which is the report in #64. The session state dies; the marker stamped on the tab does not, so the guard now uses it: with no marker of its own, a run refuses any front document whose `window.name` carries an `MCP_` marker (a tab some MCP session opened and this one does not own) and fails closed with no retry. An unmarked front document stays reachable, so "read the page I'm looking at" still works for a session that genuinely never opened a tab (#64).
+
+## [2.15.5] - 2026-07-22
+
+### Fixed
+- **Two paths could run caller-supplied JavaScript on a tab this session does not own.** The atomic identity guard — the only check that does not depend on how the tab index was resolved — was built at a single call site instead of where the script is assembled, so two targeted paths went without it: `runJS`'s ghost-recovery retry dropped the prefix (the retry runs precisely when the index has already proven wrong, making the least trustworthy path the only unchecked one), and `runJSLarge` never carried it at all — that is `safari_upload_file` and `safari_paste_image`, the largest payloads in the toolset. The guard now lives in `_tabIdentityGuard()` and every tab-targeted path uses it; `runJSLarge` fails closed instead of retrying, since re-running a file payload on a freshly guessed tab is the exact guess the guard exists to prevent (#64).
+
+## [2.15.4] - 2026-07-21
+
+### Fixed
+- **A tracked tab index past the end of the window no longer retargets the session at a user tab.** When the tracked index exceeded the window's tab count (the user closed a tab, or tore one into its own window), `resolveActiveTab()` clamped the index to the *last* tab in the window — which is whatever the user happens to have open there — and logged it as a "proactive fix". Every subsequent navigate/click/fill then landed on that tab, destroying page state (#54). The clamp predates the identity marker (`window.name` / `__mcpTabMarker`, v2.8.3) and was never rewired when its neighbouring branches were; it now fails closed like they do — the session drops ownership and returns `null` instead of guessing (#59).
+
+## [2.15.3] - 2026-07-15
+
+### Fixed
+- Clicks and synthetic events are now dispatched with the owning tab fronted (`_withTargetTabFronted`), so they land on our tab and element instead of whatever tab was frontmost.
+- `typeText` fires per-character key events on ARIA comboboxes, so async typeahead lists actually load.
+- The focus-helper FIFO stays aligned when a request times out — a stale callback no longer swallows a later daemon reply and cascade-times-out `doctor`/`newTab`. Thanks to @jrepp (#53).
 
 ## [2.15.2] - 2026-07-05
 

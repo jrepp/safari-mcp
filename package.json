@@ -1,6 +1,6 @@
 {
   "name": "safari-mcp",
-  "version": "2.15.3",
+  "version": "2.15.12",
   "mcpName": "io.github.achiya-automation/safari-mcp",
   "description": "Safari browser automation for AI agents — native macOS, zero Chrome overhead. 97 tools via AppleScript + JavaScript.",
   "type": "module",
@@ -67,6 +67,7 @@
     "transport.js",
     "response.js",
     "safari.js",
+    "session-context.js",
     "ownership-match.js",
     "ownership-state.js",
     "mcp-helpers.js",
@@ -82,20 +83,20 @@
     "scripts/postinstall.cjs"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "ws": "^8.19.0"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ws": "^8.21.3"
   },
   "overrides": {
     "hono": "^4.12.21",
-    "@hono/node-server": "^1.19.13"
+    "@hono/node-server": "^2.0.5"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^26.1.0",
-    "eslint": "^10.6.0",
-    "globals": "^17.6.0",
+    "@types/node": "^26.1.2",
+    "eslint": "^10.8.0",
+    "globals": "^17.9.0",
     "jsdom": "^29.1.1",
-    "prettier": "^3.9.4",
-    "typescript": "^6.0.3"
+    "prettier": "^3.9.6",
+    "typescript": "^7.0.2"
   }
 }

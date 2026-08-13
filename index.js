@@ -8,6 +8,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { startTransport } from "./transport.js";
+import { currentSessionId } from "./session-context.js";
 import { z } from "zod";
 import * as safari from "./safari.js";
 import { textResult, jsonResult, imageResult, errorResult, diagnosticErrorResult } from "./response.js";
@@ -82,10 +83,9 @@ async function _cleanupTabs() {
       const tabs = await safari.listTabs();
       const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
       const match = parsed.find(t => t.url === url);
-      if (match) {
-        safari.setActiveTabIndex(match.index);
-        await safari.closeTab();
-      }
+      // Name the tab explicitly: it was just resolved out of our own opened-tab table, and
+      // closeTab refuses anything it cannot prove it owns (#68).
+      if (match) await safari.closeTab(match.index);
     } catch {}
   }
   _openedTabs.clear();
@@ -154,10 +154,7 @@ async function _closeOldestMCPTab() {
         const tabs = await safari.listTabs();
         const parsed = typeof tabs === 'string' ? JSON.parse(tabs) : tabs;
         const match = parsed.find(t => t.url === info.url);
-        if (match) {
-          safari.setActiveTabIndex(match.index);
-          await safari.closeTab();
-        }
+        if (match) await safari.closeTab(match.index);
       }
     } catch {}
     _untrackTab(oldestIdx);
@@ -168,11 +165,12 @@ function _startMemoryMonitor() {
   const checkInterval = Math.min(MEMORY_CHECK_INTERVAL_MS, 30000); // Max 30s between checks
   _memoryCheckTimer = setInterval(async () => {
     try {
-      // Only the extension host (the single instance owning the Safari
-      // connection) may sweep tabs. Every instance runs this monitor and reads
-      // the SAME global WebKit memory; if all N swept, they'd close tabs in
-      // lockstep and flicker Safari windows shut. The host is the one actor.
-      if (!_isExtensionHost) return;
+      // Every instance may sweep — but only its OWN _openedTabs, and only one
+      // per cycle: _tryAcquireMemoryLock() below already serializes sweepers
+      // machine-wide. The old `_isExtensionHost` gate here was redundant with
+      // that lock and made the guard inert in multi-instance setups — only the
+      // port-9224 winner could ever sweep, and it can't reach tabs the other
+      // instances opened (#83).
       const webkitMB = _getWebKitMemoryMB();
       if (webkitMB <= 0) return;
 
@@ -211,19 +209,21 @@ function _startMemoryMonitor() {
 
 // Cleanup on exit
 let _cleaningUp = false;
+async function _shutdown() {
+  if (_cleaningUp) return;
+  _cleaningUp = true;
+  // Restore the user's clipboard synchronously FIRST — if a native paste is mid-flight, its
+  // 2s restore timer would never fire once we exit, leaving the tool's text on the clipboard.
+  try { safari.flushClipboardRestore(); } catch {}
+  // Cap tab cleanup — if the daemon/Safari is wedged at shutdown (exactly when a SIGTERM
+  // tends to arrive), listTabs/closeTab can each block for their full timeout; never let
+  // that hang the exit past 3s.
+  await Promise.race([_cleanupTabs(), new Promise(r => setTimeout(r, 3000))]);
+  process.exit(0);
+}
+
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, async () => {
-    if (_cleaningUp) return; // Prevent double-exit on rapid signal repeat
-    _cleaningUp = true;
-    // Restore the user's clipboard synchronously FIRST — if a native paste is mid-flight, its
-    // 2s restore timer would never fire once we exit, leaving the tool's text on the clipboard.
-    try { safari.flushClipboardRestore(); } catch {}
-    // Cap tab cleanup — if the daemon/Safari is wedged at shutdown (exactly when a SIGTERM
-    // tends to arrive), listTabs/closeTab can each block for their full timeout; never let
-    // that hang the exit past 3s.
-    await Promise.race([_cleanupTabs(), new Promise(r => setTimeout(r, 3000))]);
-    process.exit(0);
-  });
+  process.on(sig, _shutdown);
 }
 process.on("exit", () => {
   if (_openedTabs.size > 0) {
@@ -658,8 +658,12 @@ const _nullMeansFailure = new Set([
 
 // Operations that don't need tab ownership (read-only or tab management)
 const _noOwnershipCheck = new Set([
-  // Tab management
-  "new_tab", "list_tabs", "close_tab", "switch_tab",
+  // Tab management. NOTE: "close_tab" is deliberately NOT here. It sat in this set as
+  // "tab management" next to new_tab/list_tabs/switch_tab, but it is the only member that
+  // destroys a user tab: new_tab creates one, list_tabs reads, and switch_tab carries its
+  // own ownership check at the tool. close_tab had none — exempt from the shared guard and
+  // unguarded underneath, which is how it closed a user's tab in #68.
+  "new_tab", "list_tabs", "switch_tab",
   // Extension self-management (doesn't touch tabs)
   "reload_extension",
   // Read-only — don't modify the page
@@ -737,7 +741,11 @@ async function extensionOrFallback(extensionType, extensionPayload, fallbackFn) 
       try {
         const t0 = Date.now();
         const tabUrl = safari.getActiveTabURL();
-        const payload = { ...extensionPayload, sessionId: SESSION_ID, ...(tabUrl ? { tabUrl } : {}) };
+        // Composite id: SESSION_ID alone is process-wide, so in HTTP-daemon mode every
+        // MCP client looked like ONE extension session and could target another client's
+        // cached tab (#76). currentSessionId() alone would collapse all stdio processes
+        // into "_default" — so both parts are needed.
+        const payload = { ...extensionPayload, sessionId: `${SESSION_ID}:${currentSessionId()}`, ...(tabUrl ? { tabUrl } : {}) };
         const timeout = _commandTimeouts[extensionType] || 30000;
         result = await sendToExtension(extensionType, payload, timeout);
         const isCspError = typeof result === 'string' && (result.includes('unsafe-eval') || result.includes('trusted-types') || result.includes('Trusted Type') || result.includes('Content Security Policy'));
@@ -1407,8 +1415,7 @@ server.tool(
       if (oldestIdx !== null) {
         console.error(`[Safari MCP] Tab limit (${MAX_TABS}) reached — closing oldest tab #${oldestIdx}`);
         try {
-          safari.setActiveTabIndex(oldestIdx);
-          await safari.closeTab();
+          await safari.closeTab(oldestIdx);
         } catch {}
         _untrackTab(oldestIdx);
       }
@@ -2451,4 +2458,12 @@ _startMemoryMonitor();
 
 // Transport is chosen at runtime: default stdio (unchanged), or a shared HTTP instance when
 // SAFARI_MCP_HTTP=1 (many Claude sessions → one process). buildServer is the per-session factory.
-await startTransport(buildServer, process.env);
+const transportHandle = await startTransport(buildServer, process.env);
+
+if (transportHandle.kind === "stdio") {
+  // A client can disappear without delivering a signal. Treat its pipe closing as the stdio
+  // server's lifecycle boundary, while leaving the opt-in HTTP daemon independent of stdin.
+  process.stdin.once("end", _shutdown);
+  process.stdin.once("close", _shutdown);
+  if (process.stdin.readableEnded || process.stdin.destroyed) void _shutdown();
+}

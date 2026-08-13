@@ -48,7 +48,7 @@ Native WebKit. ~60% less CPU. Background operation. 97 tools. One `npx` command.
 
 > 📰 **Featured on freeCodeCamp:** [How to Connect Your AI Coding Agent to a Browser on macOS](https://www.freecodecamp.org/news/how-to-connect-your-ai-coding-agent-to-a-browser-on-macos/) · [HackerNoon: Reverse-Engineering React, Shadow DOM, and CSP](https://hackernoon.com/i-had-to-reverse-engineer-react-shadow-dom-and-csp-to-automate-safari-without-chrome)
 
-> 🍎 **Apple shipped an official Safari MCP** (Safari Technology Preview 247, July 2026). It's built on `safaridriver` for isolated debugging sessions. safari-mcp drives the **real Safari you're already logged into** — on stable Safari, with 97 tools. See the full comparison below.
+> 🍎 **Apple shipped an official Safari MCP** (July 2026 — Safari Technology Preview 247+ and the Safari 27 beta). It's built on `safaridriver` for isolated debugging sessions. safari-mcp drives the **real Safari you're already logged into** — on the stable Safari that ships with macOS today, with 97 tools. See the full comparison below.
 
 ---
 
@@ -304,6 +304,40 @@ The recommended pattern for AI agents using Safari MCP:
 
 ---
 
+## Running several agents at once
+
+Multiple agents or subagents driving one Safari at the same time will fight over the active tab — unless you run them against a **shared HTTP daemon** instead of one process per client:
+
+```bash
+SAFARI_MCP_HTTP=1 SAFARI_MCP_HTTP_PORT=9225 npx safari-mcp
+```
+
+Then point every client at it:
+
+```json
+{ "mcpServers": { "safari-mcp": { "type": "http", "url": "http://127.0.0.1:9225/mcp" } } }
+```
+
+One daemon, many sessions — and each session gets its **own tab state**. The server keys `activeTabIndex`, the ownership flag and a unique tab marker off the MCP session id, so session A physically cannot read or steer session B's tab.
+
+Two properties make this safe rather than merely tidy:
+
+- **Tab identity is a marker, not an index.** Each session stamps a unique id into the page it opens, so ownership survives navigation *and* survives the user reordering or closing other tabs. An index alone would silently drift onto the wrong tab.
+- **It fails closed.** If a session's marked tab can't be re-found, every tool refuses instead of falling back to whatever tab is in front — because that tab is usually yours:
+
+  ```
+  Tab tracking lost — refusing to fall back to "current tab of window"
+  (would target the user's active tab). Call safari_new_tab to reopen.
+  ```
+
+This also drops process count sharply: ~17 node processes for 17 concurrent sessions becomes 1.
+
+`SAFARI_PROFILE` stays optional — leave it unset and sessions bind to your ordinary Safari windows, cookies and logins intact. Details in [docs/http-transport-design.md](docs/http-transport-design.md).
+
+Prefer stdio (one process per agent) over a persistent daemon? That works too — isolation then comes from the process boundary itself. One caveat: if your client multiplexes agents through [mcporter](https://github.com/openclaw/mcporter), mcporter caches a single MCP client for all of them — whichever transport you pick — so the server never sees distinct sessions and per-session isolation can't engage. [mcporter-lanes](https://pi.dev/packages/mcporter-lanes) (a pi extension by [@maxim](https://github.com/maxim), born out of [#76](https://github.com/achiya-automation/safari-mcp/issues/76)) fixes this upstream: each agent session gets its own daemon dir — and therefore its own safari-mcp — with an idle timeout so processes don't pile up.
+
+---
+
 ## Tools (97)
 
 <details>
@@ -544,21 +578,23 @@ Safari MCP runs locally on your Mac with minimal attack surface:
 
 ### vs Apple's Official Safari MCP (safaridriver)
 
-In Safari Technology Preview 247 (July 2026), Apple shipped an **official** Safari MCP server built on `safaridriver`. That's great validation for the category — and it's built for a different job. Apple's server drives an **isolated WebDriver automation session** for debugging; safari-mcp drives the **real Safari you're already logged into**.
+In July 2026 Apple shipped an **official** Safari MCP server built on `safaridriver` — first in Safari Technology Preview 247, and now also in the Safari 27 beta. That's great validation for the category — and it's built for a different job. Apple's server drives an **isolated WebDriver automation session** for debugging; safari-mcp drives the **real Safari you're already logged into**.
+
+It has not reached a stable Safari release yet: on macOS 26.5.2 with Safari 26.5.2, `safaridriver --help` lists `--port`, `--bidi`, `--enable` and `--diagnose`, and no `--mcp` (verified 2026-07-23). Check your own machine with `safaridriver --help | grep mcp` before assuming either way.
 
 | | 🦁 safari-mcp *(this repo)* | Apple `safaridriver --mcp` |
 |---|:---:|:---:|
 | **Your real logins / cookies** | ✅ Your actual Safari | ⚠️ Isolated automation session — no access to AutoFill or browsing activity |
-| **Runs on** | ✅ Stable Safari, every Mac | ❌ Safari Technology Preview 247 only |
+| **Runs on** | ✅ Stable Safari, every Mac | ⚠️ Safari Technology Preview 247+ or the Safari 27 beta — not in stable Safari 26.5 |
 | **Background (no focus steal)** | ✅ Yes | ❌ Dedicated window with a "controlled by automation" banner |
 | **Tools** | **97** | ~17 |
 | **Storage** (cookies, localStorage, IndexedDB) | ✅ 10 tools | ❌ |
 | **Network mocking + throttling** | ✅ Yes | ❌ Read-only network inspection |
 | **Device emulation** (iPhone, iPad) | ✅ Yes | ⚠️ Viewport + media type only |
-| **Setup** | `npx safari-mcp` | Enable "remote automation and external agents" in STP |
+| **Setup** | `npx safari-mcp` | Enable "remote automation and external agents", then point your client at that build's `safaridriver --mcp` |
 | **Official Apple support** | ❌ Community (MIT) | ✅ Apple, WebDriver-standard |
 
-> **When Apple's server is the right pick:** you specifically want a clean-room, WebDriver-standard session for compatibility debugging and you already run STP. **For everything else — daily automation on the browser you're already signed into, on stable Safari — safari-mcp is built for exactly that.**
+> **When Apple's server is the right pick:** you specifically want a clean-room, WebDriver-standard session for compatibility debugging and you already run a preview or beta build. **For everything else — daily automation on the browser you're already signed into, on the Safari that shipped with your Mac — safari-mcp is built for exactly that.**
 
 ### Why Safari MCP and Not the Other Safari MCP Projects?
 
@@ -848,3 +884,7 @@ If Safari MCP saves you from Chrome overhead, **a star helps others discover it:
 ## License
 
 MIT — use it however you want.
+
+---
+
+Built by **[Achiya Automation](https://achiya-automation.com)** — automation & AI agents for business.

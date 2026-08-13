@@ -1,8 +1,18 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { assessEmulationObservation, screenCaptureCliError } from "../safari.js";
+
+const safariSource = readFileSync(new URL("../safari.js", import.meta.url), "utf8");
+
+function exportedFunctionBody(name) {
+  const start = safariSource.indexOf(`export async function ${name}(`);
+  assert.ok(start >= 0, `${name} should exist in safari.js`);
+  const end = safariSource.indexOf("\nexport async function ", start + 1);
+  return safariSource.slice(start, end === -1 ? undefined : end);
+}
 
 test("emulation rejects an outer-window-only resize", () => {
   const assessment = assessEmulationObservation(
@@ -63,4 +73,23 @@ test("screen capture preserves actionable non-permission helper failures", () =>
 
   assert.match(error.message, /window 42 not found/);
   assert.doesNotMatch(error.message, /permission denied/i);
+});
+
+test("all image-based capture tools use the signed capture helper", () => {
+  for (const name of ["screenshot", "screenshotElement", "savePDF"]) {
+    const body = exportedFunctionBody(name);
+    assert.match(body, /_helperCaptureWindow\(/, `${name} must capture through safari-helper`);
+    assert.doesNotMatch(
+      body,
+      /\/usr\/sbin\/screencapture|do shell script[^\n]*screencapture/,
+      `${name} must not bypass safari-helper's Screen Recording identity`,
+    );
+  }
+});
+
+test("element and PDF captures restore transient Safari state", () => {
+  assert.match(exportedFunctionBody("screenshotElement"), /_withTargetTabFronted\(/);
+  const pdfBody = exportedFunctionBody("savePDF");
+  assert.match(pdfBody, /_withTargetTabFronted\(/);
+  assert.match(pdfBody, /finally[\s\S]*set bounds/);
 });
