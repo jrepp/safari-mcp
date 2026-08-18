@@ -6,7 +6,8 @@
   "type": "module",
   "main": "index.js",
   "bin": {
-    "safari-mcp": "index.js"
+    "safari-mcp": "index.js",
+    "safari-browser": "safari-browser.js"
   },
   "scripts": {
     "start": "node index.js",
@@ -63,6 +64,10 @@
   ],
   "files": [
     "index.js",
+    "safari-browser.js",
+    "cli-contract.js",
+    "docs/cli-automation.md",
+    "examples/cli-startup-trajectory.json",
     "trace.js",
     "transport.js",
     "response.js",

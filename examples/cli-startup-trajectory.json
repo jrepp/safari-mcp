@@ -1,0 +1,6 @@
+[
+  ["open", "http://127.0.0.1:4173/?selftest=1"],
+  ["wait", "#selftest-result[data-pass=\"true\"]", "--timeout", "60000"],
+  ["eval", "await window.__lcs.captureStartupProfile()"],
+  ["metrics"]
+]

@@ -85,6 +85,27 @@ That's it — no global install needed. Or install permanently:
 npm install -g safari-mcp
 ```
 
+### Automate from the CLI without MCP configuration
+
+The package also installs `safari-browser`, a persistent, agent-oriented CLI. It uses the same Safari MCP tools and tab-safety contract internally, but needs no editor or MCP client configuration:
+
+```bash
+safari-browser open http://127.0.0.1:4173
+safari-browser snapshot
+safari-browser click @0_5
+safari-browser metrics --json
+safari-browser screenshot artifacts/safari.jpg --full
+safari-browser close --all
+```
+
+Named sessions support parallel agent work, while `run` executes a deterministic JSON command trajectory through one retained Safari tab:
+
+```bash
+safari-browser --session startup --json run paths/startup.json --bail
+```
+
+See [configuration-free CLI automation](docs/cli-automation.md) for the command surface, session lifecycle, trajectory format, and profiling boundary.
+
 ### Configure your MCP client
 
 All clients run Safari MCP the same way — `npx safari-mcp`. Pick your editor:
