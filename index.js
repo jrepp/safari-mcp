@@ -2327,7 +2327,18 @@ server.tool(
   {},
   async () => {
     const result = await safari.doctor();
-    return textResult(result);
+    const route = _preferAppleScript
+      ? "AppleScript forced by SAFARI_PROFILE"
+      : _extensionConnected
+        ? _isExtensionHost
+          ? "Safari extension (local host)"
+          : "Safari extension (proxied through the primary instance)"
+        : "AppleScript fallback (Safari extension unavailable)";
+    const routeAdvice =
+      !_preferAppleScript && !_extensionConnected
+        ? "\n   → Extension acceleration is inactive. AppleScript tools remain available; enable the Safari MCP extension or restart the process currently owning ports 9223/9224 if extension-backed latency is required."
+        : "";
+    return textResult(`${result}\n\nExecution route: ${route}${routeAdvice}`);
   }
 );
 

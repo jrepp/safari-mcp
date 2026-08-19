@@ -35,6 +35,8 @@ safari-browser --session reaction open 'http://127.0.0.1:4173/?scenario=backlit'
 
 `safari-browser close --all` stops only the named session and closes the tabs it opened. Session sockets, process identifiers, and logs use lowercase filenames beneath `~/.safari-mcp/cli/`.
 
+`close --all` is an out-of-band control request: it can stop a session even while a browser command is blocked. Starting the same session concurrently is safe because the daemon claims its socket before it starts an MCP child; a losing starter does not leave an orphan process.
+
 ## Repeatable profiling paths
 
 `run` executes a JSON trajectory through one persistent browser session. Each step is either an argv array or an object with `command` and `args`:
@@ -88,7 +90,9 @@ This is a command-shape compatibility layer, not an engine emulation layer. Safa
 
 Human-readable mode prints the command text directly. JSON mode omits that duplicate text representation so trajectory output can be stored without recording each structured payload twice.
 
-Tool failures exit nonzero. Screenshot data is decoded inside the daemon and written to the requested local path instead of printing base64. `doctor` preserves the existing actionable macOS permission report:
+Tool failures exit nonzero. Each MCP tool request and local socket request has a hard deadline. A tool/transport timeout is fatal to that retained session: the wrapper closes its MCP child, removes the socket and PID, and the next invocation starts clean instead of inheriting a wedged command queue. The defaults can be narrowed for a harness with `SAFARI_BROWSER_TOOL_TIMEOUT_MS`, `SAFARI_BROWSER_SOCKET_TIMEOUT_MS`, and `SAFARI_BROWSER_SHUTDOWN_TIMEOUT_MS`.
+
+Screenshot data is decoded inside the daemon and written relative to the working directory of the current invocation, even when the named daemon was started elsewhere. `doctor` preserves the existing actionable macOS permission report and also states whether commands currently use the local extension, the proxied extension, forced profile-mode AppleScript, or AppleScript fallback:
 
 ```bash
 safari-browser doctor

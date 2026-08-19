@@ -15,6 +15,7 @@ import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT } f
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 import { addTraceEvent } from "./trace.js";
 import { currentSessionId } from "./session-context.js";
+import { shouldWaitForNewTabNavigation } from "./tab-navigation.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
@@ -3584,7 +3585,8 @@ export async function newTab(url = "") {
   // Wait for page load if URL given. Poll readyState from the Node side — Safari's
   // `do JavaScript` does NOT await async IIFEs, so an in-page wait loop returns
   // immediately without waiting. Stamping before the page settles loses the marker.
-  if (url) {
+  const waitsForNonBlankNavigation = shouldWaitForNewTabNavigation(url);
+  if (waitsForNonBlankNavigation) {
     for (let i = 0; i < 50; i++) {
       await new Promise(r => setTimeout(r, 200));
       try {

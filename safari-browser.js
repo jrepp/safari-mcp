@@ -12,8 +12,30 @@ import { fileURLToPath } from "node:url";
 import { cliHelp, parseCliCommand } from "./cli-contract.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const stateRoot = join(homedir(), ".safari-mcp", "cli");
+const stateRoot = resolve(
+  process.env.SAFARI_BROWSER_STATE_ROOT || join(homedir(), ".safari-mcp", "cli")
+);
 const version = JSON.parse(readFileSync(join(here, "package.json"), "utf8")).version;
+const toolTimeoutMs = positiveEnvironmentMilliseconds("SAFARI_BROWSER_TOOL_TIMEOUT_MS", 120_000);
+const socketTimeoutMs = positiveEnvironmentMilliseconds(
+  "SAFARI_BROWSER_SOCKET_TIMEOUT_MS",
+  toolTimeoutMs + 15_000
+);
+const shutdownTimeoutMs = positiveEnvironmentMilliseconds(
+  "SAFARI_BROWSER_SHUTDOWN_TIMEOUT_MS",
+  3_000
+);
+const mcpEntry = resolve(process.env.SAFARI_BROWSER_MCP_ENTRY || join(here, "index.js"));
+
+function positiveEnvironmentMilliseconds(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer number of milliseconds.`);
+  }
+  return value;
+}
 
 function parseGlobal(argv) {
   const rest = [];
@@ -45,21 +67,37 @@ function sessionPaths(session) {
   };
 }
 
-function requestSocket(socketPath, payload) {
+function requestSocket(socketPath, payload, timeoutMs = socketTimeoutMs) {
   return new Promise((resolveRequest, reject) => {
     const socket = createConnection(socketPath);
     let body = "";
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      fn(value);
+    };
     socket.setEncoding("utf8");
     socket.on("connect", () => socket.write(`${JSON.stringify(payload)}\n`));
     socket.on("data", (chunk) => {
       body += chunk;
     });
-    socket.on("error", reject);
+    socket.setTimeout(timeoutMs, () => {
+      const error = Object.assign(
+        new Error(
+          `Safari CLI session did not answer within ${timeoutMs}ms; its daemon will be stopped.`
+        ),
+        { code: "SAFARI_CLI_SOCKET_TIMEOUT" }
+      );
+      finish(reject, error);
+    });
+    socket.on("error", (error) => finish(reject, error));
     socket.on("end", () => {
       try {
-        resolveRequest(JSON.parse(body));
+        finish(resolveRequest, JSON.parse(body));
       } catch {
-        reject(new Error(`Safari CLI daemon returned invalid JSON: ${body || "(empty)"}`));
+        finish(reject, new Error(`Safari CLI daemon returned invalid JSON: ${body || "(empty)"}`));
       }
     });
   });
@@ -76,12 +114,33 @@ function socketIsLive(socketPath) {
   });
 }
 
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function connectOrStart(options, payload) {
   mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
   const paths = sessionPaths(options.session);
   try {
     return await requestSocket(paths.socket, payload);
-  } catch {}
+  } catch (error) {
+    if (error?.code === "SAFARI_CLI_SOCKET_TIMEOUT") {
+      await requestSocket(
+        paths.socket,
+        { kind: "shutdown", reason: "unresponsive-session" },
+        shutdownTimeoutMs
+      ).catch(() => {});
+      throw error;
+    }
+    if (payload.kind === "shutdown") {
+      return { ok: true, data: { stopped: false }, text: "Safari CLI session was not running." };
+    }
+  }
 
   const logFd = openSync(paths.log, "a", 0o600);
   const child = spawn(
@@ -106,6 +165,14 @@ async function connectOrStart(options, payload) {
     try {
       return await requestSocket(paths.socket, payload);
     } catch (error) {
+      if (error?.code === "SAFARI_CLI_SOCKET_TIMEOUT") {
+        await requestSocket(
+          paths.socket,
+          { kind: "shutdown", reason: "unresponsive-session" },
+          shutdownTimeoutMs
+        ).catch(() => {});
+        throw error;
+      }
       lastError = error;
     }
   }
@@ -127,21 +194,42 @@ function maybeJson(text) {
   }
 }
 
-async function executeTool(client, parsed) {
+function isFatalMcpError(error) {
+  const message = String(error?.message || error || "");
+  return /request timed out|maximum total timeout|transport closed|connection closed|not connected|safari-helper timeout|helper process (?:exited|error)|daemon wedged|blocked past their timeout/i.test(
+    message
+  );
+}
+
+async function executeTool(client, parsed, requestCwd) {
   if (parsed.local === "help") return { text: cliHelp, data: cliHelp };
   if (parsed.local === "shutdown")
     return { text: "Safari CLI session stopped.", data: { stopped: true }, shutdown: true };
 
-  const result = await client.callTool({ name: parsed.tool, arguments: parsed.args }, undefined, {
-    timeout: 120_000,
-  });
+  let result;
+  try {
+    result = await client.callTool({ name: parsed.tool, arguments: parsed.args }, undefined, {
+      timeout: toolTimeoutMs,
+      maxTotalTimeout: toolTimeoutMs,
+    });
+  } catch (error) {
+    if (isFatalMcpError(error)) error.fatalSession = true;
+    throw error;
+  }
   const text = textContent(result);
-  if (result.isError) throw new Error(text || `${parsed.tool} failed.`);
+  if (result.isError) {
+    const error = new Error(text || `${parsed.tool} failed.`);
+    if (isFatalMcpError(error)) error.fatalSession = true;
+    throw error;
+  }
 
   const image = (result.content || []).find((item) => item.type === "image");
   if (image) {
     const extension = image.mimeType === "image/png" ? "png" : "jpg";
-    const outputPath = resolve(parsed.outputPath || `safari-screenshot-${Date.now()}.${extension}`);
+    const outputPath = resolve(
+      requestCwd || process.cwd(),
+      parsed.outputPath || `safari-screenshot-${Date.now()}.${extension}`
+    );
     await mkdir(dirname(outputPath), { recursive: true });
     await writeFile(outputPath, Buffer.from(image.data, "base64"));
     return {
@@ -158,7 +246,7 @@ async function executeRequest(client, request) {
     for (const [index, step] of request.steps.entries()) {
       try {
         const argv = Array.isArray(step) ? step : [step.command, ...(step.args || [])];
-        const result = await executeTool(client, parseCliCommand(argv));
+        const result = await executeTool(client, parseCliCommand(argv), request.cwd);
         results.push({ index, command: argv, ok: true, data: result.data });
         if (result.shutdown)
           return {
@@ -169,6 +257,14 @@ async function executeRequest(client, request) {
           };
       } catch (error) {
         results.push({ index, command: step, ok: false, error: error.message });
+        if (error.fatalSession) {
+          return {
+            ok: false,
+            error: `${error.message} The retained Safari CLI session was stopped; retry starts a clean daemon.`,
+            data: results,
+            shutdown: true,
+          };
+        }
         if (request.bail) return { ok: false, error: error.message, data: results };
       }
     }
@@ -182,10 +278,16 @@ async function executeRequest(client, request) {
   }
 
   try {
-    const result = await executeTool(client, parseCliCommand(request.argv));
+    const result = await executeTool(client, parseCliCommand(request.argv), request.cwd);
     return { ok: true, ...result };
   } catch (error) {
-    return { ok: false, error: error.message };
+    return {
+      ok: false,
+      error: error.fatalSession
+        ? `${error.message} The retained Safari CLI session was stopped; retry starts a clean daemon.`
+        : error.message,
+      ...(error.fatalSession ? { shutdown: true } : {}),
+    };
   }
 }
 
@@ -198,20 +300,17 @@ async function startDaemon(session) {
       unlinkSync(paths.socket);
     } catch {}
   }
-  writeFileSync(paths.pid, String(process.pid), { mode: 0o600 });
-
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [join(here, "index.js")],
-    cwd: here,
-    env: { ...process.env, SAFARI_MCP_QUIET: "1" },
-    stderr: "inherit",
-  });
-  const client = new Client({ name: `safari-browser-${session}`, version });
-  await client.connect(transport, { timeout: 15_000 });
-
   let stopping = false;
+  /** @type {Promise<unknown>} */
   let commandQueue = Promise.resolve();
+  let client;
+  let transport;
+  let resolveReady;
+  let rejectReady;
+  const ready = new Promise((resolveReadyPromise, rejectReadyPromise) => {
+    resolveReady = resolveReadyPromise;
+    rejectReady = rejectReadyPromise;
+  });
   const server = createServer((socket) => {
     let body = "";
     let handled = false;
@@ -223,7 +322,21 @@ async function startDaemon(session) {
       let response;
       try {
         const request = JSON.parse(body.trim());
-        const operation = commandQueue.then(() => executeRequest(client, request));
+        if (request.kind === "shutdown") {
+          socket.end(
+            JSON.stringify({
+              ok: true,
+              data: { stopped: true, reason: request.reason || "requested" },
+              shutdown: true,
+            })
+          );
+          void stopDaemon();
+          return;
+        }
+        const operation = commandQueue.then(async () => {
+          await ready;
+          return executeRequest(client, request);
+        });
         commandQueue = operation.catch(() => {});
         response = await operation;
       } catch (error) {
@@ -231,18 +344,65 @@ async function startDaemon(session) {
       }
       socket.end(JSON.stringify(response));
       if (response.shutdown && !stopping) {
-        stopping = true;
-        server.close();
-        await client.close().catch(() => {});
-        await transport.close().catch(() => {});
-        process.exit(0);
+        void stopDaemon();
       }
     });
   });
   await new Promise((resolveListen, reject) => {
     server.once("error", reject);
-    server.listen(paths.socket, resolveListen);
+    server.listen(paths.socket, () => resolveListen(undefined));
   });
+  writeFileSync(paths.pid, String(process.pid), { mode: 0o600 });
+
+  async function stopDaemon() {
+    if (stopping) return;
+    stopping = true;
+    server.close();
+    const mcpPid = transport?.pid;
+    const closeTask = (async () => {
+      await client?.close().catch(() => {});
+      await transport?.close().catch(() => {});
+    })();
+    await Promise.race([
+      closeTask,
+      new Promise((resolveWait) => setTimeout(resolveWait, shutdownTimeoutMs)),
+    ]);
+    if (mcpPid && processIsAlive(mcpPid)) {
+      try {
+        process.kill(mcpPid, "SIGTERM");
+      } catch {}
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      if (processIsAlive(mcpPid)) {
+        try {
+          process.kill(mcpPid, "SIGKILL");
+        } catch {}
+      }
+    }
+    try {
+      unlinkSync(paths.socket);
+    } catch {}
+    try {
+      unlinkSync(paths.pid);
+    } catch {}
+    process.exit(0);
+  }
+
+  transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [mcpEntry],
+    cwd: here,
+    env: { ...process.env, SAFARI_MCP_QUIET: "1" },
+    stderr: "inherit",
+  });
+  client = new Client({ name: `safari-browser-${session}`, version });
+  try {
+    await client.connect(transport, { timeout: 15_000 });
+    resolveReady();
+  } catch (error) {
+    rejectReady(error);
+    await stopDaemon();
+    return;
+  }
   process.on("exit", () => {
     try {
       unlinkSync(paths.socket);
@@ -252,14 +412,7 @@ async function startDaemon(session) {
     } catch {}
   });
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-    process.on(signal, async () => {
-      if (stopping) return;
-      stopping = true;
-      server.close();
-      await client.close().catch(() => {});
-      await transport.close().catch(() => {});
-      process.exit(0);
-    });
+    process.on(signal, () => void stopDaemon());
   }
 }
 
@@ -282,12 +435,19 @@ async function main() {
   }
 
   let payload;
-  if (rest[0] === "run") {
+  if (rest[0] === "close" && rest.includes("--all")) {
+    payload = { kind: "shutdown", reason: "requested" };
+  } else if (rest[0] === "run") {
     const path = rest[1];
     if (!path) throw new Error("run requires a trajectory JSON path.");
-    payload = { kind: "batch", steps: await loadTrajectory(path), bail: rest.includes("--bail") };
+    payload = {
+      kind: "batch",
+      steps: await loadTrajectory(path),
+      bail: rest.includes("--bail"),
+      cwd: process.cwd(),
+    };
   } else {
-    payload = { kind: "command", argv: rest };
+    payload = { kind: "command", argv: rest, cwd: process.cwd() };
   }
 
   const response = await connectOrStart(options, payload);

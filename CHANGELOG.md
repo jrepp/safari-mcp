@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retained the fork's consolidated 97-tool surface, embedded script diagnostics, authenticated extension bridge, and richer DOM/layout instrumentation while forward-merging upstream fixes through 2.15.12.
 
 ### Fixed
+- The configuration-free `safari-browser` wrapper now bounds MCP and Unix-socket requests, tears down a retained session after fatal transport/helper timeouts, lets `close --all` bypass a blocked command queue, and claims the session socket before spawning its child so concurrent starts cannot orphan an MCP process.
+- `safari-browser open about:blank` no longer spends the full navigation polling window waiting for the URL to become non-blank; live startup dropped from 15.6 seconds to 0.7 seconds on the reproducing machine.
+- CLI screenshots resolve relative paths against each invoking working directory rather than the directory of the first command that started the retained daemon.
 - Safari screenshots, element captures, and PDF saves now run through the signed helper's responsibility-disclaimed ScreenCaptureKit identity, with truthful permission diagnostics, correct tab targeting, and PNG/JPEG response metadata.
 - Responsive viewport emulation verifies the effective inner viewport, restores prior window/tab/page state, and isolates emulation ownership across shared-daemon sessions.
 
